@@ -1,6 +1,8 @@
-# Hermes Open WebUI Adapter
+# hermes-open-webui-adapter
 
-SSE 串流代理伺服器，位於 Open WebUI 和 Hermes Gateway 之間，負責過濾、轉換、優化工具顯示格式。
+"Make Hermes tool calls visible in Open WebUI and Conduit app"
+
+An SSE proxy that converts Hermes's custom tool call format into clean Markdown text to avoid rendering issues.
 
 ## 功能
 
