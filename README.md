@@ -1,6 +1,10 @@
 # Hermes Open WebUI Adapter
 
 <p align="center">
+  <a href="README.en.md">English</a> · 繁體中文
+</p>
+
+<p align="center">
   <b>讓 Hermes 工具調用在任何客戶端都能正確顯示</b>
   <br>
   透明的 SSE 代理，即時轉換 Hermes Gateway 的 <code>&lt;details&gt;</code> HTML 標籤為純文字 Markdown
@@ -10,7 +14,6 @@
   <a href="https://github.com/fastapi/fastapi"><img src="https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
-  <a href="README.en.md"><img src="https://img.shields.io/badge/English-docs-blue?style=flat-square"></a>
 </p>
 
 ---
@@ -124,10 +127,6 @@ sudo systemctl enable --now hermes-tool-filter
 ```
 
 ---
-
-<p align="center">
-  <a href="README.en.md">English</a> · <a href="architecture.excalidraw">架構圖</a>
-</p>
 
 <p align="center">
   <sub>MIT License</sub>
