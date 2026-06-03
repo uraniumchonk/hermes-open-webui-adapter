@@ -20,6 +20,7 @@ import asyncio
 import json
 import html
 import logging
+import os
 import re
 import time
 from typing import Dict, Optional, AsyncGenerator
@@ -137,6 +138,9 @@ def resolve_upstream(path: str) -> str:
 
 
 # ── SSE Stream Transformer ────────────────────────────────
+
+# 自動分割閾值（字元數），0 表示關閉
+AUTO_SPLIT_THRESHOLD = int(os.environ.get("AUTO_SPLIT_THRESHOLD", "4000"))
 
 
 def replace_done_false(frame: str) -> str:
@@ -355,14 +359,21 @@ async def transform_stream(
 
     對於 status=completed 的事件，額外注入一個 <details done="true"> 的
     delta.content chunk，讓 Open WebUI 能正確更新工具卡片的狀態。
+    
+    自動分割功能：當 content 累積超過閾值時，自動結束當前 stream 並繼續。
     """
 
     # Track tool states: toolCallId -> {tool, emoji, label}
     tool_states: Dict[str, dict] = {}
 
     done_received = False
+    split_done = False  # 是否已發送過分割標記
 
     buffer = ""
+    
+    # 自動分割計數器
+    accumulated_content = ""
+    has_split = False
 
     while True:
         line = await reader.readline()
@@ -427,6 +438,38 @@ async def transform_stream(
                 modified_frame = _strip_details_from_content(frame)
             else:
                 modified_frame = frame
+            
+            # 自動分割檢查
+            if AUTO_SPLIT_THRESHOLD > 0 and not has_split:
+                try:
+                    payload = json.loads(data_str) if data_str else {}
+                    choices = payload.get("choices")
+                    if isinstance(choices, list) and len(choices) > 0:
+                        delta = choices[0].get("delta")
+                        if isinstance(delta, dict):
+                            content = delta.get("content", "")
+                            if isinstance(content, str) and content:
+                                accumulated_content += content
+                                
+                                # 檢查是否超過閾值
+                                if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
+                                    has_split = True
+                                    # 發送 [DONE] 結束當前 stream
+                                    yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
+                                    yield b'data: [DONE]\n\n'
+                                    # 發送分割事件
+                                    split_event = {
+                                        "type": "session.split",
+                                        "message": "會話自動分割，繼續中...",
+                                        "chars_processed": len(accumulated_content)
+                                    }
+                                    yield b'event: session.split\n'
+                                    yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
+                                    # 清空計數器，繼續處理後續內容
+                                    accumulated_content = ""
+                except (json.JSONDecodeError, Exception):
+                    pass
+            
             yield (modified_frame + "\n\n").encode("utf-8")
 
 
