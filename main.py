@@ -553,8 +553,14 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
                         upstream_port, strip_details,
                     ):
                         yield chunk
+            except aiohttp.ServerDisconnectedError:
+                # Upstream disconnected after auto-split — this is expected, not an error
+                logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
+            except aiohttp.ClientError as e:
+                # Other client errors (connection reset, timeout, etc.)
+                logger.warning(f"[port={upstream_port}] Client error: {e}")
             except Exception as e:
-                logger.error(f"[port={upstream_port}] Proxy error: {e}")
+                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}")
                 err = {
                     "error": {
                         "message": str(e),
@@ -651,8 +657,14 @@ async def proxy_default(request: Request, rest: str):
                         upstream_port, strip_details,
                     ):
                         yield chunk
+            except aiohttp.ServerDisconnectedError:
+                # Upstream disconnected after auto-split — this is expected, not an error
+                logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
+            except aiohttp.ClientError as e:
+                # Other client errors (connection reset, timeout, etc.)
+                logger.warning(f"[port={upstream_port}] Client error: {e}")
             except Exception as e:
-                logger.error(f"[port={upstream_port}] Proxy error: {e}")
+                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}")
                 err = {
                     "error": {
                         "message": str(e),
