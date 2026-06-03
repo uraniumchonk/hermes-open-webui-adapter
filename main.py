@@ -140,7 +140,8 @@ def resolve_upstream(path: str) -> str:
 # ── SSE Stream Transformer ────────────────────────────────
 
 # 自動分割閾值（字元數），0 表示關閉
-AUTO_SPLIT_THRESHOLD = int(os.environ.get("AUTO_SPLIT_THRESHOLD", "4000"))
+# 注意: 目前 Conduit APP 不支援 session.split 事件，開啟後會導致 stream 中斷
+AUTO_SPLIT_THRESHOLD = int(os.environ.get("AUTO_SPLIT_THRESHOLD", "0"))
 
 
 def replace_done_false(frame: str) -> str:
