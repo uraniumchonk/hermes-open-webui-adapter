@@ -8,4 +8,6 @@ build/
 .venv/
 venv/
 *.log
-.pid
+*.pid
+.env
+config.yaml  # 使用 config.example.yaml 作為範本
