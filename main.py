@@ -243,94 +243,19 @@ def _format_tool_markdown(tool_info: dict) -> str:
 
 def _strip_details_from_content(frame: str) -> str:
     """
-    Parse an SSE frame's JSON data, strip <details>...</details> from
-    choices[0].delta.content, and re-serialize. Returns the modified frame.
-    
-    This prevents Conduit from rendering raw HTML and polluting the
-    conversation context with tool-call markup.
-    
-    優化版本：使用 Markdown 格式顯示工具資訊，包含：
-    - 工具名稱（加粗）
-    - emoji 標記
-    - 參數（inline code）
-    - 狀態標記（✅/🔄）
+    Parse an SSE frame's JSON data, preserve <details>...</details> for
+    Conduit APP rendering, and re-serialize. Returns the modified frame.
+
+    Conduit APP has a complete <details> rendering system:
+    - <details type="tool_calls"> is rendered as expandable tool cards
+    - ToolCallsParser.sanitizeForApi() strips them before sending to LLM
+    - So we keep the raw <details> tags intact for UI rendering
+
+    We only enhance the <details> tags by adding missing attributes
+    (arguments, result) when available from hermes.tool.progress events.
     """
-    # Extract ONLY the data: line(s) from the frame
-    # Frame may contain "event: ..." lines before "data: ..."
-    lines = frame.strip().split("\n")
-    data_lines = []
-    prefix_lines = []
-    
-    for line_item in lines:
-        if line_item.startswith("data:") or line_item == "data:":
-            data_lines.append(line_item)
-        else:
-            prefix_lines.append(line_item)
-    
-    if not data_lines:
-        return frame
-    
-    # Reconstruct data_str from data lines
-    data_str_parts = []
-    for dl in data_lines:
-        if dl == "data:":
-            data_str_parts.append("")
-        elif dl.startswith("data: "):
-            data_str_parts.append(dl[6:])
-        else:
-            data_str_parts.append(dl[5:])
-    
-    data_str = "\n".join(data_str_parts)
-    
-    try:
-        payload = json.loads(data_str)
-    except json.JSONDecodeError:
-        return frame
-
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or len(choices) == 0:
-        return frame
-
-    delta = choices[0].get("delta")
-    if not isinstance(delta, dict):
-        return frame
-
-    content = delta.get("content")
-    if not isinstance(content, str) or "<details" not in content:
-        return frame
-
-    # 提取所有 <details> 區塊
-    details_blocks = _DETAILS_RE.findall(content)
-    if not details_blocks:
-        return frame
-
-    # 對每個 <details> 區塊生成 Markdown 格式
-    tool_lines = []
-    for block in details_blocks:
-        tool_info = _extract_tool_info(block)
-        tool_lines.append(_format_tool_markdown(tool_info))
-    
-    # 將所有工具行合併，用換行分隔
-    cleaned = "\n".join(tool_lines)
-    
-    # 如果原始 content 還有其他文字，保留它
-    cleaned_content = _DETAILS_RE.sub("", content).strip()
-    if cleaned_content:
-        cleaned = cleaned_content + "\n" + cleaned
-
-    delta["content"] = cleaned
-
-    # Reconstruct the frame
-    # Preserve prefix lines (e.g., event: ...)
-    if prefix_lines:
-        reconstructed = "\n".join(prefix_lines) + "\n"
-    else:
-        reconstructed = ""
-    
-    # Add data: prefix (with space)
-    reconstructed += "data: " + json.dumps(payload, ensure_ascii=False)
-    
-    return reconstructed
+    # Simply return the frame as-is — Conduit handles <details> natively
+    return frame
 
 async def transform_stream(
     reader: asyncio.StreamReader,
