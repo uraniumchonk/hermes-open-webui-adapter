@@ -113,9 +113,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=user
-WorkingDirectory=/home/user/hermes_tool_filter
-ExecStart=/opt/hermes/hermes-agent/venv/bin/python /home/user/hermes_tool_filter/main.py
+User=YOUE_USER
+WorkingDirectory=PATH_TO/hermes_tool_filter
+ExecStart=YOUE_VENE PATH_TO/hermes_tool_filter/main.py
 Restart=always
 
 [Install]
