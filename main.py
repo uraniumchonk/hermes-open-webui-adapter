@@ -11,8 +11,9 @@ Hermes SSE Tool Card Enhancer Proxy (Multi-Tenant Router)
   /30003/v1/*  → http://127.0.0.1:30003/v1/*  (trader profile)
 
 SSE Transform：攔截 hermes.tool.progress 事件，在 completed 時注入
-<details done="true"> 標籤，讓 Open WebUI 正確更新工具卡片狀態。
+<details done="true"> 標籤，讓 Conduit APP 正確顯示工具卡片狀態。
 
+配置：config.yaml (優先) 或 .env (後備)
 Systemd service: hermes-tool-filter.service
 """
 
@@ -21,13 +22,19 @@ import json
 import html
 import logging
 import os
-import re
 import time
-from typing import Dict, Optional, AsyncGenerator
+from pathlib import Path
+from typing import Any, Dict, Optional, AsyncGenerator
 
 import aiohttp
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response, JSONResponse
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(
@@ -36,11 +43,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tool-filter")
 
+# ── Configuration ──────────────────────────────────────────
+
+CONFIG_PATH = Path(__file__).parent / "config.yaml"
+CONFIG: Dict[str, Any] = {}
+
+def _load_config() -> Dict[str, Any]:
+    """
+    載入配置。優先順序: config.yaml > .env > 預設值
+    """
+    cfg: Dict[str, Any] = {}
+
+    # 1. 載入 config.yaml
+    if CONFIG_PATH.exists() and HAS_YAML:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+            logger.info(f"Loaded config from {CONFIG_PATH}")
+            cfg.update(yaml_cfg)
+        except Exception as e:
+            logger.warning(f"Failed to load config.yaml: {e}")
+    elif CONFIG_PATH.exists():
+        logger.warning("config.yaml exists but PyYAML is not installed. Install with: pip install pyyaml")
+
+    # 2. .env 環境變數覆蓋
+    if os.environ.get("TOOL_MODE"):
+        cfg["tool_mode"] = os.environ["TOOL_MODE"]
+    if os.environ.get("AUTO_SPLIT_THRESHOLD"):
+        cfg["auto_split_threshold"] = int(os.environ["AUTO_SPLIT_THRESHOLD"])
+    if os.environ.get("BIND_PORT"):
+        cfg["bind_port"] = int(os.environ["BIND_PORT"])
+    if os.environ.get("BIND_HOST"):
+        cfg["bind_host"] = os.environ["BIND_HOST"]
+
+    return cfg
+
+CONFIG = _load_config()
+
 # ── App ───────────────────────────────────────────────────
 APP = FastAPI(title="Hermes Tool Card Enhancer Router")
 
-BIND_HOST = "0.0.0.0"
-BIND_PORT = 9099
+BIND_HOST = CONFIG.get("bind_host", "0.0.0.0")
+BIND_PORT = CONFIG.get("bind_port", 9099)
 
 # Port routing table: path prefix -> upstream base URL
 PORT_MAP: Dict[str, str] = {
@@ -139,117 +183,10 @@ def resolve_upstream(path: str) -> str:
 
 # ── SSE Stream Transformer ────────────────────────────────
 
-# 自動分割閾值（字元數），0 表示關閉
-# 注意: 目前 Conduit APP 不支援 session.split 事件，開啟後會導致 stream 中斷
-AUTO_SPLIT_THRESHOLD = int(os.environ.get("AUTO_SPLIT_THRESHOLD", "0"))
+TOOL_MODE = CONFIG.get("tool_mode", "enhance")
+AUTO_SPLIT_THRESHOLD = CONFIG.get("auto_split_threshold", 0)
 
-# ── Tool Display Mode ──────────────────────────────────────
-# 工具顯示模式切換（透過環境變數 TOOL_MODE 控制）：
-#   passthrough  - 直接透傳 <details> 標籤（預設，最安全）
-#   enhance      - 在 completed 時注入帶 arguments 的 done=true 標籤（方案 A v1）
-#   enhance-v2   - 增強版：注入完成標籤 + 工具間分隔 + 確保名稱（方案 A v2）
-#   strip        - 移除 <details> 並替換為純文字（舊版）
-TOOL_MODE = os.environ.get("TOOL_MODE", "passthrough")
-
-logger.info(f"Tool display mode: {TOOL_MODE}")
-
-
-def replace_done_false(frame: str) -> str:
-    """
-    Replace done=false with done=true in <details tags.
-    Handles any level of quote escaping by finding 'done=' then 'false' after it.
-    """
-    start = frame.find("done=")
-    if start < 0:
-        return frame
-    # Find 'false' after 'done=' (within next 20 chars)
-    search_region = frame[start:start + 20]
-    false_pos = search_region.find("false")
-    if false_pos < 0:
-        return frame
-    # Build the replacement
-    before = frame[:start + false_pos + 5]  # 'done=' + 'false' position
-    after = frame[start + false_pos + 5:]   # rest after 'false'
-    # Find the actual 'false' in the original frame
-    actual_false_pos = start + false_pos
-    result = frame[:actual_false_pos] + "true" + frame[actual_false_pos + 5:]
-    return result
-
-
-# Details-tag regex: matches <details ...>...</details> including newlines
-_DETAILS_RE = re.compile(r'<details[^>]*>.*?</details>', re.DOTALL)
-
-
-def _extract_tool_info(details_html: str) -> dict:
-    """
-    從 <details> 標籤中提取工具資訊。
-    
-    Returns: {name, emoji, label, done, id}
-    """
-    # 提取 name 屬性
-    name_match = re.search(r'name="([^"]*)"', details_html)
-    name = name_match.group(1) if name_match else "unknown"
-    
-    # 提取 done 屬性
-    done_match = re.search(r'done="([^"]*)"', details_html)
-    done = done_match and done_match.group(1) == "true"
-    
-    # 提取 id 屬性
-    id_match = re.search(r'id="([^"]*)"', details_html)
-    tc_id = id_match.group(1) if id_match else ""
-    
-    # 提取 <summary> 內容
-    summary_match = re.search(r'<summary>(.*?)</summary>', details_html, re.DOTALL)
-    summary = summary_match.group(1).strip() if summary_match else ""
-    
-    # 從 summary 中提取 emoji 和 label
-    # 格式: "💻 Running... echo hello" 或 "✅ Done"
-    emoji = ""
-    label = summary
-    
-    # 嘗試提取開頭的 emoji（包含 variation selector \uFE0F）
-    # emoji 可能後面跟 \uFE0F (VS15) 或 \u200D (ZWS) 等組合字元
-    emoji_pattern = re.match(r'^([\U0001F300-\U0001F9FF\U00002600-\U000027BF\U00002700-\U000027BF][\uFE0F\u200D\u20E3]*\s*)', summary)
-    
-    if emoji_pattern:
-        emoji = emoji_pattern.group(1).strip()
-        label = summary[emoji_pattern.end():].strip()
-    
-    # 從 label 中移除 "Running..." 或 "Done"
-    label = re.sub(r'^(Running\.\.\.|Done)\s*', '', label)
-    
-    # 如果沒有 emoji，使用 TOOL_EMOJI 映射
-    if not emoji:
-        emoji = get_tool_emoji(name)
-    
-    return {
-        "name": name,
-        "emoji": emoji,
-        "label": label,
-        "done": done,
-        "id": tc_id,
-    }
-
-
-def _format_tool_markdown(tool_info: dict) -> str:
-    """
-    將工具資訊格式化為對 LLM 上下文無污染的標記。
-    
-    重要: 此內容會進入 LLM 的對話歷史，所以必須極簡且不會讓 LLM
-    誤以為這是它應該模仿的輸出格式。
-    
-    使用 [tool: name] 格式，類似系統標記，不會被 LLM 模仿。
-    """
-    name = tool_info.get("name", "unknown")
-    done = tool_info.get("done", False)
-    
-    # 使用方括號 + "tool:" 前綴，讓 LLM 知道這是系統標記而非自然語言
-    # 這種格式不會被 LLM 模仿，因為它不像自然語言
-    if done:
-        return f"[tool:{name}✓]\n"
-    else:
-        return f"[tool:{name}…]\n"
-
+logger.info(f"Configuration loaded: tool_mode={TOOL_MODE}, auto_split={AUTO_SPLIT_THRESHOLD}")
 
 def _strip_details_from_content(frame: str) -> str:
     """
@@ -281,83 +218,38 @@ def _encode_detail_attribute(value: str) -> str:
     return html.escape(json_str, quote=True)
 
 
-def _build_completion_details(tool_name: str, arguments: dict, result: str = "") -> str:
+def _build_completion_details(tool_name: str, label: str = "", result: str = "") -> str:
     """
     Build a complete <details> tag for a completed tool call.
     
-    Format expected by Conduit:
-    <details type="tool_calls" done="true" name="tool" arguments="{&quot;k&quot;:&quot;v&quot;}">
-    <summary>Done</summary>
-    </details>
+    - 確保 name 屬性正確（不會為空）
+    - 使用 label 作為 input 參數顯示
+    - 結果截斷（最多 5000 字元）
     """
-    attrs = f'type="tool_calls" done="true" name="{html.escape(tool_name)}"'
+    safe_name = html.escape(tool_name) if tool_name else "unknown"
     
-    if arguments:
-        attrs += f' arguments="{_encode_detail_attribute(arguments)}"'
+    attrs = f'type="tool_calls" done="true" name="{safe_name}"'
+    
+    if label:
+        args_dict = {"input": label}
+        attrs += f' arguments="{_encode_detail_attribute(args_dict)}"'
     
     if result:
-        attrs += f' result="{_encode_detail_attribute(result)}"'
+        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
+        attrs += f' result="{_encode_detail_attribute(truncated)}"'
     
     return f'<details {attrs}>\n<summary>Done</summary>\n</details>\n'
 
 
 def _build_content_chunk(content: str) -> bytes:
-    """
-    Build an SSE data: line with delta.content.
-    """
-    payload = {
-        "choices": [{
-            "delta": {"content": content}
-        }]
-    }
+    """Build an SSE data: line with delta.content."""
+    payload = {"choices": [{"delta": {"content": content}}]}
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def _build_completion_details_v2(tool_name: str, arguments: dict, result: str = "", separator: bool = True) -> str:
-    """
-    Build a complete <details> tag for a completed tool call (v2).
-    
-    改進:
-    1. 確保 name 屬性正確（不會為空）
-    2. 可選分隔符號（避免工具擠在一起）
-    3. 結果截斷（避免過長）
-    
-    Format expected by Conduit:
-    <details type="tool_calls" done="true" name="tool" arguments="{&quot;k&quot;:&quot;v&quot;}">
-    <summary>Done</summary>
-    </details>
-    """
-    # 確保工具名稱不為空
-    safe_name = html.escape(tool_name) if tool_name else "unknown"
-    
-    attrs = f'type="tool_calls" done="true" name="{safe_name}"'
-    
-    if arguments:
-        attrs += f' arguments="{_encode_detail_attribute(arguments)}"'
-    
-    # 結果截斷（最多 5000 字元）
-    if result:
-        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        attrs += f' result="{_encode_detail_attribute(truncated)}"'
-    
-    details = f'<details {attrs}>\n<summary>Done</summary>\n</details>'
-    
-    # 如果需要分隔符號，在前面加換行
-    if separator:
-        return f'\n\n{details}\n\n'
-    return details + '\n'
-
-
-def handle_tool_completion_v2(tool_name: str, arguments: dict, result: str = "", separator: bool = True) -> bytes:
-    """
-    Mode 'enhance-v2': Build a completion <details> chunk to inject.
-    
-    與 v1 的差異:
-    - 確保 name 屬性正確
-    - 結果截斷（5000 字元）
-    - 可選分隔符號（避免工具擠在一起）
-    """
-    details = _build_completion_details_v2(tool_name, arguments, result, separator)
+def handle_tool_completion(tool_name: str, label: str = "", result: str = "") -> bytes:
+    """Build a completion <details> chunk to inject."""
+    details = _build_completion_details(tool_name, label, result)
     return _build_content_chunk(details)
 
 async def transform_stream(
@@ -372,14 +264,11 @@ async def transform_stream(
     從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件。
 
     對於 status=completed 的事件，額外注入一個 <details done="true"> 的
-    delta.content chunk，讓 Open WebUI 能正確更新工具卡片的狀態。
-    
-    自動分割功能：當 content 累積超過閾值時，自動結束當前 stream 並繼續。
+    delta.content chunk，讓 Conduit APP 能正確顯示工具卡片狀態。
     
     TOOL_MODE 控制處理策略：
-    - passthrough: 直接透傳 <details> 標籤
-    - enhance: 在 completed 時注入帶 arguments 的更新標籤
-    - enhance-v2: 增強版 - 確保名稱 + 結果截斷 + 工具間分隔
+    - passthrough: 直接透傳 <details> 標籤（預設）
+    - enhance: 過濾 done=false + 在 completed 時注入帶 label 的完成標籤
     - strip: 移除 <details> 並替換為純文字
     """
 
@@ -452,20 +341,12 @@ async def transform_stream(
                             state = tool_states.pop(tc_id, {})
                             final_result = payload.get("result", "")
                             
-                            # If enhance mode, inject a completion details tag
+                            # enhance 模式: 注入完成標籤
                             if TOOL_MODE == "enhance":
                                 tool_name = state.get("tool", tool)
-                                args = state.get("arguments", arguments)
+                                label = state.get("label", "")
                                 res = final_result if final_result else state.get("result", "")
-                                yield handle_tool_completion(tool_name, args, res)
-                            
-                            # If enhance-v2 mode, inject enhanced completion tag
-                            elif TOOL_MODE == "enhance-v2":
-                                tool_name = state.get("tool", tool)
-                                args = state.get("arguments", arguments)
-                                res = final_result if final_result else state.get("result", "")
-                                # separator=True 讓工具之間有分隔，避免擠在一起
-                                yield handle_tool_completion_v2(tool_name, args, res, separator=True)
+                                yield handle_tool_completion(tool_name, label, res)
                     except json.JSONDecodeError:
                         pass
                 # Do NOT yield - skip this frame
@@ -475,8 +356,19 @@ async def transform_stream(
             if data_str and ("<details" in data_str or "<details" in frame):
                 if TOOL_MODE == "strip":
                     modified_frame = _strip_details_from_content(frame)
+                elif TOOL_MODE == "enhance":
+                    # 過濾掉 done="false" 的標籤（只保留 completed 時注入的 done="true"）
+                    try:
+                        parsed = json.loads(data_str)
+                        delta = parsed.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if 'done="false"' in content:
+                            continue
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        pass
+                    modified_frame = frame
                 else:
-                    # passthrough or enhance: keep <details> as-is
+                    # passthrough: keep <details> as-is
                     modified_frame = frame
             else:
                 modified_frame = frame
