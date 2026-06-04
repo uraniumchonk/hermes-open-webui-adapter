@@ -223,37 +223,22 @@ def _extract_tool_info(details_html: str) -> dict:
 
 def _format_tool_markdown(tool_info: dict) -> str:
     """
-    將工具資訊格式化為 Markdown 純文字。
+    將工具資訊格式化為對 LLM 上下文無污染的標記。
     
-    格式: `**💻 terminal**` ┃ `echo hello`
+    重要: 此內容會進入 LLM 的對話歷史，所以必須極簡且不會讓 LLM
+    誤以為這是它應該模仿的輸出格式。
+    
+    使用 [tool: name] 格式，類似系統標記，不會被 LLM 模仿。
     """
-    emoji = tool_info.get("emoji", "🔧")
     name = tool_info.get("name", "unknown")
-    label = tool_info.get("label", "")
     done = tool_info.get("done", False)
     
-    # 狀態標記
-    status = "✅" if done else "🔄"
-    
-    # 移除前綴標記 (如 "⌨️ Running..."、"🌐 Running..."、"🖥️ Running..." 等)
-    # 這些是 Hermes 加的顯示前綴，實際參數在後面
-    import re
-    # 移除 "emoji Running... " 格式的前綴
-    label = re.sub(r'^[\U0001F000-\U0001FFFF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]*\s*Running\.\.\.\s*', '', label)
-    # 移除純 "Running... " 前綴
-    label = re.sub(r'^Running\.\.\.\s*', '', label)
-    
-    # 截斷過長的 label (最大 50 字元)
-    max_label_len = 50
-    if len(label) > max_label_len:
-        label = label[:max_label_len] + "..."
-    
-    # 構建 Markdown 格式
-    # 使用 inline code 包裹工具名稱，用 backtick 包裹參數
-    if label:
-        return f"**{emoji} {name}** {status} `{label}`\n"
+    # 使用方括號 + "tool:" 前綴，讓 LLM 知道這是系統標記而非自然語言
+    # 這種格式不會被 LLM 模仿，因為它不像自然語言
+    if done:
+        return f"[tool:{name}✓]\n"
     else:
-        return f"**{emoji} {name}** {status}\n"
+        return f"[tool:{name}…]\n"
 
 
 def _strip_details_from_content(frame: str) -> str:
