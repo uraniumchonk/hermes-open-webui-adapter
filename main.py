@@ -143,6 +143,15 @@ def resolve_upstream(path: str) -> str:
 # 注意: 目前 Conduit APP 不支援 session.split 事件，開啟後會導致 stream 中斷
 AUTO_SPLIT_THRESHOLD = int(os.environ.get("AUTO_SPLIT_THRESHOLD", "0"))
 
+# ── Tool Display Mode ──────────────────────────────────────
+# 工具顯示模式切換（透過環境變數 TOOL_MODE 控制）：
+#   passthrough  - 直接透傳 <details> 標籤（預設，最安全）
+#   enhance      - 在 completed 時注入帶 arguments 的 done=true 標籤（方案 A）
+#   strip        - 移除 <details> 並替換為純文字（舊版）
+TOOL_MODE = os.environ.get("TOOL_MODE", "passthrough")
+
+logger.info(f"Tool display mode: {TOOL_MODE}")
+
 
 def replace_done_false(frame: str) -> str:
     """
@@ -257,6 +266,59 @@ def _strip_details_from_content(frame: str) -> str:
     # Simply return the frame as-is — Conduit handles <details> natively
     return frame
 
+
+# ── Tool Mode Handlers ─────────────────────────────────────
+
+def _encode_detail_attribute(value: str) -> str:
+    """
+    Encode a value for use as a <details> attribute.
+    Order: JSON-encode → HTML-escape
+    """
+    if not value:
+        return ""
+    json_str = json.dumps(value, ensure_ascii=False)
+    return html.escape(json_str, quote=True)
+
+
+def _build_completion_details(tool_name: str, arguments: dict, result: str = "") -> str:
+    """
+    Build a complete <details> tag for a completed tool call.
+    
+    Format expected by Conduit:
+    <details type="tool_calls" done="true" name="tool" arguments="{&quot;k&quot;:&quot;v&quot;}">
+    <summary>Done</summary>
+    </details>
+    """
+    attrs = f'type="tool_calls" done="true" name="{html.escape(tool_name)}"'
+    
+    if arguments:
+        attrs += f' arguments="{_encode_detail_attribute(arguments)}"'
+    
+    if result:
+        attrs += f' result="{_encode_detail_attribute(result)}"'
+    
+    return f'<details {attrs}>\n<summary>Done</summary>\n</details>\n'
+
+
+def _build_content_chunk(content: str) -> bytes:
+    """
+    Build an SSE data: line with delta.content.
+    """
+    payload = {
+        "choices": [{
+            "delta": {"content": content}
+        }]
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def handle_tool_completion(tool_name: str, arguments: dict, result: str = "") -> bytes:
+    """
+    Mode 'enhance': Build a completion <details> chunk to inject.
+    """
+    details = _build_completion_details(tool_name, arguments, result)
+    return _build_content_chunk(details)
+
 async def transform_stream(
     reader: asyncio.StreamReader,
     model: str,
@@ -272,9 +334,14 @@ async def transform_stream(
     delta.content chunk，讓 Open WebUI 能正確更新工具卡片的狀態。
     
     自動分割功能：當 content 累積超過閾值時，自動結束當前 stream 並繼續。
+    
+    TOOL_MODE 控制處理策略：
+    - passthrough: 直接透傳 <details> 標籤
+    - enhance: 在 completed 時注入帶 arguments 的更新標籤
+    - strip: 移除 <details> 並替換為純文字
     """
 
-    # Track tool states: toolCallId -> {tool, emoji, label}
+    # Track tool states: toolCallId -> {tool, emoji, label, arguments, result}
     tool_states: Dict[str, dict] = {}
 
     done_received = False
@@ -320,7 +387,7 @@ async def transform_stream(
             # Join multiline data with newlines (SSE spec)
             data_str = "\n".join(data_lines) if data_lines else None
 
-            # Skip hermes.tool.progress events entirely - Conduit cannot parse them
+            # Handle hermes.tool.progress events
             if event_type == "hermes.tool.progress":
                 if data_str:
                     try:
@@ -328,25 +395,39 @@ async def transform_stream(
                         tc_id = payload.get("toolCallId", "")
                         status = payload.get("status", "")
                         tool = payload.get("tool", "unknown")
+                        arguments = payload.get("arguments", {})
+                        result = payload.get("result", "")
 
                         if status == "running":
                             tool_states[tc_id] = {
                                 "tool": tool,
                                 "emoji": payload.get("emoji", ""),
                                 "label": payload.get("label", tool),
+                                "arguments": arguments if isinstance(arguments, dict) else {},
+                                "result": "",
                             }
                         elif status == "completed":
-                            tool_states.pop(tc_id, None)
+                            state = tool_states.pop(tc_id, {})
+                            final_result = payload.get("result", "")
+                            
+                            # If enhance mode, inject a completion details tag
+                            if TOOL_MODE == "enhance":
+                                tool_name = state.get("tool", tool)
+                                args = state.get("arguments", arguments)
+                                res = final_result if final_result else state.get("result", "")
+                                yield handle_tool_completion(tool_name, args, res)
                     except json.JSONDecodeError:
                         pass
                 # Do NOT yield - skip this frame
                 continue
 
-            # 一律 strip <details> tags 並替換為可見文字。
-            # Hermes Gateway embeds <details type="tool_calls"> in delta.content,
-            # 但 Conduit 無法渲染，Open WebUI 的卡片也殘，所以一律替換。
+            # Handle <details> based on TOOL_MODE
             if data_str and ("<details" in data_str or "<details" in frame):
-                modified_frame = _strip_details_from_content(frame)
+                if TOOL_MODE == "strip":
+                    modified_frame = _strip_details_from_content(frame)
+                else:
+                    # passthrough or enhance: keep <details> as-is
+                    modified_frame = frame
             else:
                 modified_frame = frame
             
