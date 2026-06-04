@@ -16,22 +16,24 @@
 
 ## Why This Exists
 
-Hermes Gateway embeds `<details>` HTML tags in SSE streams to display tool call status. But:
+Hermes Gateway uses a custom `<details>` HTML tag format in its SSE stream to display tool call status, but this format does not match what Open WebUI / Conduit APP expects — resulting in **tool cards not rendering at all**.
 
-- **Conduit APP** — cannot render `<details>`, shows raw HTML
-- **Open WebUI** — tool cards stay stale, never update to "completed"
+Hermes Tool Filter sits between them, transforming the stream in real-time to a format the client can render correctly:
 
-Hermes Tool Filter sits between them, transforming the stream in real-time:
+**passthrough mode** (default): direct pass-through for clients that support Hermes format natively.
 
-```
-<details type="tool_calls" done="false" name="terminal">
-<summary>💻 Running... echo hello</summary>
+**enhance mode** (recommended): filter out intermediate state tags, inject a single standards-compliant `done="true"` tag on completion with full tool name, arguments, and result:
+
+```html
+<!-- Raw Hermes output: format mismatch, client cannot render -->
+
+<!-- After enhance mode transformation: -->
+<details type="tool_calls" done="true" name="terminal" arguments="{&quot;input&quot;: &quot;echo hello&quot;}">
+<summary>Done</summary>
 </details>
-
-        ↓ transformed ↓
-
-**💻 terminal** 🔄 `echo hello`
 ```
+
+**strip mode**: remove `<details>` and replace with plain Markdown (legacy compatibility).
 
 ---
 
@@ -93,10 +95,11 @@ Conduit / Open WebUI ──▶ Hermes Tool Filter ──▶ Hermes Gateway
 
 ## Features
 
-- **SSE Stream Transformation** — `<details>` HTML → plain Markdown
+- **Format Transformation** — converts Hermes custom format to client-renderable standard format
+- **Three Processing Modes** — passthrough, enhance, strip
 - **Multi-Tenant Routing** — one proxy, multiple Gateway profiles
-- **Three Display Modes** — passthrough, enhance, strip, switched via config
-- **Tool Formatting** — `**💻 terminal** 🔄 \`echo hello\``
+- **Smart Filtering** — enhance mode filters intermediate states, outputs only completion tags
+- **Complete Tool Info** — injected tags include name, arguments, result
 - **config.yaml Configuration** — centralized, no code changes needed
 
 ---
