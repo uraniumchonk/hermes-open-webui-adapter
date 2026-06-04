@@ -118,8 +118,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=YOUE_USER
-WorkingDirectory=PATH_TO/hermes_tool_filter
-ExecStart=YOUE_VENE PATH_TO/hermes_tool_filter/main.py
+WorkingDirectory=PATH_TO/
+ExecStart=YOUE_VENE PATH_TO/main.py
 Restart=always
 
 [Install]
