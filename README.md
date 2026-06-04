@@ -16,22 +16,24 @@
 
 ## 為什麼需要它？
 
-Hermes Gateway 的 SSE 串流使用 `<details>` HTML 標籤來顯示工具調用狀態。但這導致：
+Hermes Gateway 的 SSE 串流使用自訂的 `<details>` HTML 標籤格式來顯示工具調用狀態，但這個格式與 Open WebUI / Conduit APP 期望的格式不符，導致**工具卡片完全不顯示**。
 
-- **Conduit APP** — 無法渲染 `<details>`，顯示原始 HTML 碼
-- **Open WebUI** — 工具卡片狀態殘留，不會更新為完成
+Hermes Tool Filter 在兩者之間做即時轉換，將 Hermes 的格式轉為客戶端能正確渲染的格式：
 
-Hermes Tool Filter 在兩者之間做即時轉換，讓工具調用變成乾淨的 Markdown：
+**passthrough 模式**（預設）：直接透傳，適合已支援 Hermes 格式的客戶端。
 
-```
-<details type="tool_calls" done="false" name="terminal">
-<summary>💻 Running... echo hello</summary>
+**enhance 模式**（推薦）：過濾掉中間狀態的標籤，只在工具完成時注入一個符合標準的 `done="true"` 標籤，包含完整的工具名稱、參數和結果：
+
+```html
+<!-- Hermes 原始輸出：格式不符，客戶端無法渲染 -->
+
+<!-- 經過 enhance 模式轉換後： -->
+<details type="tool_calls" done="true" name="terminal" arguments="{&quot;input&quot;: &quot;echo hello&quot;}">
+<summary>Done</summary>
 </details>
-
-        ↓ 轉換後 ↓
-
-**💻 terminal** 🔄 `echo hello`
 ```
+
+**strip 模式**：移除 `<details>` 並替換為純文字 Markdown（舊版兼容）。
 
 ---
 
@@ -93,10 +95,11 @@ Conduit / Open WebUI ──▶ Hermes Tool Filter ──▶ Hermes Gateway
 
 ## 功能
 
-- **SSE 串流轉換** — `<details>` HTML → 純文字 Markdown
+- **格式轉換** — 將 Hermes 自訂格式轉為客戶端可渲染的標準格式
+- **三種處理模式** — passthrough（透傳）、enhance（增強）、strip（純文字）
 - **多租戶路由** — 一個代理對應多個 Gateway profiles
-- **三種顯示模式** — 透傳、增強、純文字，透過 config.yaml 切換
-- **工具格式化** — `**💻 terminal** 🔄 \`echo hello\``
+- **智能過濾** — enhance 模式自動過濾中間狀態，只輸出完成標籤
+- **完整工具資訊** — 注入的標籤包含工具名稱、參數、結果
 - **config.yaml 配置** — 集中管理，無需修改程式碼
 
 ---
