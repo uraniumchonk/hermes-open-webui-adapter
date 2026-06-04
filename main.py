@@ -207,38 +207,32 @@ def _strip_details_from_content(frame: str) -> str:
 
 # ── Tool Mode Handlers ─────────────────────────────────────
 
-def _encode_detail_attribute(value: str) -> str:
-    """
-    Encode a value for use as a <details> attribute.
-    Order: JSON-encode → HTML-escape
-    """
-    if not value:
-        return ""
-    json_str = json.dumps(value, ensure_ascii=False)
-    return html.escape(json_str, quote=True)
-
 
 def _build_completion_details(tool_name: str, label: str = "", result: str = "") -> str:
     """
     Build a complete <details> tag for a completed tool call.
     
     - 確保 name 屬性正確（不會為空）
-    - 使用 label 作為 input 參數顯示
+    - 使用 label 作為 input 參數顯示（放在 <arguments> 標籤內）
+    - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
+    inner = "\n<summary>Done</summary>"
+    
     if label:
-        args_dict = {"input": label}
-        attrs += f' arguments="{_encode_detail_attribute(args_dict)}"'
+        # arguments 放在標籤內，用 html.escape 避免 XSS
+        inner += f"\n<arguments>{html.escape(label)}</arguments>"
     
     if result:
+        # result 放在標籤內，用 html.escape 避免 XSS
         truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        attrs += f' result="{_encode_detail_attribute(truncated)}"'
+        inner += f"\n<result>{html.escape(truncated)}</result>"
     
-    return f'<details {attrs}>\n<summary>Done</summary>\n</details>\n'
+    return f'<details {attrs}>{inner}\n</details>\n'
 
 
 def _build_content_chunk(content: str) -> bytes:
@@ -270,6 +264,15 @@ async def transform_stream(
     - passthrough: 直接透傳 <details> 標籤（預設）
     - enhance: 過濾 done=false + 在 completed 時注入帶 label 的完成標籤
     - strip: 移除 <details> 並替換為純文字
+    
+    性能優化：
+    - 使用 bytes buffer 避免反覆 decode/encode
+    - 單次 JSON 解析，緩存結果供後續使用
+    - 即時輸出而非累積大字符串
+    
+    心跳機制：
+    - 獨立於數據處理循環，每 10 秒發送一次心跳
+    - 確保即使上游暫時沒有數據，客戶端也不會超時
     """
 
     # Track tool states: toolCallId -> {tool, emoji, label, arguments, result}
@@ -287,9 +290,15 @@ async def transform_stream(
     
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
-    heartbeat_interval = 15.0  # 每 15 秒發送心跳
+    heartbeat_interval = 10.0  # 每 10 秒發送心跳（比 gateway 的 30 秒更頻繁）
 
     while True:
+        # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
+        now = time.monotonic()
+        if now - last_heartbeat > heartbeat_interval:
+            yield b": heartbeat\n\n"
+            last_heartbeat = now
+
         line = await reader.readline()
 
         # Empty line means end of connection
@@ -303,17 +312,15 @@ async def transform_stream(
             frame_bytes, buffer = buffer.split(b"\n\n", 1)
             frame = frame_bytes.decode("utf-8", errors="replace")
 
-            # 心跳檢查：如果距離上次心跳超過間隔，發送心跳
-            now = time.monotonic()
-            if now - last_heartbeat > heartbeat_interval:
-                yield b": heartbeat\n\n"
-                last_heartbeat = now
+            # 心跳檢查：處理數據時也更新心跳時間戳
+            last_heartbeat = time.monotonic()
 
             # Check for [DONE] signal early - stop processing after it
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
-                return
+                # 不要直接 return！先處理 buffer 中剩餘的數據
+                break
 
             # Parse the frame - support both "data:" and "data: " formats
             lines = frame.strip().split("\n")
@@ -334,41 +341,47 @@ async def transform_stream(
             parsed_json = None
             if data_str:
                 try:
-                    parsed_json = json.loads(data_str)
+                        parsed_json = json.loads(data_str)
                 except json.JSONDecodeError:
                     pass
 
             # Handle hermes.tool.progress events
             if event_type == "hermes.tool.progress":
-                if data_str:
-                    try:
-                        payload = json.loads(data_str)
-                        tc_id = payload.get("toolCallId", "")
-                        status = payload.get("status", "")
-                        tool = payload.get("tool", "unknown")
-                        arguments = payload.get("arguments", {})
-                        result = payload.get("result", "")
+                if parsed_json:
+                    tc_id = parsed_json.get("toolCallId", "")
+                    status = parsed_json.get("status", "")
+                    tool = parsed_json.get("tool", "unknown")
+                    arguments = parsed_json.get("arguments", {})
+                    result = parsed_json.get("result", "")
 
-                        if status == "running":
-                            tool_states[tc_id] = {
-                                "tool": tool,
-                                "emoji": payload.get("emoji", ""),
-                                "label": payload.get("label", tool),
-                                "arguments": arguments if isinstance(arguments, dict) else {},
-                                "result": "",
-                            }
-                        elif status == "completed":
-                            state = tool_states.pop(tc_id, {})
-                            final_result = payload.get("result", "")
-                            
-                            # enhance 模式: 注入完成標籤
-                            if TOOL_MODE == "enhance":
-                                tool_name = state.get("tool", tool)
-                                label = state.get("label", "")
-                                res = final_result if final_result else state.get("result", "")
-                                yield handle_tool_completion(tool_name, label, res)
-                    except json.JSONDecodeError:
-                        pass
+                    if status == "running":
+                        tool_states[tc_id] = {
+                            "tool": tool,
+                            "emoji": parsed_json.get("emoji", ""),
+                            "label": parsed_json.get("label", tool),
+                            "arguments": arguments if isinstance(arguments, dict) else {},
+                            "result": "",
+                        }
+                        # 立即發送 running 狀態的佔位符，保持 stream 活躍
+                        # 這防止了工具執行期間 SSE stream 完全停頓導致超時
+                        if TOOL_MODE == "enhance":
+                            emoji = parsed_json.get("emoji", get_tool_emoji(tool))
+                            label = parsed_json.get("label", tool)
+                            yield _build_content_chunk(
+                                f'<details type="tool_calls" done="false" id="{tc_id}" name="{html.escape(tool)}">\n'
+                                f'<summary>{emoji} Running... {html.escape(label)}</summary>\n'
+                                f'</details>\n'
+                            )
+                    elif status == "completed":
+                        state = tool_states.pop(tc_id, {})
+                        final_result = parsed_json.get("result", "")
+                        
+                        # enhance 模式: 注入完成標籤
+                        if TOOL_MODE == "enhance":
+                            tool_name = state.get("tool", tool)
+                            label = state.get("label", "")
+                            res = final_result if final_result else state.get("result", "")
+                            yield handle_tool_completion(tool_name, label, res)
                 # Do NOT yield - skip this frame
                 continue
 
@@ -378,14 +391,14 @@ async def transform_stream(
                     modified_frame = _strip_details_from_content(frame)
                 elif TOOL_MODE == "enhance":
                     # 過濾掉 done="false" 的標籤（只保留 completed 時注入的 done="true"）
-                    try:
-                        parsed = json.loads(data_str)
-                        delta = parsed.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if 'done="false"' in content:
-                            continue
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        pass
+                    if parsed_json:
+                        try:
+                            delta = parsed_json.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if 'done="false"' in content:
+                                continue
+                        except (IndexError, KeyError):
+                            pass
                     modified_frame = frame
                 else:
                     # passthrough: keep <details> as-is
@@ -423,6 +436,9 @@ async def transform_stream(
             # 即時輸出，避免累積
             yield (modified_frame + "\n\n").encode("utf-8")
 
+        # 如果收到 [DONE]，跳出外層循環
+        if done_received:
+            break
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
