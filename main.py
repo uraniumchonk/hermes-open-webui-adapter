@@ -278,11 +278,16 @@ async def transform_stream(
     done_received = False
     split_done = False  # 是否已發送過分割標記
 
-    buffer = ""
+    # 使用 bytes buffer 避免反覆 decode/encode
+    buffer = b""
     
     # 自動分割計數器
     accumulated_content = ""
     has_split = False
+    
+    # 心跳計時器，防止超時
+    last_heartbeat = time.monotonic()
+    heartbeat_interval = 15.0  # 每 15 秒發送心跳
 
     while True:
         line = await reader.readline()
@@ -291,11 +296,18 @@ async def transform_stream(
         if not line:
             break
 
-        buffer += line.decode("utf-8", errors="replace")
+        buffer += line
 
         # Process complete SSE frames (terminated by \n\n)
-        while "\n\n" in buffer:
-            frame, buffer = buffer.split("\n\n", 1)
+        while b"\n\n" in buffer:
+            frame_bytes, buffer = buffer.split(b"\n\n", 1)
+            frame = frame_bytes.decode("utf-8", errors="replace")
+
+            # 心跳檢查：如果距離上次心跳超過間隔，發送心跳
+            now = time.monotonic()
+            if now - last_heartbeat > heartbeat_interval:
+                yield b": heartbeat\n\n"
+                last_heartbeat = now
 
             # Check for [DONE] signal early - stop processing after it
             if "[DONE]" in frame and not done_received:
@@ -317,6 +329,14 @@ async def transform_stream(
 
             # Join multiline data with newlines (SSE spec)
             data_str = "\n".join(data_lines) if data_lines else None
+            
+            # 單次 JSON 解析，緩存結果
+            parsed_json = None
+            if data_str:
+                try:
+                    parsed_json = json.loads(data_str)
+                except json.JSONDecodeError:
+                    pass
 
             # Handle hermes.tool.progress events
             if event_type == "hermes.tool.progress":
@@ -373,44 +393,41 @@ async def transform_stream(
             else:
                 modified_frame = frame
             
-            # 自動分割檢查
-            if AUTO_SPLIT_THRESHOLD > 0 and not has_split:
-                try:
-                    payload = json.loads(data_str) if data_str else {}
-                    choices = payload.get("choices")
-                    if isinstance(choices, list) and len(choices) > 0:
-                        delta = choices[0].get("delta")
-                        if isinstance(delta, dict):
-                            content = delta.get("content", "")
-                            if isinstance(content, str) and content:
-                                accumulated_content += content
-                                
-                                # 檢查是否超過閾值
-                                if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
-                                    has_split = True
-                                    # 發送 [DONE] 結束當前 stream
-                                    yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
-                                    yield b'data: [DONE]\n\n'
-                                    # 發送分割事件
-                                    split_event = {
-                                        "type": "session.split",
-                                        "message": "會話自動分割，繼續中...",
-                                        "chars_processed": len(accumulated_content)
-                                    }
-                                    yield b'event: session.split\n'
-                                    yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
-                                    # 清空計數器，繼續處理後續內容
-                                    accumulated_content = ""
-                except (json.JSONDecodeError, Exception):
-                    pass
+            # 自動分割檢查（使用已解析的 JSON）
+            if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
+                choices = parsed_json.get("choices")
+                if isinstance(choices, list) and len(choices) > 0:
+                    delta = choices[0].get("delta")
+                    if isinstance(delta, dict):
+                        content = delta.get("content", "")
+                        if isinstance(content, str) and content:
+                            accumulated_content += content
+                            
+                            # 檢查是否超過閾值
+                            if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
+                                has_split = True
+                                # 發送 [DONE] 結束當前 stream
+                                yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
+                                yield b'data: [DONE]\n\n'
+                                # 發送分割事件
+                                split_event = {
+                                    "type": "session.split",
+                                    "message": "會話自動分割，繼續中...",
+                                    "chars_processed": len(accumulated_content)
+                                }
+                                yield b'event: session.split\n'
+                                yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
+                                # 清空計數器，繼續處理後續內容
+                                accumulated_content = ""
             
+            # 即時輸出，避免累積
             yield (modified_frame + "\n\n").encode("utf-8")
 
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
         # Ensure the residual buffer ends with \n\n for proper SSE framing
-        cleaned = buffer.rstrip("\r\n")
+        cleaned = buffer.decode("utf-8", errors="replace").rstrip("\r\n")
         if cleaned:
             yield (cleaned + "\n\n").encode("utf-8")
 
