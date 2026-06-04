@@ -146,7 +146,8 @@ AUTO_SPLIT_THRESHOLD = int(os.environ.get("AUTO_SPLIT_THRESHOLD", "0"))
 # ── Tool Display Mode ──────────────────────────────────────
 # 工具顯示模式切換（透過環境變數 TOOL_MODE 控制）：
 #   passthrough  - 直接透傳 <details> 標籤（預設，最安全）
-#   enhance      - 在 completed 時注入帶 arguments 的 done=true 標籤（方案 A）
+#   enhance      - 在 completed 時注入帶 arguments 的 done=true 標籤（方案 A v1）
+#   enhance-v2   - 增強版：注入完成標籤 + 工具間分隔 + 確保名稱（方案 A v2）
 #   strip        - 移除 <details> 並替換為純文字（舊版）
 TOOL_MODE = os.environ.get("TOOL_MODE", "passthrough")
 
@@ -312,11 +313,51 @@ def _build_content_chunk(content: str) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def handle_tool_completion(tool_name: str, arguments: dict, result: str = "") -> bytes:
+def _build_completion_details_v2(tool_name: str, arguments: dict, result: str = "", separator: bool = True) -> str:
     """
-    Mode 'enhance': Build a completion <details> chunk to inject.
+    Build a complete <details> tag for a completed tool call (v2).
+    
+    改進:
+    1. 確保 name 屬性正確（不會為空）
+    2. 可選分隔符號（避免工具擠在一起）
+    3. 結果截斷（避免過長）
+    
+    Format expected by Conduit:
+    <details type="tool_calls" done="true" name="tool" arguments="{&quot;k&quot;:&quot;v&quot;}">
+    <summary>Done</summary>
+    </details>
     """
-    details = _build_completion_details(tool_name, arguments, result)
+    # 確保工具名稱不為空
+    safe_name = html.escape(tool_name) if tool_name else "unknown"
+    
+    attrs = f'type="tool_calls" done="true" name="{safe_name}"'
+    
+    if arguments:
+        attrs += f' arguments="{_encode_detail_attribute(arguments)}"'
+    
+    # 結果截斷（最多 5000 字元）
+    if result:
+        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
+        attrs += f' result="{_encode_detail_attribute(truncated)}"'
+    
+    details = f'<details {attrs}>\n<summary>Done</summary>\n</details>'
+    
+    # 如果需要分隔符號，在前面加換行
+    if separator:
+        return f'\n\n{details}\n\n'
+    return details + '\n'
+
+
+def handle_tool_completion_v2(tool_name: str, arguments: dict, result: str = "", separator: bool = True) -> bytes:
+    """
+    Mode 'enhance-v2': Build a completion <details> chunk to inject.
+    
+    與 v1 的差異:
+    - 確保 name 屬性正確
+    - 結果截斷（5000 字元）
+    - 可選分隔符號（避免工具擠在一起）
+    """
+    details = _build_completion_details_v2(tool_name, arguments, result, separator)
     return _build_content_chunk(details)
 
 async def transform_stream(
@@ -338,6 +379,7 @@ async def transform_stream(
     TOOL_MODE 控制處理策略：
     - passthrough: 直接透傳 <details> 標籤
     - enhance: 在 completed 時注入帶 arguments 的更新標籤
+    - enhance-v2: 增強版 - 確保名稱 + 結果截斷 + 工具間分隔
     - strip: 移除 <details> 並替換為純文字
     """
 
@@ -416,6 +458,14 @@ async def transform_stream(
                                 args = state.get("arguments", arguments)
                                 res = final_result if final_result else state.get("result", "")
                                 yield handle_tool_completion(tool_name, args, res)
+                            
+                            # If enhance-v2 mode, inject enhanced completion tag
+                            elif TOOL_MODE == "enhance-v2":
+                                tool_name = state.get("tool", tool)
+                                args = state.get("arguments", arguments)
+                                res = final_result if final_result else state.get("result", "")
+                                # separator=True 讓工具之間有分隔，避免擠在一起
+                                yield handle_tool_completion_v2(tool_name, args, res, separator=True)
                     except json.JSONDecodeError:
                         pass
                 # Do NOT yield - skip this frame
