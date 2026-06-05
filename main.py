@@ -341,7 +341,7 @@ async def transform_stream(
             parsed_json = None
             if data_str:
                 try:
-                        parsed_json = json.loads(data_str)
+                    parsed_json = json.loads(data_str)
                 except json.JSONDecodeError:
                     pass
 
