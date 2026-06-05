@@ -1,9 +1,9 @@
 # Hermes Tool Filter
 
-**讓 Hermes 工具調用在任何客戶端都能正確顯示的透明 SSE 代理**
+**Transparent SSE proxy that makes Hermes tool calls render correctly on any client**
 
 <p align="center">
-  <a href="README.en.md">English</a> · 繁體中文
+  English · <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
 <p align="center">
@@ -14,30 +14,30 @@
 
 ---
 
-## 為什麼需要它？
+## Why This Exists
 
-Hermes Gateway 的 SSE 串流使用自訂的 `<details>` HTML 標籤格式來顯示工具調用狀態，但這個格式與 Open WebUI / Conduit APP 期望的格式不符，導致**工具卡片完全不顯示**。
+Hermes Gateway uses a custom `<details>` HTML tag format in its SSE stream to display tool call status, but this format does not match what Open WebUI / Conduit APP expects — resulting in **tool cards not rendering at all**.
 
-Hermes Tool Filter 在兩者之間做即時轉換，將 Hermes 的格式轉為客戶端能正確渲染的格式：
+Hermes Tool Filter sits between them, transforming the stream in real-time to a format the client can render correctly:
 
-**passthrough 模式**（預設）：直接透傳，適合已支援 Hermes 格式的客戶端。
+**passthrough mode** (default): direct pass-through for clients that support Hermes format natively.
 
-**enhance 模式**（推薦）：過濾掉中間狀態的標籤，只在工具完成時注入一個符合標準的 `done="true"` 標籤，包含完整的工具名稱、參數和結果：
+**enhance mode** (recommended): filter out intermediate state tags, inject a single standards-compliant `done="true"` tag on completion with full tool name, arguments, and result:
 
 ```html
-<!-- Hermes 原始輸出：格式不符，客戶端無法渲染 -->
+<!-- Raw Hermes output: format mismatch, client cannot render -->
 
-<!-- 經過 enhance 模式轉換後： -->
+<!-- After enhance mode transformation: -->
 <details type="tool_calls" done="true" name="terminal" arguments="{&quot;input&quot;: &quot;echo hello&quot;}">
 <summary>Done</summary>
 </details>
 ```
 
-**strip 模式**：移除 `<details>` 並替換為純文字 Markdown（舊版兼容）。
+**strip mode**: remove `<details>` and replace with plain Markdown (legacy compatibility).
 
 ---
 
-## 快速開始
+## Quick Start
 
 ```bash
 git clone https://github.com/Thisisawa/hermes-open-webui-adapter.git
@@ -46,9 +46,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-服務啟動在 `http://0.0.0.0:9099`
+Service starts on `http://0.0.0.0:9099`.
 
-將 Conduit APP 或 Open WebUI 的 API Base URL 設為：
+Set your Conduit APP or Open WebUI API Base URL to:
 
 ```
 http://127.0.0.1:9099/30000/v1
@@ -56,20 +56,20 @@ http://127.0.0.1:9099/30000/v1
 
 ---
 
-## 配置
+## Configuration
 
-編輯 `config.yaml` 即可調整設定：
+Edit `config.yaml` to adjust settings:
 
-- **tool_mode** — `passthrough`（透傳）/ `enhance`（增強，預設）/ `strip`（移除）
-- **auto_split_threshold** — 串流自動分割閾值（字元數，`0` = 關閉）
-- **bind_host / bind_port** — 監聽位址與埠號
+- **tool_mode** — `passthrough` (pass-through) / `enhance` (enhanced, default) / `strip` (remove)
+- **auto_split_threshold** — auto-split stream at N characters (`0` = disabled)
+- **bind_host / bind_port** — listen address and port
 
-環境變數可覆蓋 config.yaml 設定（`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`）。
+Environment variables override `config.yaml` (`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`).
 
-### 路由表
+### Routing Table
 
-| 路徑 | 上游 | 用途 |
-|------|------|------|
+| Path | Upstream | Profile |
+|------|----------|---------|
 | `/30000/v1/*` | `127.0.0.1:30000` | Default |
 | `/30001/v1/*` | `127.0.0.1:30001` | Coder |
 | `/30002/v1/*` | `127.0.0.1:30002` | Analyst |
@@ -77,34 +77,34 @@ http://127.0.0.1:9099/30000/v1
 
 ---
 
-## 工作方式
+## How It Works
 
 ```
 Conduit / Open WebUI ──▶ Hermes Tool Filter ──▶ Hermes Gateway
      (30010)                (9099)                  (30000)
-        ◀──────── 轉換後 SSE ◀────────────────────────────
+        ◀──── Transformed SSE ◀────────────────────────────
 ```
 
-1. 客戶端發送請求到代理（Port 9099）
-2. 代理根據路徑轉發到對應的 Hermes Gateway
-3. Gateway 回傳 SSE 串流（含 `<details>` 標籤）
-4. 代理即時解析並轉換為 Markdown
-5. 回傳乾淨的串流給客戶端
+1. Client sends request to proxy (Port 9099)
+2. Proxy routes to the matched Hermes Gateway by path prefix
+3. Gateway returns SSE stream with `<details>` tags
+4. Proxy parses and converts to Markdown on-the-fly
+5. Clean stream returned to client
 
 ---
 
-## 功能
+## Features
 
-- **格式轉換** — 將 Hermes 自訂格式轉為客戶端可渲染的標準格式
-- **三種處理模式** — passthrough（透傳）、enhance（增強）、strip（純文字）
-- **多租戶路由** — 一個代理對應多個 Gateway profiles
-- **智能過濾** — enhance 模式自動過濾中間狀態，只輸出完成標籤
-- **完整工具資訊** — 注入的標籤包含工具名稱、參數、結果
-- **config.yaml 配置** — 集中管理，無需修改程式碼
+- **Format Transformation** — converts Hermes custom format to client-renderable standard format
+- **Three Processing Modes** — passthrough, enhance, strip
+- **Multi-Tenant Routing** — one proxy, multiple Gateway profiles
+- **Smart Filtering** — enhance mode filters intermediate states, outputs only completion tags
+- **Complete Tool Info** — injected tags include name, arguments, result
+- **config.yaml Configuration** — centralized, no code changes needed
 
 ---
 
-## Systemd 服務
+## As Systemd Service
 
 ```ini
 [Unit]
@@ -128,11 +128,11 @@ sudo systemctl enable --now hermes-tool-filter
 
 ---
 
-## 技術細節
+## Technical Details
 
-- **依賴** — FastAPI, aiohttp, PyYAML
-- **架構** — 單檔案，無外部資料庫，零狀態
-- **部署** — systemd 或直接執行
+- **Dependencies** — FastAPI, aiohttp, PyYAML
+- **Architecture** — single file, no database, stateless
+- **Deployment** — systemd or direct execution
 
 ---
 
