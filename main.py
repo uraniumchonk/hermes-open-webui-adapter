@@ -269,6 +269,10 @@ async def transform_stream(
     - 使用 bytes buffer 避免反覆 decode/encode
     - 單次 JSON 解析，緩存結果供後續使用
     - 即時輸出而非累積大字符串
+    
+    心跳機制：
+    - 獨立於數據處理循環，每 10 秒發送一次心跳
+    - 確保即使上游暫時沒有數據，客戶端也不會超時
     """
 
     # Track tool states: toolCallId -> {tool, emoji, label, arguments, result}
@@ -286,9 +290,15 @@ async def transform_stream(
     
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
-    heartbeat_interval = 15.0  # 每 15 秒發送心跳
+    heartbeat_interval = 10.0  # 每 10 秒發送心跳（比 gateway 的 30 秒更頻繁）
 
     while True:
+        # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
+        now = time.monotonic()
+        if now - last_heartbeat > heartbeat_interval:
+            yield b": heartbeat\n\n"
+            last_heartbeat = now
+
         line = await reader.readline()
 
         # Empty line means end of connection
@@ -302,17 +312,15 @@ async def transform_stream(
             frame_bytes, buffer = buffer.split(b"\n\n", 1)
             frame = frame_bytes.decode("utf-8", errors="replace")
 
-            # 心跳檢查：如果距離上次心跳超過間隔，發送心跳
-            now = time.monotonic()
-            if now - last_heartbeat > heartbeat_interval:
-                yield b": heartbeat\n\n"
-                last_heartbeat = now
+            # 心跳檢查：處理數據時也更新心跳時間戳
+            last_heartbeat = time.monotonic()
 
             # Check for [DONE] signal early - stop processing after it
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
-                return
+                # 不要直接 return！先處理 buffer 中剩餘的數據
+                break
 
             # Parse the frame - support both "data:" and "data: " formats
             lines = frame.strip().split("\n")
@@ -428,6 +436,9 @@ async def transform_stream(
             # 即時輸出，避免累積
             yield (modified_frame + "\n\n").encode("utf-8")
 
+        # 如果收到 [DONE]，跳出外層循環
+        if done_received:
+            break
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
