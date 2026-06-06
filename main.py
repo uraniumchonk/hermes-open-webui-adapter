@@ -514,18 +514,17 @@ async def transform_stream(
                             )
                             for chunk in chunks:
                                 yield chunk
-                            # Tool completed 後發送多個 nudge（3 個，間隔 0.5 秒）
-                            # 確保 Open WebUI 的 idle timer 被重置，即使只剩 1-2 秒
+                            # Tool completed 後立即發送多個 nudge（不阻塞）
+                            # 確保 Open WebUI 的 idle timer 被重置
                             for i in range(3):
-                                await asyncio.sleep(0.5)
                                 yield b': keepalive-post-tool\n\n'
                                 yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
                                     completion_id.encode(), created, model.encode()
                                 )
-                                logger.info(
-                                    f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
-                                    f"sent nudge #{i+1}/3 to keep stream alive"
-                                )
+                            logger.info(
+                                f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
+                                f"sent 3 nudges to keep stream alive"
+                            )
                             tool_just_completed = True
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
                         continue
