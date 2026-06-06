@@ -431,6 +431,14 @@ async def transform_stream(
             )
             last_heartbeat = time.monotonic()
             continue
+        except Exception as e:
+            # readline() 可能丟出 exception（例如 client 斷開連線）
+            logger.error(
+                f"[enhance-v2] readline() exception: {type(e).__name__}: {e}, "
+                f"tool_just_completed={tool_just_completed}, "
+                f"done_received={done_received}, buffer_len={len(buffer)}"
+            )
+            raise
 
         # Empty line means end of connection — LOG THIS!
         if not line:
