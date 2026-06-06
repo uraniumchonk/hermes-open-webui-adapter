@@ -236,13 +236,14 @@ To view your actual profiles: `hermes profiles list`. Simply add or remove entri
 
 ### Hermes Gateway Configuration
 
-The proxy routes to Hermes Gateway instances. Each Gateway profile has its own `.env` file at:
+The proxy routes to Hermes Gateway instances. Each Gateway profile has its own `.env` file — location depends on how Hermes was installed:
 
 ```
-/opt/hermes/profiles/<PROFILE_NAME>/.env
+/opt/hermes/profiles/<PROFILE_NAME>/.env     # System-wide install
+~/.hermes/profiles/<PROFILE_NAME>/.env       # User-level install
 ```
 
-For example, a profile named `chatting` would be at `/opt/hermes/profiles/chatting/.env`. Key settings:
+For example, a profile named `chatting` would be at `/opt/hermes/profiles/chatting/.env` or `~/.hermes/profiles/chatting/.env`. Key settings:
 
 ```bash
 # Enable the API server

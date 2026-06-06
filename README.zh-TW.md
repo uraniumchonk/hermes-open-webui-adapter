@@ -236,13 +236,14 @@ upstreams:
 
 ### Hermes Gateway 配置
 
-代理路由到多個 Hermes Gateway 實例。每個 Gateway profile 有獨立的 `.env` 檔案，位置在：
+代理路由到多個 Hermes Gateway 實例。每個 Gateway profile 有獨立的 `.env` 檔案，位置取決於安裝方式：
 
 ```
-/opt/hermes/profiles/<PROFILE_NAME>/.env
+/opt/hermes/profiles/<PROFILE_NAME>/.env     # 系統級安裝
+~/.hermes/profiles/<PROFILE_NAME>/.env       # 使用者級安裝
 ```
 
-例如，名為 `chatting` 的 profile 會在 `/opt/hermes/profiles/chatting/.env`。重要設定：
+例如，名為 `chatting` 的 profile 會在 `/opt/hermes/profiles/chatting/.env` 或 `~/.hermes/profiles/chatting/.env`。重要設定：
 
 ```bash
 # 啟用 API 伺服器
