@@ -399,37 +399,36 @@ async def transform_stream(
     
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
-    heartbeat_interval = 5.0  # 每 5 秒發送心跳（比 gateway 的 30 秒更頻繁）
+    heartbeat_interval = 2.0  # 每 2 秒發送心跳（比 gateway 的 30 秒更頻繁，避免 Open WebUI idle timeout）
     
     # enhance-v2 專用緩衝器
     v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
     
     # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
     tool_just_completed = False
-
+    
+    # 主循環
     while True:
-        # ── 非阻塞心跳：使用 asyncio.wait_for 讓 readline 有超時 ──
-        # 這樣即使 upstream 沒有數據，我們也能定期發送 heartbeat 保持連線活躍
-        now = time.monotonic()
-        time_since_heartbeat = now - last_heartbeat
-        
-        # 計算 readline 的最長等待時間（不能超過心跳間隔）
-        readline_timeout = max(0.5, heartbeat_interval - time_since_heartbeat)
-        
-        try:
-            line = await asyncio.wait_for(reader.readline(), timeout=readline_timeout)
-        except asyncio.TimeoutError:
-            # 超時了，發送空 content delta（不是純 comment）保持 Open WebUI 認為 stream 活躍
-            # 空的 content delta 是有效的 SSE data chunk，會重置 Open WebUI 的 idle timer
+        # 心跳檢查 — 在 readline 之前檢查，確保即使 upstream 沒有數據也能發送心跳
+        elapsed = time.monotonic() - last_heartbeat
+        if elapsed >= heartbeat_interval:
+            # 發送空 content delta（不是純 comment）保持 Open WebUI 認為 stream 活躍
             logger.debug(
-                f"[enhance-v2] Heartbeat timeout ({readline_timeout:.1f}s), "
-                f"sending empty delta. tool_just_completed={tool_just_completed}, "
+                f"[enhance-v2] Heartbeat ({elapsed:.1f}s), sending empty delta. "
+                f"tool_just_completed={tool_just_completed}, "
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
-            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""}]}]\n\n' % (
+            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
                 completion_id.encode(), created, model.encode()
             )
             last_heartbeat = time.monotonic()
+            tool_just_completed = False
+
+        # 非阻塞讀取 — 使用 asyncio.wait_for 確保不會永久阻塞
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+        except asyncio.TimeoutError:
+            # 超時了，繼續循環，下次心跳會發送 empty delta
             continue
         except Exception as e:
             # readline() 可能丟出 exception（例如 client 斷開連線）
