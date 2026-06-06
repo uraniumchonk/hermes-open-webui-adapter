@@ -209,17 +209,30 @@ http://127.0.0.1:9099/30000/v1
 - **tool_mode** — `enhance-v2`（預設，推薦）/ `enhance` / `passthrough` / `strip`
 - **auto_split_threshold** — 串流自動分割閾值（字元數，`0` = 關閉）
 - **bind_host / bind_port** — 監聽位址與埠號
+- **upstreams** — 靈活路由表（見下方）
 
 環境變數可覆蓋 config.yaml（`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`）。
 
-### 路由表
+### 上游路由（可配置）
 
-| 路徑 | 上游 | 用途 |
-|------|------|------|
-| `/30000/v1/*` | `127.0.0.1:30000` | Default |
-| `/30001/v1/*` | `127.0.0.1:30001` | Coder |
-| `/30002/v1/*` | `127.0.0.1:30002` | Analyst |
-| `/30003/v1/*` | `127.0.0.1:30003` | Trader |
+路由完全由 `config.yaml` 控制 — 增減 profile 不需要修改程式碼：
+
+```yaml
+upstreams:
+  "30000": "http://127.0.0.1:30000"
+  "30001": "http://127.0.0.1:30001"
+  "30002": "http://127.0.0.1:30002"
+  "30003": "http://127.0.0.1:30003"
+```
+
+每個鍵是路徑前綴，每個值是对應的 Hermes Gateway URL。Hermes 預設 profiles：
+
+- `30000` → Default（預設）
+- `30001` → Coder（程式開發）
+- `30002` → Analyst（分析師）
+- `30003` → Trader（交易員）
+
+查看你的 profiles：`hermes profiles list`。只需在 `config.yaml` 中新增或移除項目即可。若省略 `upstreams`，會自動使用上方四個預設值。
 
 ---
 

@@ -17,6 +17,24 @@ bind_port: 9099
 # strip       : 移除 <details> 並替換為純文字
 tool_mode: "enhance-v2"
 
+# ── Upstream Routing ───────────────────────────────────────
+# 路由表：路徑前綴 → 上游 Hermes Gateway 位址
+# 格式: "端口": "http://位址:端口"
+#
+# 預設 Hermes profiles（執行 `hermes profiles list` 查看你的 profiles）：
+#   30000: default profile
+#   30001: coder profile
+#   30002: analyst profile
+#   30003: trader profile
+#
+# 你可以自由增減 — 只需符合你的 Gateway 設定即可！
+# 若省略此區塊，會使用預設的 30000-30003。
+upstreams:
+  "30000": "http://127.0.0.1:30000"
+  "30001": "http://127.0.0.1:30001"
+  "30002": "http://127.0.0.1:30002"
+  "30003": "http://127.0.0.1:30003"
+
 # ── Auto Split ─────────────────────────────────────────────
 # 自動分割閾值（字元數），0 表示關閉
 # 注意: Conduit APP 不支援 session.split 事件

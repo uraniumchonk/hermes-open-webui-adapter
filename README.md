@@ -209,17 +209,30 @@ Edit `config.yaml`:
 - **tool_mode** — `enhance-v2` (default, recommended) / `enhance` / `passthrough` / `strip`
 - **auto_split_threshold** — Stream auto-split threshold (characters, `0` = disabled)
 - **bind_host / bind_port** — Listen address and port
+- **upstreams** — Flexible routing table (see below)
 
 Environment variables override config.yaml (`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`).
 
-### Routing Table
+### Upstream Routing (Configurable)
 
-| Path | Upstream | Purpose |
-|------|------|------|
-| `/30000/v1/*` | `127.0.0.1:30000` | Default |
-| `/30001/v1/*` | `127.0.0.1:30001` | Coder |
-| `/30002/v1/*` | `127.0.0.1:30002` | Analyst |
-| `/30003/v1/*` | `127.0.0.1:30003` | Trader |
+Routing is fully configurable via `config.yaml` — no code changes needed to add or remove profiles:
+
+```yaml
+upstreams:
+  "30000": "http://127.0.0.1:30000"
+  "30001": "http://127.0.0.1:30001"
+  "30002": "http://127.0.0.1:30002"
+  "30003": "http://127.0.0.1:30003"
+```
+
+Each key is a path prefix, each value is the upstream Hermes Gateway URL. The default Hermes profiles are:
+
+- `30000` → Default profile
+- `30001` → Coder profile
+- `30002` → Analyst profile
+- `30003` → Trader profile
+
+To view your actual profiles: `hermes profiles list`. Simply add or remove entries in `config.yaml` to match your setup. If `upstreams` is omitted, the four defaults above are used automatically.
 
 ---
 

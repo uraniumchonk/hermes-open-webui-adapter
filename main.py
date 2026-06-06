@@ -4,7 +4,7 @@ Hermes SSE Tool Card Enhancer Proxy (Multi-Tenant Router)
 
 在 Open WebUI 和多個 Hermes Gateway profiles 之間的透明代理路由器。
 
-路由规则：
+路由规则（由 config.yaml 中的 upstreams 配置決定）：
   /30000/v1/*  → http://127.0.0.1:30000/v1/*  (default profile)
   /30001/v1/*  → http://127.0.0.1:30001/v1/*  (coder profile)
   /30002/v1/*  → http://127.0.0.1:30002/v1/*  (analyst profile)
@@ -88,15 +88,27 @@ BIND_HOST = CONFIG.get("bind_host", "0.0.0.0")
 BIND_PORT = CONFIG.get("bind_port", 9099)
 
 # Port routing table: path prefix -> upstream base URL
-PORT_MAP: Dict[str, str] = {
-    "30000": "http://127.0.0.1:30000",
-    "30001": "http://127.0.0.1:30001",
-    "30002": "http://127.0.0.1:30002",
-    "30003": "http://127.0.0.1:30003",
-}
+# Loaded from config.yaml "upstreams" section, with sensible defaults.
+PORT_MAP: Dict[str, str] = {}
 
-# Default upstream if no port prefix matched
-DEFAULT_UPSTREAM = PORT_MAP["30000"]
+def _build_port_map() -> Dict[str, str]:
+    """Build PORT_MAP from config or use defaults."""
+    upstreams = CONFIG.get("upstreams", {})
+    if upstreams:
+        return {str(k): str(v) for k, v in upstreams.items()}
+    # Default: Hermes's built-in profiles (default, coder, analyst, trader)
+    return {
+        "30000": "http://127.0.0.1:30000",
+        "30001": "http://127.0.0.1:30001",
+        "30002": "http://127.0.0.1:30002",
+        "30003": "http://127.0.0.1:30003",
+    }
+
+
+PORT_MAP = _build_port_map()
+
+# Default upstream if no port prefix matched — pick the first one or fallback
+DEFAULT_UPSTREAM = next(iter(PORT_MAP.values())) if PORT_MAP else "http://127.0.0.1:30000"
 
 # ── Emoji Mapping ─────────────────────────────────────────
 
