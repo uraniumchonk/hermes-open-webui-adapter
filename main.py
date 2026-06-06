@@ -416,8 +416,16 @@ async def transform_stream(
 
         line = await reader.readline()
 
-        # Empty line means end of connection
+        # Empty line means end of connection — LOG THIS!
         if not line:
+            elapsed = time.monotonic() - last_heartbeat
+            logger.info(
+                f"[enhance-v2] Upstream EOF detected! "
+                f"last_heartbeat={elapsed:.1f}s ago, "
+                f"done_received={done_received}, "
+                f"buffer_len={len(buffer)}, "
+                f"tool_just_completed={tool_just_completed}"
+            )
             break
 
         buffer += line
