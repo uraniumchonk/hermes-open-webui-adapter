@@ -1,4 +1,4 @@
-# Hermes Tool Filter
+# Hermes Tool Filter v2.0.0
 
 **Transparent SSE proxy that makes Hermes tool calls render correctly in any client**
 
@@ -10,6 +10,7 @@
   <a href="https://github.com/fastapi/fastapi"><img src="https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Version-2.0.0-brightgreen?style=flat-square"></a>
 </p>
 
 > **Solves**: Hermes Gateway tool cards not rendering in Open WebUI / Conduit APP, and tool results being lost from conversation context — causing model amnesia.
@@ -135,12 +136,16 @@ Hermes Tool Filter bridges the gap by converting Hermes' custom SSE format into 
 
 ```html
 <!-- After enhance-v2 transformation: -->
-<details type="tool_calls" done="true" name="web_search">
-<summary>Done</summary>
-<arguments>Taipei weather today</arguments>
-<result>{"success":true,"data":"..."}</result>
+<details type="tool_calls" done="true" name="terminal">
+<summary>✅ 💻 echo hello</summary>
+<arguments>{"tool_name": "terminal", "command": "echo hello"}</arguments>
+<result>{"output": "hello", "exit_code": 0, "error": null}</result>
 </details>
 ```
+
+- `<summary>` — Tool name + emoji for visual identification
+- `<arguments>` — Full JSON with `tool_name` + parameters (model can identify the tool)
+- `<result>` — Tool execution output
 
 **enhance mode**: Filters intermediate states, injects `done="true"` tag on completion.
 

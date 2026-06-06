@@ -1,4 +1,4 @@
-# Hermes Tool Filter
+# Hermes Tool Filter v2.0.0
 
 **讓 Hermes 工具調用在任何客戶端都能正確顯示的透明 SSE 代理**
 
@@ -10,6 +10,7 @@
   <a href="https://github.com/fastapi/fastapi"><img src="https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Version-2.0.0-brightgreen?style=flat-square"></a>
 </p>
 
 > **解決問題**：Hermes Gateway 在 Open WebUI / Conduit APP 中工具卡片無法顯示、工具結果從對話上下文中丟失——導致模型失憶。
@@ -135,12 +136,16 @@ Hermes Tool Filter 在 Hermes Gateway 與 Open WebUI 之間架起橋樑，將自
 
 ```html
 <!-- 經過 enhance-v2 轉換後： -->
-<details type="tool_calls" done="true" name="web_search">
-<summary>Done</summary>
-<arguments>台北天氣 今天</arguments>
-<result>{"success":true,"data":"..."}</result>
+<details type="tool_calls" done="true" name="terminal">
+<summary>✅ 💻 echo hello</summary>
+<arguments>{"tool_name": "terminal", "command": "echo hello"}</arguments>
+<result>{"output": "hello", "exit_code": 0, "error": null}</result>
 </details>
 ```
+
+- `<summary>` — 工具名稱 + emoji（供視覺識別）
+- `<arguments>` — 完整 JSON，包含 `tool_name` + 參數（讓模型能識別工具）
+- `<result>` — 工具執行結果
 
 **enhance 模式**：過濾中間狀態，完成時注入 `done="true"` 標籤。
 
