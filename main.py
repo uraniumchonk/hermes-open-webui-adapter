@@ -244,7 +244,7 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
         truncated = result[:5000] + ("..." if len(result) > 5000 else "")
         inner += f"\n<result>{html.escape(truncated)}</result>"
     
-    return f'<details {attrs}>{inner}\n</details>\n'
+    return f'<details {attrs}>{inner}\n</details>'
 
 
 def _build_content_chunk(content: str) -> bytes:
@@ -324,24 +324,30 @@ class ToolCallBuffer:
         工具完成 → 只注入 <details type="tool_calls" done="true"> 到 content stream。
         這樣 Open WebUI 會正確渲染 tool card，並把 result 存進歷史訊息。
         """
-        state = self.active_tools.pop(tc_id, {})
-        state["result"] = payload.get("result", "")
-        state["arguments"] = payload.get("arguments", state.get("arguments", {}))
-        
-        tool_name = state.get("tool", "unknown")
-        result = state.get("result", "")
-        
-        chunks = []
-        
-        # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
-        emoji = state.get("emoji", get_tool_emoji(tool_name))
-        label = state.get("label", tool_name)
-        details = _build_completion_details(tool_name, label, result)
-        
-        # 加 \n\n 確保 Markdown 正確解析 <details> block
-        chunks.append(_build_content_chunk(f"\n\n{details}"))
-        
-        return chunks
+        try:
+            state = self.active_tools.pop(tc_id, {})
+            state["result"] = payload.get("result", "")
+            state["arguments"] = payload.get("arguments", state.get("arguments", {}))
+            
+            tool_name = state.get("tool", "unknown")
+            result = state.get("result", "")
+            
+            chunks = []
+            
+            # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
+            emoji = state.get("emoji", get_tool_emoji(tool_name))
+            label = state.get("label", tool_name)
+            details = _build_completion_details(tool_name, label, result)
+            
+            # 加 \n\n 確保 Markdown 正確解析 <details> block
+            # 整個 <details> 在一個 chunk 中發出，避免被分割
+            chunks.append(_build_content_chunk(f"\n\n{details}\n"))
+            
+            logging.info(f"[enhance-v2] Tool completed: {tool_name} (result_len={len(result)}, chunks={len(chunks)})")
+            return chunks
+        except Exception as e:
+            logging.error(f"[enhance-v2] on_tool_completed ERROR: {e} for tc_id={tc_id}")
+            return []
     
     @property
     def has_active_tools(self) -> bool:
@@ -427,32 +433,32 @@ async def transform_stream(
                 done_received = True
                 break
 
-            # Parse the frame - support both "data:" and "data: " formats
-            lines = frame.strip().split("\n")
-            event_type = None
-            data_lines = []
+            try:
+                # Parse the frame - support both "data:" and "data: " formats
+                lines = frame.strip().split("\n")
+                event_type = None
+                data_lines = []
 
-            for line_item in lines:
-                if line_item.startswith("event: "):
-                    event_type = line_item[7:].strip()
-                elif line_item.startswith("data:") or line_item == "data:":
-                    # Support multiline data: collect all data lines
-                    data_lines.append(line_item[5:].lstrip(" "))
+                for line_item in lines:
+                    if line_item.startswith("event: "):
+                        event_type = line_item[7:].strip()
+                    elif line_item.startswith("data:") or line_item == "data:":
+                        # Support multiline data: collect all data lines
+                        data_lines.append(line_item[5:].lstrip(" "))
 
-            # Join multiline data with newlines (SSE spec)
-            data_str = "\n".join(data_lines) if data_lines else None
-            
-            # 單次 JSON 解析，緩存結果
-            parsed_json = None
-            if data_str:
-                try:
-                    parsed_json = json.loads(data_str)
-                except json.JSONDecodeError:
-                    pass
+                # Join multiline data with newlines (SSE spec)
+                data_str = "\n".join(data_lines) if data_lines else None
+                
+                # 單次 JSON 解析，緩存結果
+                parsed_json = None
+                if data_str:
+                    try:
+                        parsed_json = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        pass
 
-            # Handle hermes.tool.progress events
-            if event_type == "hermes.tool.progress":
-                if parsed_json:
+                # Handle hermes.tool.progress events
+                if event_type == "hermes.tool.progress" and parsed_json:
                     tc_id = parsed_json.get("toolCallId", "")
                     status = parsed_json.get("status", "")
                     tool = parsed_json.get("tool", "unknown")
@@ -501,71 +507,75 @@ async def transform_stream(
                             label = state.get("label", "")
                             res = final_result if final_result else state.get("result", "")
                             yield handle_tool_completion(tool_name, label, res)
-                # Do NOT yield - skip this frame
-                continue
+                    # Do NOT yield - skip this frame
+                    continue
 
-            # Handle <details> based on TOOL_MODE
-            if data_str and ("<details" in data_str or "<details" in frame):
-                if TOOL_MODE == "strip":
-                    modified_frame = _strip_details_from_content(frame)
-                elif TOOL_MODE == "enhance":
-                    # 過濾掉 done="false" 的標籤（只保留 completed 時注入的 done="true"）
-                    if parsed_json:
-                        try:
-                            delta = parsed_json.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if 'done="false"' in content:
-                                continue
-                        except (IndexError, KeyError):
-                            pass
-                    modified_frame = frame
-                elif TOOL_MODE == "enhance-v2":
-                    # enhance-v2: 過濾掉 Gateway 發送的原始 <details> 標籤
-                    # 我們自己在 completed 時注入正確的格式
-                    if parsed_json:
-                        try:
-                            delta = parsed_json.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if "<details" in content:
-                                continue
-                        except (IndexError, KeyError):
-                            pass
-                    modified_frame = frame
+                # Handle <details> based on TOOL_MODE
+                if data_str and ("<details" in data_str or "<details" in frame):
+                    if TOOL_MODE == "strip":
+                        modified_frame = _strip_details_from_content(frame)
+                    elif TOOL_MODE == "enhance":
+                        # 過濾掉 done="false" 的標籤（只保留 completed 時注入的 done="true"）
+                        if parsed_json:
+                            try:
+                                delta = parsed_json.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if 'done="false"' in content:
+                                    continue
+                            except (IndexError, KeyError):
+                                pass
+                        modified_frame = frame
+                    elif TOOL_MODE == "enhance-v2":
+                        # enhance-v2: 過濾掉 Gateway 發送的原始 <details> 標籤
+                        # 我們自己在 completed 時注入正確的格式
+                        if parsed_json:
+                            try:
+                                delta = parsed_json.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if "<details" in content:
+                                    continue
+                            except (IndexError, KeyError):
+                                pass
+                        modified_frame = frame
+                    else:
+                        # passthrough: keep <details> as-is
+                        modified_frame = frame
                 else:
-                    # passthrough: keep <details> as-is
                     modified_frame = frame
-            else:
-                modified_frame = frame
-            
-            # 自動分割檢查（使用已解析的 JSON）
-            if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
-                choices = parsed_json.get("choices")
-                if isinstance(choices, list) and len(choices) > 0:
-                    delta = choices[0].get("delta")
-                    if isinstance(delta, dict):
-                        content = delta.get("content", "")
-                        if isinstance(content, str) and content:
-                            accumulated_content += content
-                            
-                            # 檢查是否超過閾值
-                            if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
-                                has_split = True
-                                # 發送 [DONE] 結束當前 stream
-                                yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
-                                yield b'data: [DONE]\n\n'
-                                # 發送分割事件
-                                split_event = {
-                                    "type": "session.split",
-                                    "message": "會話自動分割，繼續中...",
-                                    "chars_processed": len(accumulated_content)
-                                }
-                                yield b'event: session.split\n'
-                                yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
-                                # 清空計數器，繼續處理後續內容
-                                accumulated_content = ""
-            
-            # 即時輸出，避免累積
-            yield (modified_frame + "\n\n").encode("utf-8")
+                
+                # 自動分割檢查（使用已解析的 JSON）
+                if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
+                    choices = parsed_json.get("choices")
+                    if isinstance(choices, list) and len(choices) > 0:
+                        delta = choices[0].get("delta")
+                        if isinstance(delta, dict):
+                            content = delta.get("content", "")
+                            if isinstance(content, str) and content:
+                                accumulated_content += content
+                                
+                                # 檢查是否超過閾值
+                                if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
+                                    has_split = True
+                                    # 發送 [DONE] 結束當前 stream
+                                    yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
+                                    yield b'data: [DONE]\n\n'
+                                    # 發送分割事件
+                                    split_event = {
+                                        "type": "session.split",
+                                        "message": "會話自動分割，繼續中...",
+                                        "chars_processed": len(accumulated_content)
+                                    }
+                                    yield b'event: session.split\n'
+                                    yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
+                                    # 清空計數器，繼續處理後續內容
+                                    accumulated_content = ""
+                
+                # 即時輸出，避免累積
+                yield (modified_frame + "\n\n").encode("utf-8")
+                
+            except Exception as e:
+                logging.error(f"[transform_stream] Frame processing ERROR: {e} | frame_preview={frame[:200]}")
+                continue
 
         # 如果收到 [DONE]，跳出外層循環
         if done_received:
