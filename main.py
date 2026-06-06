@@ -74,7 +74,7 @@ CONFIG = _load_config()
 # ── App ───────────────────────────────────────────────────
 APP = FastAPI(title="Hermes Tool Card Enhancer Router")
 
-BIND_HOST = CONFIG.get("bind_host", "0.0.0.0")
+BIND_HOST = CONFIG.get("bind_host", "127.0.0.1")  # 預設只綁定本機
 BIND_PORT = CONFIG.get("bind_port", 9099)
 
 # Port routing table: path prefix -> upstream base URL
