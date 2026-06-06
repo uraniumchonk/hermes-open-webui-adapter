@@ -579,6 +579,10 @@ async def transform_stream(
         cleaned = buffer.decode("utf-8", errors="replace").rstrip("\r\n")
         if cleaned:
             yield (cleaned + "\n\n").encode("utf-8")
+    
+    # If upstream disconnected without sending [DONE], send a proper finish
+    if not done_received and not split_done:
+        yield _build_finish_chunk(completion_id, created, model, "stop")
 
 
 # ── Shared aiohttp session ────────────────────────────────
