@@ -1,0 +1,22 @@
+# ═══════════════════════════════════════════════════════════
+# Hermes Tool Card Enhancer Proxy — Configuration
+# ═══════════════════════════════════════════════════════════
+#
+# 環境變數可以覆蓋此設定 (TOOL_MODE, BIND_PORT, BIND_HOST, AUTO_SPLIT_THRESHOLD)
+#
+# 詳細說明請參考 README.md
+
+# ── Server ─────────────────────────────────────────────────
+bind_host: "0.0.0.0"
+bind_port: 9099
+
+# ── Tool Display Mode ──────────────────────────────────────
+# passthrough : 直接透傳 <details> 標籤（最安全）
+# enhance     : 過濾 done=false + 注入帶 label 的完成標籤（推薦）
+# strip       : 移除 <details> 並替換為純文字
+tool_mode: "enhance-v2"
+
+# ── Auto Split ─────────────────────────────────────────────
+# 自動分割閾值（字元數），0 表示關閉
+# 注意: Conduit APP 不支援 session.split 事件
+auto_split_threshold: 0

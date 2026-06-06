@@ -1,0 +1,13 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 8b53db3a9..056fa1c5f 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1146,6 +1146,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                     "tool": function_name,
+                     "toolCallId": tool_call_id,
+                     "status": "completed",
++                    "arguments": function_args or {},
++                    "result": str(function_result) if function_result is not None else "",
+                 }))
+ 
+             # Start agent in background.  agent_ref is a mutable container

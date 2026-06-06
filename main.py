@@ -23,8 +23,9 @@ import html
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, AsyncGenerator
+from typing import Any, Dict, Optional, AsyncGenerator, List, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -208,31 +209,38 @@ def _strip_details_from_content(frame: str) -> str:
 # ── Tool Mode Handlers ─────────────────────────────────────
 
 
+def _encode_detail_attribute(value: Any) -> str:
+    """
+    Encode a value as a <details> attribute:
+    JSON encode -> HTML escape (for safe attribute embedding).
+    """
+    if not value:
+        return ""
+    json_str = json.dumps(value, ensure_ascii=False)
+    return html.escape(json_str, quote=True)
+
+
 def _build_completion_details(tool_name: str, label: str = "", result: str = "") -> str:
     """
     Build a complete <details> tag for a completed tool call.
     
-    - 確保 name 屬性正確（不會為空）
-    - 使用 label 作為 input 參數顯示（放在 <arguments> 標籤內）
-    - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
-    - 結果截斷（最多 5000 字元）
+    Conduit APP 規格：arguments/result 必須是屬性（attribute），不是子標籤。
+    屬性值經過 JSON 編碼 -> HTML 轉義雙重編碼。
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
-    inner = "\n<summary>Done</summary>"
-    
+    # arguments 作為屬性
     if label:
-        # arguments 放在標籤內，用 html.escape 避免 XSS
-        inner += f"\n<arguments>{html.escape(label)}</arguments>"
+        attrs += f' arguments="{_encode_detail_attribute(label)}"'
     
+    # result 作為屬性（截斷到 5000 字元）
     if result:
-        # result 放在標籤內，用 html.escape 避免 XSS
         truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        inner += f"\n<result>{html.escape(truncated)}</result>"
+        attrs += f' result="{_encode_detail_attribute(truncated)}"'
     
-    return f'<details {attrs}>{inner}\n</details>\n'
+    return f'<details {attrs}>\n<summary>Done</summary>\n</details>\n'
 
 
 def _build_content_chunk(content: str) -> bytes:
@@ -246,8 +254,248 @@ def handle_tool_completion(tool_name: str, label: str = "", result: str = "") ->
     details = _build_completion_details(tool_name, label, result)
     return _build_content_chunk(details)
 
+
+# ── Standard OpenAI tool_calls format builders ─────────────
+
+def _build_tool_call_delta_chunk(
+    completion_id: str, created: int, model: str,
+    index: int, tool_call_id: str, tool_name: str, arguments: Any
+) -> bytes:
+    """
+    Build a standard OpenAI tool_calls delta chunk.
+    
+    Format:
+    {
+      "id": "...",
+      "object": "chat.completion.chunk",
+      "created": ...,
+      "model": "...",
+      "choices": [{
+        "index": 0,
+        "delta": {
+          "tool_calls": [{
+            "index": 0,
+            "id": "call_xxx",
+            "type": "function",
+            "function": {
+              "name": "terminal",
+              "arguments": "{\"input\": \"echo hello\"}"
+            }
+          }]
+        }
+      }]
+    }
+    """
+    # Ensure arguments is a JSON string
+    if isinstance(arguments, dict):
+        args_str = json.dumps(arguments, ensure_ascii=False)
+    elif isinstance(arguments, str):
+        args_str = arguments
+    else:
+        args_str = str(arguments)
+    
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": index,
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": args_str,
+                    }
+                }]
+            },
+            "finish_reason": None,
+        }],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _build_tool_result_chunk(
+    completion_id: str, created: int, model: str,
+    tool_call_id: str, result: str
+) -> bytes:
+    """
+    Build a standard OpenAI tool role message chunk.
+    
+    Format:
+    {
+      "id": "...",
+      "object": "chat.completion.chunk",
+      "created": ...,
+      "model": "...",
+      "choices": [{
+        "index": 0,
+        "delta": {
+          "role": "tool",
+          "tool_call_id": "call_xxx",
+          "content": "result..."
+        },
+        "finish_reason": None
+      }]
+    }
+    """
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result if result else "",
+            },
+            "finish_reason": None,
+        }],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _build_finish_chunk(
+    completion_id: str, created: int, model: str,
+    finish_reason: str, usage: Optional[dict] = None
+) -> bytes:
+    """Build a finish chunk."""
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish_reason,
+        }],
+    }
+    if usage:
+        chunk["usage"] = usage
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+# ── Enhance-v2: Blocking Translation Mode ─────────────────
+# 
+# 核心概念：
+# 1. 收到 running 事件 → 開始緩衝後續 content
+# 2. 收到 completed 事件 → 輸出標準 tool_calls delta + tool role + 緩衝 content
+# 3. 這讓 Open WebUI 能正確儲存完整的 conversation history
+
+class ToolCallBuffer:
+    """
+    堵塞翻譯緩衝器。
+    
+    當工具開始執行時，緩衝所有後續的 content delta。
+    當工具完成時，先輸出標準格式的 tool_calls + tool result，再 flush 緩衝的內容。
+    """
+    
+    MAX_BUFFER_SIZE = 100_000  # 100KB 上限，防止記憶體洩漏
+    
+    def __init__(self):
+        self.content_buffer: List[str] = []
+        self.buffering = False
+        self.buffer_size = 0
+        # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments, result}
+        self.active_tools: Dict[str, dict] = {}
+        # 已完成但等待輸出的工具（按順序）
+        self.completed_queue: List[Tuple[str, dict]] = []
+        # 工具調用索引計數器（用於 OpenAI index 欄位）
+        self.tool_call_index = 0
+    
+    def on_tool_running(self, tc_id: str, payload: dict) -> None:
+        """工具開始執行，開始緩衝。"""
+        self.active_tools[tc_id] = {
+            "tool": payload.get("tool", "unknown"),
+            "emoji": payload.get("emoji", ""),
+            "label": payload.get("label", payload.get("tool", "unknown")),
+            "arguments": payload.get("arguments", {}),
+            "index": self.tool_call_index,
+        }
+        self.tool_call_index += 1
+        self.buffering = True
+    
+    def on_tool_completed(self, tc_id: str, payload: dict) -> None:
+        """工具完成，加入完成佇列。"""
+        state = self.active_tools.pop(tc_id, {})
+        state["result"] = payload.get("result", "")
+        state["arguments"] = payload.get("arguments", state.get("arguments", {}))
+        self.completed_queue.append((tc_id, state))
+        
+        # 如果沒有其他活躍工具，停止緩衝
+        if not self.active_tools:
+            self.buffering = False
+    
+    def on_content(self, content: str) -> None:
+        """緩衝 content delta。"""
+        if self.buffering:
+            self.buffer_size += len(content)
+            if self.buffer_size <= self.MAX_BUFFER_SIZE:
+                self.content_buffer.append(content)
+            else:
+                # 超過上限，強制 flush 並停止緩衝
+                logger.warning(f"Buffer exceeded {self.MAX_BUFFER_SIZE} chars, flushing and stopping")
+                self.buffering = False
+    
+    def flush_completed(self, completion_id: str, created: int, model: str) -> List[bytes]:
+        """
+        Flush 所有已完成工具的標準格式 chunks。
+        返回要輸出的 chunks 列表。
+        """
+        chunks = []
+        while self.completed_queue:
+            tc_id, state = self.completed_queue.pop(0)
+            
+            tool_name = state.get("tool", "unknown")
+            arguments = state.get("arguments", {})
+            result = state.get("result", "")
+            index = state.get("index", 0)
+            
+            # 1. 標準 tool_calls delta
+            chunks.append(_build_tool_call_delta_chunk(
+                completion_id, created, model,
+                index, tc_id, tool_name, arguments
+            ))
+            
+            # 2. 標準 tool role message
+            chunks.append(_build_tool_result_chunk(
+                completion_id, created, model,
+                tc_id, result
+            ))
+            
+            # 3. <details> 標籤（供 Conduit APP 渲染）
+            emoji = state.get("emoji", get_tool_emoji(tool_name))
+            label = state.get("label", "")
+            details = _build_completion_details(tool_name, label, result)
+            chunks.append(_build_content_chunk(f"\n\n{details}"))
+        
+        return chunks
+    
+    def flush_content(self) -> List[bytes]:
+        """Flush 緩衝的內容。"""
+        chunks = []
+        if self.content_buffer:
+            # 將所有緩衝的 content visor 合併後輸出
+            combined = "".join(self.content_buffer)
+            if combined:
+                chunks.append(_build_content_chunk(combined))
+            self.content_buffer = []
+            self.buffer_size = 0
+        return chunks
+    
+    @property
+    def is_empty(self) -> bool:
+        return not self.active_tools and not self.completed_queue and not self.content_buffer
+
+
 async def transform_stream(
-    reader: asyncio.StreamReader,
+    reader: aiohttp.StreamReader,
     model: str,
     completion_id: str,
     created: int,
@@ -257,13 +505,14 @@ async def transform_stream(
     """
     從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件。
 
-    對於 status=completed 的事件，額外注入一個 <details done="true"> 的
-    delta.content chunk，讓 Conduit APP 能正確顯示工具卡片狀態。
-    
     TOOL_MODE 控制處理策略：
-    - passthrough: 直接透傳 <details> 標籤（預設）
+    - passthrough: 直接透傳所有資料
     - enhance: 過濾 done=false + 在 completed 時注入帶 label 的完成標籤
     - strip: 移除 <details> 並替換為純文字
+    - enhance-v2: 堵塞翻譯模式
+      - 不發送 running 卡片
+      - 在 completed 時輸出標準 OpenAI tool_calls delta + tool role + <details>
+      - 緩衝 tool 執行期間的 content，等 completed 後再輸出
     
     性能優化：
     - 使用 bytes buffer 避免反覆 decode/encode
@@ -275,9 +524,9 @@ async def transform_stream(
     - 確保即使上游暫時沒有數據，客戶端也不會超時
     """
 
-    # Track tool states: toolCallId -> {tool, emoji, label, arguments, result}
+    # Track tool states for legacy modes
     tool_states: Dict[str, dict] = {}
-
+    
     done_received = False
     split_done = False  # 是否已發送過分割標記
 
@@ -291,6 +540,9 @@ async def transform_stream(
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
     heartbeat_interval = 10.0  # 每 10 秒發送心跳（比 gateway 的 30 秒更頻繁）
+    
+    # enhance-v2 專用緩衝器
+    v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
 
     while True:
         # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
@@ -317,9 +569,17 @@ async def transform_stream(
 
             # Check for [DONE] signal early - stop processing after it
             if "[DONE]" in frame and not done_received:
+                # enhance-v2: flush 剩餘緩衝
+                if v2_buffer:
+                    chunks = v2_buffer.flush_completed(completion_id, created, model)
+                    for chunk in chunks:
+                        yield chunk
+                    chunks = v2_buffer.flush_content()
+                    for chunk in chunks:
+                        yield chunk
+                
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
-                # 不要直接 return！先處理 buffer 中剩餘的數據
                 break
 
             # Parse the frame - support both "data:" and "data: " formats
@@ -354,6 +614,20 @@ async def transform_stream(
                     arguments = parsed_json.get("arguments", {})
                     result = parsed_json.get("result", "")
 
+                    # ── enhance-v2 模式 ──
+                    if TOOL_MODE == "enhance-v2" and v2_buffer:
+                        if status == "running":
+                            v2_buffer.on_tool_running(tc_id, parsed_json)
+                        elif status == "completed":
+                            v2_buffer.on_tool_completed(tc_id, parsed_json)
+                            # 立即 flush 已完成工具的標準格式
+                            chunks = v2_buffer.flush_completed(completion_id, created, model)
+                            for chunk in chunks:
+                                yield chunk
+                        # 跳過 hermes.tool.progress 事件，不發送給客戶端
+                        continue
+                    
+                    # ── 其他模式 ──
                     if status == "running":
                         tool_states[tc_id] = {
                             "tool": tool,
@@ -363,7 +637,6 @@ async def transform_stream(
                             "result": "",
                         }
                         # 立即發送 running 狀態的佔位符，保持 stream 活躍
-                        # 這防止了工具執行期間 SSE stream 完全停頓導致超時
                         if TOOL_MODE == "enhance":
                             emoji = parsed_json.get("emoji", get_tool_emoji(tool))
                             label = parsed_json.get("label", tool)
@@ -400,41 +673,69 @@ async def transform_stream(
                         except (IndexError, KeyError):
                             pass
                     modified_frame = frame
+                elif TOOL_MODE == "enhance-v2":
+                    # enhance-v2: 過濾掉 Gateway 發送的原始 <details> 標籤
+                    # 我們自己在 completed 時注入正確的格式
+                    if parsed_json:
+                        try:
+                            delta = parsed_json.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if "<details" in content:
+                                continue
+                        except (IndexError, KeyError):
+                            pass
+                    modified_frame = frame
                 else:
                     # passthrough: keep <details> as-is
                     modified_frame = frame
             else:
                 modified_frame = frame
             
-            # 自動分割檢查（使用已解析的 JSON）
-            if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
-                choices = parsed_json.get("choices")
-                if isinstance(choices, list) and len(choices) > 0:
-                    delta = choices[0].get("delta")
-                    if isinstance(delta, dict):
+            # enhance-v2: 如果正在緩衝，將 content 存入緩衝區
+            if TOOL_MODE == "enhance-v2" and v2_buffer and v2_buffer.buffering:
+                if parsed_json:
+                    try:
+                        delta = parsed_json.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
                         if isinstance(content, str) and content:
-                            accumulated_content += content
-                            
-                            # 檢查是否超過閾值
-                            if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
-                                has_split = True
-                                # 發送 [DONE] 結束當前 stream
-                                yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
-                                yield b'data: [DONE]\n\n'
-                                # 發送分割事件
-                                split_event = {
-                                    "type": "session.split",
-                                    "message": "會話自動分割，繼續中...",
-                                    "chars_processed": len(accumulated_content)
-                                }
-                                yield b'event: session.split\n'
-                                yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
-                                # 清空計數器，繼續處理後續內容
-                                accumulated_content = ""
-            
-            # 即時輸出，避免累積
-            yield (modified_frame + "\n\n").encode("utf-8")
+                            v2_buffer.on_content(content)
+                            continue  # 不立即輸出，等待 tool completed
+                    except (IndexError, KeyError):
+                        pass
+                # 如果不是 content delta（例如 role chunk），直接輸出
+                yield (modified_frame + "\n\n").encode("utf-8")
+            else:
+                # 非 enhance-v2 或不在緩衝中，正常輸出
+                
+                # 自動分割檢查（使用已解析的 JSON）
+                if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
+                    choices = parsed_json.get("choices")
+                    if isinstance(choices, list) and len(choices) > 0:
+                        delta = choices[0].get("delta")
+                        if isinstance(delta, dict):
+                            content = delta.get("content", "")
+                            if isinstance(content, str) and content:
+                                accumulated_content += content
+                                
+                                # 檢查是否超過閾值
+                                if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
+                                    has_split = True
+                                    # 發送 [DONE] 結束當前 stream
+                                    yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
+                                    yield b'data: [DONE]\n\n'
+                                    # 發送分割事件
+                                    split_event = {
+                                        "type": "session.split",
+                                        "message": "會話自動分割，繼續中...",
+                                        "chars_processed": len(accumulated_content)
+                                    }
+                                    yield b'event: session.split\n'
+                                    yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
+                                    # 清空計數器，繼續處理後續內容
+                                    accumulated_content = ""
+                
+                # 即時輸出，避免累積
+                yield (modified_frame + "\n\n").encode("utf-8")
 
         # 如果收到 [DONE]，跳出外層循環
         if done_received:
@@ -442,6 +743,15 @@ async def transform_stream(
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
+        # enhance-v2: 先 flush 緩衝器
+        if v2_buffer:
+            chunks = v2_buffer.flush_completed(completion_id, created, model)
+            for chunk in chunks:
+                yield chunk
+            chunks = v2_buffer.flush_content()
+            for chunk in chunks:
+                yield chunk
+        
         # Ensure the residual buffer ends with \n\n for proper SSE framing
         cleaned = buffer.decode("utf-8", errors="replace").rstrip("\r\n")
         if cleaned:
@@ -549,24 +859,29 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
 
     # --- Non-streaming path (passthrough) ---
     method = request.method.upper()
+    resp_body = b""
+    resp_status = 502
+    resp_headers = {}
     try:
         async with sess.request(
             method, upstream_url, data=body, headers=fwd_headers
         ) as resp:
             resp_body = await resp.read()
+            resp_status = resp.status
+            resp_headers = dict(resp.headers)
             try:
                 parsed = json.loads(resp_body) if resp_body else {}
             except json.JSONDecodeError:
                 parsed = {}
             return JSONResponse(
                 content=parsed,
-                status_code=resp.status,
+                status_code=resp_status,
             )
     except json.JSONDecodeError:
         return Response(
-            content=await resp.read() if resp_body else b"",
-            status_code=resp.status,
-            headers=dict(resp.headers),
+            content=resp_body,
+            status_code=resp_status,
+            headers=resp_headers,
         )
 
 
@@ -625,10 +940,8 @@ async def proxy_default(request: Request, rest: str):
                     ):
                         yield chunk
             except aiohttp.ServerDisconnectedError:
-                # Upstream disconnected after auto-split — this is expected, not an error
                 logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
             except aiohttp.ClientError as e:
-                # Other client errors (connection reset, timeout, etc.)
                 logger.warning(f"[port={upstream_port}] Client error: {e}")
             except Exception as e:
                 logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}")
