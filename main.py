@@ -220,12 +220,13 @@ def _encode_detail_attribute(value: Any) -> str:
     return html.escape(json_str, quote=True)
 
 
-def _build_completion_details(tool_name: str, label: str = "", result: str = "") -> str:
+def _build_completion_details(tool_name: str, label: str = "", result: str = "", arguments: Optional[dict] = None) -> str:
     """
     Build a complete <details> tag for a completed tool call.
     
     - 確保 name 屬性正確（不會為空）
-    - 使用 label 作為 input 參數顯示（放在 <arguments> 標籤內）
+    - <summary> 顯示工具名稱 + emoji（供用戶視覺識別）
+    - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
     """
@@ -233,11 +234,28 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
-    inner = "\n<summary>Done</summary>"
+    # <summary> 包含工具名稱 + emoji（供視覺渲染）
+    emoji = get_tool_emoji(tool_name)
+    display_name = label if label else tool_name
+    safe_display = html.escape(display_name)
+    inner = f"\n<summary>✅ {emoji} {safe_display}</summary>"
     
-    if label:
-        # arguments 放在標籤內，用 html.escape 避免 XSS
-        inner += f"\n<arguments>{html.escape(label)}</arguments>"
+    # <arguments> 標籤：包含 tool_name + 完整參數（讓模型能識別工具）
+    if arguments:
+        # 將 tool_name 加入 arguments，讓模型知道這是哪個工具
+        full_args = {"tool_name": tool_name, **arguments}
+        args_str = json.dumps(full_args, ensure_ascii=False)
+        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
+    elif label:
+        # fallback: 只有 label，也加入 tool_name
+        full_args = {"tool_name": tool_name, "label": label}
+        args_str = json.dumps(full_args, ensure_ascii=False)
+        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
+    else:
+        # 最後 fallback: 只有 tool_name
+        full_args = {"tool_name": tool_name}
+        args_str = json.dumps(full_args, ensure_ascii=False)
+        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     
     if result:
         # result 放在標籤內，用 html.escape 避免 XSS
@@ -337,7 +355,8 @@ class ToolCallBuffer:
             # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
             emoji = state.get("emoji", get_tool_emoji(tool_name))
             label = state.get("label", tool_name)
-            details = _build_completion_details(tool_name, label, result)
+            arguments = state.get("arguments", {})
+            details = _build_completion_details(tool_name, label, result, arguments)
             
             # 加 \n\n 確保 Markdown 正確解析 <details> block
             # 整個 <details> 在一個 chunk 中發出，避免被分割
