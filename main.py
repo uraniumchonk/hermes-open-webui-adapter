@@ -25,7 +25,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, AsyncGenerator, List, Tuple
+from typing import Any, Dict, Optional, AsyncGenerator, List
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -390,27 +390,22 @@ def _build_finish_chunk(
 
 class ToolCallBuffer:
     """
-    堵塞翻譯緩衝器。
+    輕量級工具狀態追蹤器。
     
-    當工具開始執行時，緩衝所有後續的 content delta。
-    當工具完成時，先輸出標準格式的 tool_calls + tool result，再 flush 緩衝的內容。
+    不緩衝 content — content 正常串流輸出。
+    只在 tool completed 時輸出標準格式的 tool_calls + tool result。
+    
+    這樣 content 可以即時串流，不會被阻塞。
     """
     
-    MAX_BUFFER_SIZE = 100_000  # 100KB 上限，防止記憶體洩漏
-    
     def __init__(self):
-        self.content_buffer: List[str] = []
-        self.buffering = False
-        self.buffer_size = 0
-        # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments, result}
+        # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments, index}
         self.active_tools: Dict[str, dict] = {}
-        # 已完成但等待輸出的工具（按順序）
-        self.completed_queue: List[Tuple[str, dict]] = []
         # 工具調用索引計數器（用於 OpenAI index 欄位）
         self.tool_call_index = 0
     
     def on_tool_running(self, tc_id: str, payload: dict) -> None:
-        """工具開始執行，開始緩衝。"""
+        """工具開始執行，記錄狀態。"""
         self.active_tools[tc_id] = {
             "tool": payload.get("tool", "unknown"),
             "emoji": payload.get("emoji", ""),
@@ -419,79 +414,47 @@ class ToolCallBuffer:
             "index": self.tool_call_index,
         }
         self.tool_call_index += 1
-        self.buffering = True
     
-    def on_tool_completed(self, tc_id: str, payload: dict) -> None:
-        """工具完成，加入完成佇列。"""
+    def on_tool_completed(self, tc_id: str, payload: dict, 
+                          completion_id: str, created: int, model: str) -> List[bytes]:
+        """
+        工具完成，立即返回標準格式的 chunks。
+        不緩衝，直接返回。
+        """
         state = self.active_tools.pop(tc_id, {})
         state["result"] = payload.get("result", "")
         state["arguments"] = payload.get("arguments", state.get("arguments", {}))
-        self.completed_queue.append((tc_id, state))
         
-        # 如果沒有其他活躍工具，停止緩衝
-        if not self.active_tools:
-            self.buffering = False
-    
-    def on_content(self, content: str) -> None:
-        """緩衝 content delta。"""
-        if self.buffering:
-            self.buffer_size += len(content)
-            if self.buffer_size <= self.MAX_BUFFER_SIZE:
-                self.content_buffer.append(content)
-            else:
-                # 超過上限，強制 flush 並停止緩衝
-                logger.warning(f"Buffer exceeded {self.MAX_BUFFER_SIZE} chars, flushing and stopping")
-                self.buffering = False
-    
-    def flush_completed(self, completion_id: str, created: int, model: str) -> List[bytes]:
-        """
-        Flush 所有已完成工具的標準格式 chunks。
-        返回要輸出的 chunks 列表。
-        """
-        chunks = []
-        while self.completed_queue:
-            tc_id, state = self.completed_queue.pop(0)
-            
-            tool_name = state.get("tool", "unknown")
-            arguments = state.get("arguments", {})
-            result = state.get("result", "")
-            index = state.get("index", 0)
-            
-            # 1. 標準 tool_calls delta
-            chunks.append(_build_tool_call_delta_chunk(
-                completion_id, created, model,
-                index, tc_id, tool_name, arguments
-            ))
-            
-            # 2. 標準 tool role message
-            chunks.append(_build_tool_result_chunk(
-                completion_id, created, model,
-                tc_id, result
-            ))
-            
-            # 3. <details> 標籤（供 Conduit APP 渲染）
-            emoji = state.get("emoji", get_tool_emoji(tool_name))
-            label = state.get("label", "")
-            details = _build_completion_details(tool_name, label, result)
-            chunks.append(_build_content_chunk(f"\n\n{details}"))
+        tool_name = state.get("tool", "unknown")
+        arguments = state.get("arguments", {})
+        result = state.get("result", "")
+        index = state.get("index", 0)
         
-        return chunks
-    
-    def flush_content(self) -> List[bytes]:
-        """Flush 緩衝的內容。"""
         chunks = []
-        if self.content_buffer:
-            # 將所有緩衝的 content visor 合併後輸出
-            combined = "".join(self.content_buffer)
-            if combined:
-                chunks.append(_build_content_chunk(combined))
-            self.content_buffer = []
-            self.buffer_size = 0
+        
+        # 1. 標準 tool_calls delta
+        chunks.append(_build_tool_call_delta_chunk(
+            completion_id, created, model,
+            index, tc_id, tool_name, arguments
+        ))
+        
+        # 2. 標準 tool role message
+        chunks.append(_build_tool_result_chunk(
+            completion_id, created, model,
+            tc_id, result
+        ))
+        
+        # 3. <details> 標籤（供 UI 渲染）
+        emoji = state.get("emoji", get_tool_emoji(tool_name))
+        label = state.get("label", "")
+        details = _build_completion_details(tool_name, label, result)
+        chunks.append(_build_content_chunk(f"\n\n{details}"))
+        
         return chunks
     
     @property
-    def is_empty(self) -> bool:
-        return not self.active_tools and not self.completed_queue and not self.content_buffer
+    def has_active_tools(self) -> bool:
+        return bool(self.active_tools)
 
 
 async def transform_stream(
@@ -569,15 +532,6 @@ async def transform_stream(
 
             # Check for [DONE] signal early - stop processing after it
             if "[DONE]" in frame and not done_received:
-                # enhance-v2: flush 剩餘緩衝
-                if v2_buffer:
-                    chunks = v2_buffer.flush_completed(completion_id, created, model)
-                    for chunk in chunks:
-                        yield chunk
-                    chunks = v2_buffer.flush_content()
-                    for chunk in chunks:
-                        yield chunk
-                
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
                 break
@@ -619,9 +573,10 @@ async def transform_stream(
                         if status == "running":
                             v2_buffer.on_tool_running(tc_id, parsed_json)
                         elif status == "completed":
-                            v2_buffer.on_tool_completed(tc_id, parsed_json)
-                            # 立即 flush 已完成工具的標準格式
-                            chunks = v2_buffer.flush_completed(completion_id, created, model)
+                            # 立即輸出標準格式（不緩衝，直接返回 chunks）
+                            chunks = v2_buffer.on_tool_completed(
+                                tc_id, parsed_json, completion_id, created, model
+                            )
                             for chunk in chunks:
                                 yield chunk
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
@@ -691,51 +646,35 @@ async def transform_stream(
             else:
                 modified_frame = frame
             
-            # enhance-v2: 如果正在緩衝，將 content 存入緩衝區
-            if TOOL_MODE == "enhance-v2" and v2_buffer and v2_buffer.buffering:
-                if parsed_json:
-                    try:
-                        delta = parsed_json.get("choices", [{}])[0].get("delta", {})
+            # 自動分割檢查（使用已解析的 JSON）
+            if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
+                choices = parsed_json.get("choices")
+                if isinstance(choices, list) and len(choices) > 0:
+                    delta = choices[0].get("delta")
+                    if isinstance(delta, dict):
                         content = delta.get("content", "")
                         if isinstance(content, str) and content:
-                            v2_buffer.on_content(content)
-                            continue  # 不立即輸出，等待 tool completed
-                    except (IndexError, KeyError):
-                        pass
-                # 如果不是 content delta（例如 role chunk），直接輸出
-                yield (modified_frame + "\n\n").encode("utf-8")
-            else:
-                # 非 enhance-v2 或不在緩衝中，正常輸出
-                
-                # 自動分割檢查（使用已解析的 JSON）
-                if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
-                    choices = parsed_json.get("choices")
-                    if isinstance(choices, list) and len(choices) > 0:
-                        delta = choices[0].get("delta")
-                        if isinstance(delta, dict):
-                            content = delta.get("content", "")
-                            if isinstance(content, str) and content:
-                                accumulated_content += content
-                                
-                                # 檢查是否超過閾值
-                                if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
-                                    has_split = True
-                                    # 發送 [DONE] 結束當前 stream
-                                    yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
-                                    yield b'data: [DONE]\n\n'
-                                    # 發送分割事件
-                                    split_event = {
-                                        "type": "session.split",
-                                        "message": "會話自動分割，繼續中...",
-                                        "chars_processed": len(accumulated_content)
-                                    }
-                                    yield b'event: session.split\n'
-                                    yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
-                                    # 清空計數器，繼續處理後續內容
-                                    accumulated_content = ""
-                
-                # 即時輸出，避免累積
-                yield (modified_frame + "\n\n").encode("utf-8")
+                            accumulated_content += content
+                            
+                            # 檢查是否超過閾值
+                            if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
+                                has_split = True
+                                # 發送 [DONE] 結束當前 stream
+                                yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
+                                yield b'data: [DONE]\n\n'
+                                # 發送分割事件
+                                split_event = {
+                                    "type": "session.split",
+                                    "message": "會話自動分割，繼續中...",
+                                    "chars_processed": len(accumulated_content)
+                                }
+                                yield b'event: session.split\n'
+                                yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
+                                # 清空計數器，繼續處理後續內容
+                                accumulated_content = ""
+            
+            # 即時輸出，避免累積
+            yield (modified_frame + "\n\n").encode("utf-8")
 
         # 如果收到 [DONE]，跳出外層循環
         if done_received:
@@ -743,15 +682,6 @@ async def transform_stream(
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
-        # enhance-v2: 先 flush 緩衝器
-        if v2_buffer:
-            chunks = v2_buffer.flush_completed(completion_id, created, model)
-            for chunk in chunks:
-                yield chunk
-            chunks = v2_buffer.flush_content()
-            for chunk in chunks:
-                yield chunk
-        
         # Ensure the residual buffer ends with \n\n for proper SSE framing
         cleaned = buffer.decode("utf-8", errors="replace").rstrip("\r\n")
         if cleaned:
