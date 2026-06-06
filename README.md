@@ -46,24 +46,20 @@
 
 When using **Hermes Agent as a server-side tool executor** through Open WebUI, the model experiences **complete amnesia** — it forgets tool execution results after the tool loop finishes. The model cannot reference previous tool outputs, leading to confused behavior and errors.
 
-### Evidence: Token Count Analysis
+### Evidence: Token Count Discrepancy
 
-Data captured from `metrics_proxy` shows the issue clearly:
+When a tool loop runs, the prompt_tokens during the loop increases significantly (tool results are included internally). However, when the user sends a new message after the tool loop completes, the prompt_tokens drops back to near the original count — proving tool results were **not** persisted in the conversation history.
 
-```
-Time         Model              Input    Output  TTFT      TG/s    Duration
-05:46:45    qwen-27b-default   18698    396     1,578ms   37.8    12,062ms
-05:46:27    qwen-27b-default   21240    384     2,258ms   41.2    11,568ms
-05:46:15    qwen-27b-default   19576    72      2,045ms   55.1    3,353ms
-05:46:12    qwen-27b-default   18301    57      1,195ms   61.0    2,130ms
-```
+**Example:**
 
-**Key findings:**
+| Step | Description | prompt_tokens |
+|------|-------------|---------------|
+| 1 | Initial message | ~18,301 |
+| 2 | Tool loop (internal) | ~21,240 (+2,939) |
+| 3 | New message (after tool loop) | ~18,698 |
 
-- `05:46:12 → 05:46:27`: prompt_tokens jumped from **18,301 → 21,240** (+2,939 tokens during tool loop)
-- `05:46:45` (new message after tool loop): prompt_tokens dropped to **18,698** — only +397 tokens over original
-- **Expected**: ~21,240+ tokens if tool results were properly included
-- **Actual**: 18,698 — tool results were **NOT** in the conversation history
+- **Expected at step 3**: ~21,240+ tokens (tool results in history)
+- **Actual at step 3**: ~18,698 — tool results were **NOT** in the conversation history
 
 This proves Open WebUI reconstructed the conversation **without tool results**, causing the model to lose all context from tool execution.
 
@@ -125,14 +121,7 @@ Configured as `enhance-v2` but code only checked `TOOL_MODE == "enhance"`, so it
 
 Receives an assistant message with only the final response text. Without standard tool messages in the stream, nothing gets stored. When the user sends a new message, the reconstructed history has no tool context.
 
-**✅ Verification: Hermes Gateway internally is correct.** From `kv_cache.log`:
-```
-19:26:01 | prompt_tokens=32833 | msgs=14 | tools_def=26
-  system: 1 messages, 23897 chars
-  user: 1 messages, 1282 chars
-  assistant: 6 messages, 356 chars
-  tool: 6 messages, 37033 chars  ← tool results ARE present internally
-```
+**✅ Verification: Hermes Gateway internally is correct.** Hermes' internal KV cache confirms tool messages and results are properly maintained during the agent loop — the issue is purely in the SSE output pipeline.
 
 The issue is in the **SSE transformation pipeline**, not in Hermes itself.
 
@@ -180,11 +169,7 @@ Hermes Gateway API Server (30001)
     │ Runs full agent loop with tool execution
     ▼
 vLLM (backend)
-    │
-    └── metrics_proxy (18080) monitors vLLM instances
 ```
-
-> **Note**: metrics_proxy is NOT in the data path — it monitors a separate vLLM port.
 
 ### Request Flow
 
