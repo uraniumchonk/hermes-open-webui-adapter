@@ -4,7 +4,17 @@ Hermes SSE Tool Card Enhancer Proxy (Multi-Tenant Router)
 
 在 Open WebUI 和多個 Hermes Gateway profiles 之間的透明代理路由器。
 
+路由规则：
+  /30000/v1/*  → http://127.0.0.1:30000/v1/*  (default profile)
+  /30001/v1/*  → http://127.0.0.1:30001/v1/*  (coder profile)
+  /30002/v1/*  → http://127.0.0.1:30002/v1/*  (analyst profile)
+  /30003/v1/*  → http://127.0.0.1:30003/v1/*  (trader profile)
+
+SSE Transform：攔截 hermes.tool.progress 事件，在 completed 時注入
+<details done="true"> 標籤，讓 Conduit APP 正確顯示工具卡片狀態。
+
 配置：config.yaml (優先) 或 .env (後備)
+Systemd service: hermes-tool-filter.service
 """
 
 import asyncio
@@ -29,7 +39,7 @@ except ImportError:
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("tool-filter")
@@ -74,31 +84,19 @@ CONFIG = _load_config()
 # ── App ───────────────────────────────────────────────────
 APP = FastAPI(title="Hermes Tool Card Enhancer Router")
 
-BIND_HOST = CONFIG.get("bind_host", "127.0.0.1")  # 預設只綁定本機
+BIND_HOST = CONFIG.get("bind_host", "0.0.0.0")
 BIND_PORT = CONFIG.get("bind_port", 9099)
 
 # Port routing table: path prefix -> upstream base URL
-# Loaded from config.yaml "upstreams" section, with sensible defaults.
-PORT_MAP: Dict[str, str] = {}
+PORT_MAP: Dict[str, str] = {
+    "30000": "http://127.0.0.1:30000",
+    "30001": "http://127.0.0.1:30001",
+    "30002": "http://127.0.0.1:30002",
+    "30003": "http://127.0.0.1:30003",
+}
 
-def _build_port_map() -> Dict[str, str]:
-    """Build PORT_MAP from config or use defaults."""
-    upstreams = CONFIG.get("upstreams", {})
-    if upstreams:
-        return {str(k): str(v) for k, v in upstreams.items()}
-    # Default: Hermes's built-in profiles (default, coder, analyst, trader)
-    return {
-        "30000": "http://127.0.0.1:30000",
-        "30001": "http://127.0.0.1:30001",
-        "30002": "http://127.0.0.1:30002",
-        "30003": "http://127.0.0.1:30003",
-    }
-
-
-PORT_MAP = _build_port_map()
-
-# Default upstream if no port prefix matched — pick the first one or fallback
-DEFAULT_UPSTREAM = next(iter(PORT_MAP.values())) if PORT_MAP else "http://127.0.0.1:30000"
+# Default upstream if no port prefix matched
+DEFAULT_UPSTREAM = PORT_MAP["30000"]
 
 # ── Emoji Mapping ─────────────────────────────────────────
 
@@ -242,9 +240,11 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
         inner += f"\n<arguments>{html.escape(label)}</arguments>"
     
     if result:
-        inner += f"\n<result>{html.escape(result)}</result>"
+        # result 放在標籤內，用 html.escape 避免 XSS
+        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
+        inner += f"\n<result>{html.escape(truncated)}</result>"
     
-    return f'<details {attrs}>{inner}\n</details>\n'
+    return f'<details {attrs}>{inner}\n</details>'
 
 
 def _build_content_chunk(content: str) -> bytes:
@@ -340,14 +340,13 @@ class ToolCallBuffer:
             details = _build_completion_details(tool_name, label, result)
             
             # 加 \n\n 確保 Markdown 正確解析 <details> block
-            chunks.append(_build_content_chunk(f"\n\n{details}"))
+            # 整個 <details> 在一個 chunk 中發出，避免被分割
+            chunks.append(_build_content_chunk(f"\n\n{details}\n"))
             
-            logger.info(f"[enhance-v2] Tool completed: {tool_name}, result_len={len(result)}, chunks={len(chunks)}")
-            
+            logging.info(f"[enhance-v2] Tool completed: {tool_name} (result_len={len(result)}, chunks={len(chunks)})")
             return chunks
         except Exception as e:
-            logger.error(f"[enhance-v2] on_tool_completed ERROR: {type(e).__name__}: {e}")
-            # 即使出錯也返回空列表，不讓 stream 炸掉
+            logging.error(f"[enhance-v2] on_tool_completed ERROR: {e} for tc_id={tc_id}")
             return []
     
     @property
@@ -400,22 +399,66 @@ async def transform_stream(
     
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
-    heartbeat_interval = 10.0  # 每 10 秒發送心跳（比 gateway 的 30 秒更頻繁）
+    heartbeat_interval = 1.5  # 每 1.5 秒發送心跳（比 Open WebUI idle timeout 短）
+    heartbeat_count = 0  # 心跳計數器
     
     # enhance-v2 專用緩衝器
     v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
-
+    
+    # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
+    tool_just_completed = False
+    tool_completed_at = 0  # 記錄 tool completed 的時間戳
+    
+    # 主循環
     while True:
-        # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
-        now = time.monotonic()
-        if now - last_heartbeat > heartbeat_interval:
-            yield b": heartbeat\n\n"
-            last_heartbeat = now
+        # 心跳檢查 — 在 readline 之前檢查，確保即使 upstream 沒有數據也能發送心跳
+        elapsed = time.monotonic() - last_heartbeat
+        if elapsed >= heartbeat_interval:
+            # 雙重保險：SSE comment + empty content delta
+            # 某些 client 對 comment 反應更好，某些對 data chunk 反應更好
+            heartbeat_count += 1
+            # 如果在 tool completed 後，記錄 idle 時間
+            idle_since_tool = 0
+            if tool_just_completed and tool_completed_at > 0:
+                idle_since_tool = time.monotonic() - tool_completed_at
+            logger.info(
+                f"[enhance-v2] Heartbeat #{heartbeat_count} ({elapsed:.1f}s), "
+                f"tool_just_completed={tool_just_completed}, "
+                f"idle_since_tool={idle_since_tool:.1f}s, "
+                f"done_received={done_received}, buffer_len={len(buffer)}"
+            )
+            yield b': keepalive\n\n'
+            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
+                completion_id.encode(), created, model.encode()
+            )
+            last_heartbeat = time.monotonic()
+            tool_just_completed = False
 
-        line = await reader.readline()
+        # 非阻塞讀取 — 使用 asyncio.wait_for 確保不會永久阻塞
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+        except asyncio.TimeoutError:
+            # 超時了，繼續循環，下次心跳會發送 empty delta
+            continue
+        except Exception as e:
+            # readline() 可能丟出 exception（例如 client 斷開連線）
+            logger.error(
+                f"[enhance-v2] readline() exception: {type(e).__name__}: {e}, "
+                f"tool_just_completed={tool_just_completed}, "
+                f"done_received={done_received}, buffer_len={len(buffer)}"
+            )
+            raise
 
-        # Empty line means end of connection
+        # Empty line means end of connection — LOG THIS!
         if not line:
+            elapsed = time.monotonic() - last_heartbeat
+            logger.info(
+                f"[enhance-v2] Upstream EOF detected! "
+                f"last_heartbeat={elapsed:.1f}s ago, "
+                f"done_received={done_received}, "
+                f"buffer_len={len(buffer)}, "
+                f"tool_just_completed={tool_just_completed}"
+            )
             break
 
         buffer += line
@@ -428,11 +471,20 @@ async def transform_stream(
             # 心跳檢查：處理數據時也更新心跳時間戳
             last_heartbeat = time.monotonic()
 
-            # Check for [DONE] signal early - stop processing after it
+            # Check for [DONE] signal - mark it but DON'T break immediately
+            # 關鍵修復：[DONE] 不代表 upstream 已經結束，agent loop 可能還在執行
+            # 我們標記 done_received，但繼續讀取直到 upstream 真正關閉 (EOF)
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
-                break
+                logger.info(
+                    f"[enhance-v2] ⚠️ Received [DONE] from upstream. "
+                    f"tool_just_completed={tool_just_completed}, "
+                    f"heartbeat_count={heartbeat_count}, "
+                    f"buffer_len={len(buffer)} — 繼續等待 upstream EOF"
+                )
+                # ✅ 不再 break — 繼續讀取，讓 upstream 自然關閉
+                continue
 
             try:
                 # Parse the frame - support both "data:" and "data: " formats
@@ -459,56 +511,70 @@ async def transform_stream(
                         pass
 
                 # Handle hermes.tool.progress events
-                if event_type == "hermes.tool.progress":
-                    if parsed_json:
-                        tc_id = parsed_json.get("toolCallId", "")
-                        status = parsed_json.get("status", "")
-                        tool = parsed_json.get("tool", "unknown")
-                        arguments = parsed_json.get("arguments", {})
-                        result = parsed_json.get("result", "")
+                if event_type == "hermes.tool.progress" and parsed_json:
+                    tc_id = parsed_json.get("toolCallId", "")
+                    status = parsed_json.get("status", "")
+                    tool = parsed_json.get("tool", "unknown")
+                    arguments = parsed_json.get("arguments", {})
+                    result = parsed_json.get("result", "")
 
-                        # ── enhance-v2 模式 ──
-                        if TOOL_MODE == "enhance-v2" and v2_buffer:
-                            if status == "running":
-                                v2_buffer.on_tool_running(tc_id, parsed_json)
-                            elif status == "completed":
-                                # 立即輸出標準格式（不緩衝，直接返回 chunks）
-                                chunks = v2_buffer.on_tool_completed(
-                                    tc_id, parsed_json, completion_id, created, model
-                                )
-                                for chunk in chunks:
-                                    yield chunk
-                            # 跳過 hermes.tool.progress 事件，不發送給客戶端
-                            continue
-                    
-                        # ── 其他模式 ──
+                    # ── enhance-v2 模式 ──
+                    if TOOL_MODE == "enhance-v2" and v2_buffer:
                         if status == "running":
-                            tool_states[tc_id] = {
-                                "tool": tool,
-                                "emoji": parsed_json.get("emoji", ""),
-                                "label": parsed_json.get("label", tool),
-                                "arguments": arguments if isinstance(arguments, dict) else {},
-                                "result": "",
-                            }
-                            # 立即發送 running 狀態的佔位符，保持 stream 活躍
-                            if TOOL_MODE == "enhance":
-                                emoji = parsed_json.get("emoji", get_tool_emoji(tool))
-                                label = parsed_json.get("label", tool)
-                                yield _build_content_chunk(
-                                    f'<details type="tool_calls" done="false" id="{tc_id}" name="{html.escape(tool)}">\n'
-                                    f'<summary>{emoji} Running... {html.escape(label)}</summary>\n'
-                                    f'</details>\n'
-                                )
+                            v2_buffer.on_tool_running(tc_id, parsed_json)
                         elif status == "completed":
-                            state = tool_states.pop(tc_id, {})
-                            final_result = parsed_json.get("result", "")
-                            
-                            # enhance 模式: 注入完成標籤
-                            if TOOL_MODE == "enhance":
-                                tool_name = state.get("tool", tool)
-                                label = state.get("label", "")
-                                res = final_result if final_result else state.get("result", "")
-                                yield handle_tool_completion(tool_name, label, res)
+                            # 立即輸出標準格式（不緩衝，直接返回 chunks）
+                            chunks = v2_buffer.on_tool_completed(
+                                tc_id, parsed_json, completion_id, created, model
+                            )
+                            for chunk in chunks:
+                                yield chunk
+                            # Tool completed 後立即發送多個 nudge（不阻塞）
+                            # 確保 Open WebUI 的 idle timer 被重置
+                            for i in range(3):
+                                yield b': keepalive-post-tool\n\n'
+                                yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
+                                    completion_id.encode(), created, model.encode()
+                                )
+                            # 發送可見的 thinking chunk，讓 Open WebUI 知道還在處理
+                            yield _build_content_chunk("\n\n")
+                            logger.info(
+                                f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
+                                f"sent 3 nudges + thinking chunk to keep stream alive"
+                            )
+                            tool_just_completed = True
+                            tool_completed_at = time.monotonic()  # 記錄 tool completed 時間
+                        # 跳過 hermes.tool.progress 事件，不發送給客戶端
+                        continue
+                    
+                    # ── 其他模式 ──
+                    if status == "running":
+                        tool_states[tc_id] = {
+                            "tool": tool,
+                            "emoji": parsed_json.get("emoji", ""),
+                            "label": parsed_json.get("label", tool),
+                            "arguments": arguments if isinstance(arguments, dict) else {},
+                            "result": "",
+                        }
+                        # 立即發送 running 狀態的佔位符，保持 stream 活躍
+                        if TOOL_MODE == "enhance":
+                            emoji = parsed_json.get("emoji", get_tool_emoji(tool))
+                            label = parsed_json.get("label", tool)
+                            yield _build_content_chunk(
+                                f'<details type="tool_calls" done="false" id="{tc_id}" name="{html.escape(tool)}">\n'
+                                f'<summary>{emoji} Running... {html.escape(label)}</summary>\n'
+                                f'</details>\n'
+                            )
+                    elif status == "completed":
+                        state = tool_states.pop(tc_id, {})
+                        final_result = parsed_json.get("result", "")
+                        
+                        # enhance 模式: 注入完成標籤
+                        if TOOL_MODE == "enhance":
+                            tool_name = state.get("tool", tool)
+                            label = state.get("label", "")
+                            res = final_result if final_result else state.get("result", "")
+                            yield handle_tool_completion(tool_name, label, res)
                     # Do NOT yield - skip this frame
                     continue
 
@@ -528,13 +594,14 @@ async def transform_stream(
                                 pass
                         modified_frame = frame
                     elif TOOL_MODE == "enhance-v2":
-                        # enhance-v2: 過濾掉 Gateway 發送的原始 <details> 標籤
-                        # 我們自己在 completed 時注入正確的格式
+                        # enhance-v2: 只過濾 Gateway 發送的 <details type="tool_calls"> 標籤
+                        # 避免誤殺正常內容中包含 <details 字串的情況
                         if parsed_json:
                             try:
                                 delta = parsed_json.get("choices", [{}])[0].get("delta", {})
                                 content = delta.get("content", "")
-                                if "<details" in content:
+                                # 只過濾我們自己的 tool_calls details 標籤
+                                if 'type="tool_calls"' in content or 'type="tool_calls">' in content:
                                     continue
                             except (IndexError, KeyError):
                                 pass
@@ -573,18 +640,31 @@ async def transform_stream(
                                     accumulated_content = ""
                 
                 # 即時輸出，避免累積
+                # 過渡期 logging：tool completed 後的第一個 content chunk
+                if tool_just_completed and modified_frame:
+                    try:
+                        fc = json.loads(modified_frame) if not modified_frame.startswith(':') else None
+                        if fc:
+                            delta = fc.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                logger.info(
+                                    f"[enhance-v2] Post-tool transition: first content chunk "
+                                    f"({len(content)} chars) -> {content[:80]}..."
+                                )
+                                tool_just_completed = False
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        tool_just_completed = False
                 yield (modified_frame + "\n\n").encode("utf-8")
                 
             except Exception as e:
-                logger.error(f"[transform_stream] Frame processing ERROR: {type(e).__name__}: {e}")
-                # 記錄出錯的 frame 前 200 字元供除錯
-                logger.error(f"[transform_stream] Faulty frame preview: {frame[:200]}")
-                # 不中斷 stream，繼續處理下一個 frame
+                logging.error(f"[transform_stream] Frame processing ERROR: {e} | frame_preview={frame[:200]}")
                 continue
 
-        # 如果收到 [DONE]，跳出外層循環
-        if done_received:
-            break
+        # ✅ 關鍵修復：收到 [DONE] 後不再立即跳出
+        # 而是繼續等待 upstream 真正關閉 (EOF)
+        # 這樣可以避免 prematurely 關閉與 Gateway 的連線，
+        # 導致 Gateway 認為 client disconnected → interrupt agent loop
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
@@ -592,10 +672,6 @@ async def transform_stream(
         cleaned = buffer.decode("utf-8", errors="replace").rstrip("\r\n")
         if cleaned:
             yield (cleaned + "\n\n").encode("utf-8")
-    
-    # If upstream disconnected without sending [DONE], send a proper finish
-    if not done_received and not split_done:
-        yield _build_finish_chunk(completion_id, created, model, "stop")
 
 
 # ── Shared aiohttp session ────────────────────────────────
@@ -656,20 +732,26 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
     if stream_flag and "chat/completions" in original_path:
 
         async def generate():
+            upstream_resp = None
             try:
-                async with sess.post(
+                upstream_resp = await sess.post(
                     upstream_url, data=body, headers=fwd_headers
-                ) as resp:
-                    logger.info(
-                        f"[port={upstream_port}] Proxied chat completions, "
-                        f"upstream status={resp.status}, "
-                        f"strip_details={strip_details} (UA: {user_agent[:50]})"
-                    )
-                    async for chunk in transform_stream(
-                        resp.content, model, completion_id, created_ts,
-                        upstream_port, strip_details,
-                    ):
-                        yield chunk
+                )
+                logger.info(
+                    f"[port={upstream_port}] Proxied chat completions, "
+                    f"upstream status={upstream_resp.status}, "
+                    f"strip_details={strip_details} (UA: {user_agent[:50]})"
+                )
+                async for chunk in transform_stream(
+                    upstream_resp.content, model, completion_id, created_ts,
+                    upstream_port, strip_details,
+                ):
+                    yield chunk
+            except asyncio.CancelledError:
+                # Client (Open WebUI) disconnected — gracefully close upstream
+                logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
+                if upstream_resp is not None:
+                    upstream_resp.close()
             except aiohttp.ServerDisconnectedError:
                 # Upstream disconnected after auto-split — this is expected, not an error
                 logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
@@ -686,6 +768,10 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
                     }
                 }
                 yield f"data: {json.dumps(err)}\n\n".encode()
+            finally:
+                # Ensure upstream response is closed even on unexpected exits
+                if upstream_resp is not None and not upstream_resp.closed:
+                    upstream_resp.close()
 
         return StreamingResponse(
             generate(),
