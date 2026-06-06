@@ -759,15 +759,9 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
                 # Other client errors (connection reset, timeout, etc.)
                 logger.warning(f"[port={upstream_port}] Client error: {e}")
             except Exception as e:
-                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}")
-                err = {
-                    "error": {
-                        "message": str(e),
-                        "type": "proxy_error",
-                        "code": "upstream_failure",
-                    }
-                }
-                yield f"data: {json.dumps(err)}\n\n".encode()
+                # CWE-209/CWE-497: 不要在 client 回應中洩露內部錯誤細節
+                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
+                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
             finally:
                 # Ensure upstream response is closed even on unexpected exits
                 if upstream_resp is not None and not upstream_resp.closed:
@@ -870,15 +864,9 @@ async def proxy_default(request: Request, rest: str):
             except aiohttp.ClientError as e:
                 logger.warning(f"[port={upstream_port}] Client error: {e}")
             except Exception as e:
-                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}")
-                err = {
-                    "error": {
-                        "message": str(e),
-                        "type": "proxy_error",
-                        "code": "upstream_failure",
-                    }
-                }
-                yield f"data: {json.dumps(err)}\n\n".encode()
+                # CWE-209/CWE-497: 不要在 client 回應中洩露內部錯誤細節
+                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
+                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
 
         return StreamingResponse(
             generate(),
