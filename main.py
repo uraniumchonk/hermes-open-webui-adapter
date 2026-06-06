@@ -39,7 +39,7 @@ except ImportError:
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("tool-filter")
@@ -420,6 +420,11 @@ async def transform_stream(
             line = await asyncio.wait_for(reader.readline(), timeout=readline_timeout)
         except asyncio.TimeoutError:
             # 超時了，發送 heartbeat 然後繼續等待
+            logger.debug(
+                f"[enhance-v2] Heartbeat timeout ({readline_timeout:.1f}s), "
+                f"sending heartbeat. tool_just_completed={tool_just_completed}, "
+                f"done_received={done_received}, buffer_len={len(buffer)}"
+            )
             yield b": heartbeat\n\n"
             last_heartbeat = time.monotonic()
             continue
