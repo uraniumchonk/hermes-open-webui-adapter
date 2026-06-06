@@ -22,10 +22,10 @@ tool_mode: "enhance-v2"
 # 格式: "端口": "http://位址:端口"
 #
 # 預設 Hermes profiles（執行 `hermes profiles list` 查看你的 profiles）：
-#   30000: default profile
-#   30001: coder profile
-#   30002: analyst profile
-#   30003: trader profile
+#   30000: 通用聊天
+#   30001: 程式開發專家
+#   30002: 資料與研究
+#   30003: 交易與市場
 #
 # 你可以自由增減 — 只需符合你的 Gateway 設定即可！
 # 若省略此區塊，會使用預設的 30000-30003。

@@ -225,18 +225,24 @@ upstreams:
   "30003": "http://127.0.0.1:30003"
 ```
 
-Each key is a path prefix, each value is the upstream Hermes Gateway URL. The default Hermes profiles are:
+Each key is a path prefix, each value is the upstream Hermes Gateway URL. Common examples:
 
-- `30000` → Default profile
-- `30001` → Coder profile
-- `30002` → Analyst profile
-- `30003` → Trader profile
+- `30000` → General-purpose chat
+- `30001` → Code specialist
+- `30002` → Data & research
+- `30003` → Trading & markets
 
 To view your actual profiles: `hermes profiles list`. Simply add or remove entries in `config.yaml` to match your setup. If `upstreams` is omitted, the four defaults above are used automatically.
 
 ### Hermes Gateway Configuration
 
-The proxy routes to Hermes Gateway instances. Each Gateway is configured via its `.env` file (typically at `/opt/hermes/.env` or `~/.hermes/.env`). Key settings:
+The proxy routes to Hermes Gateway instances. Each Gateway profile has its own `.env` file at:
+
+```
+/opt/hermes/profiles/<PROFILE_NAME>/.env
+```
+
+For example, a profile named `chatting` would be at `/opt/hermes/profiles/chatting/.env`. Key settings:
 
 ```bash
 # Enable the API server

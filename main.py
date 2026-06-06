@@ -5,10 +5,10 @@ Hermes SSE Tool Card Enhancer Proxy (Multi-Tenant Router)
 在 Open WebUI 和多個 Hermes Gateway profiles 之間的透明代理路由器。
 
 路由规则（由 config.yaml 中的 upstreams 配置決定）：
-  /30000/v1/*  → http://127.0.0.1:30000/v1/*  (default profile)
-  /30001/v1/*  → http://127.0.0.1:30001/v1/*  (coder profile)
-  /30002/v1/*  → http://127.0.0.1:30002/v1/*  (analyst profile)
-  /30003/v1/*  → http://127.0.0.1:30003/v1/*  (trader profile)
+  /30000/v1/*  → http://127.0.0.1:30000/v1/*  (通用聊天)
+  /30001/v1/*  → http://127.0.0.1:30001/v1/*  (程式開發專家)
+  /30002/v1/*  → http://127.0.0.1:30002/v1/*  (資料與研究)
+  /30003/v1/*  → http://127.0.0.1:30003/v1/*  (交易與市場)
 
 SSE Transform：攔截 hermes.tool.progress 事件，在 completed 時注入
 <details done="true"> 標籤，讓 Conduit APP 正確顯示工具卡片狀態。

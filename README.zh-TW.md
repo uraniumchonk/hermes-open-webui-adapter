@@ -225,18 +225,24 @@ upstreams:
   "30003": "http://127.0.0.1:30003"
 ```
 
-每個鍵是路徑前綴，每個值是对應的 Hermes Gateway URL。Hermes 預設 profiles：
+每個鍵是路徑前綴，每個值是对應的 Hermes Gateway URL。常見範例：
 
-- `30000` → Default（預設）
-- `30001` → Coder（程式開發）
-- `30002` → Analyst（分析師）
-- `30003` → Trader（交易員）
+- `30000` → 通用聊天
+- `30001` → 程式開發專家
+- `30002` → 資料與研究
+- `30003` → 交易與市場
 
 查看你的 profiles：`hermes profiles list`。只需在 `config.yaml` 中新增或移除項目即可。若省略 `upstreams`，會自動使用上方四個預設值。
 
 ### Hermes Gateway 配置
 
-代理路由到多個 Hermes Gateway 實例。每個 Gateway 透過 `.env` 檔案配置（通常位於 `/opt/hermes/.env` 或 `~/.hermes/.env`）。重要設定：
+代理路由到多個 Hermes Gateway 實例。每個 Gateway profile 有獨立的 `.env` 檔案，位置在：
+
+```
+/opt/hermes/profiles/<PROFILE_NAME>/.env
+```
+
+例如，名為 `chatting` 的 profile 會在 `/opt/hermes/profiles/chatting/.env`。重要設定：
 
 ```bash
 # 啟用 API 伺服器
