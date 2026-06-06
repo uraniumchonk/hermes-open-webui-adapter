@@ -399,7 +399,8 @@ async def transform_stream(
     
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
-    heartbeat_interval = 2.0  # 每 2 秒發送心跳（比 gateway 的 30 秒更頻繁，避免 Open WebUI idle timeout）
+    heartbeat_interval = 1.5  # 每 1.5 秒發送心跳（比 Open WebUI idle timeout 短）
+    heartbeat_count = 0  # 心跳計數器
     
     # enhance-v2 專用緩衝器
     v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
@@ -412,12 +413,15 @@ async def transform_stream(
         # 心跳檢查 — 在 readline 之前檢查，確保即使 upstream 沒有數據也能發送心跳
         elapsed = time.monotonic() - last_heartbeat
         if elapsed >= heartbeat_interval:
-            # 發送空 content delta（不是純 comment）保持 Open WebUI 認為 stream 活躍
-            logger.debug(
-                f"[enhance-v2] Heartbeat ({elapsed:.1f}s), sending empty delta. "
+            # 雙重保險：SSE comment + empty content delta
+            # 某些 client 對 comment 反應更好，某些對 data chunk 反應更好
+            heartbeat_count += 1
+            logger.info(
+                f"[enhance-v2] Heartbeat #{heartbeat_count} ({elapsed:.1f}s), "
                 f"tool_just_completed={tool_just_completed}, "
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
+            yield b': keepalive\n\n'
             yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
                 completion_id.encode(), created, model.encode()
             )
@@ -510,15 +514,18 @@ async def transform_stream(
                             )
                             for chunk in chunks:
                                 yield chunk
-                            # Tool completed 後發送空 content delta（nudge）告訴 client 還有後續
-                            # 這不是純 comment，而是有效的 SSE data chunk，會重置 Open WebUI 的 idle timer
-                            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""}}]}\n\n' % (
-                                completion_id.encode(), created, model.encode()
-                            )
-                            logger.info(
-                                f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
-                                f"sent empty delta nudge to keep stream alive"
-                            )
+                            # Tool completed 後發送多個 nudge（3 個，間隔 0.5 秒）
+                            # 確保 Open WebUI 的 idle timer 被重置，即使只剩 1-2 秒
+                            for i in range(3):
+                                await asyncio.sleep(0.5)
+                                yield b': keepalive-post-tool\n\n'
+                                yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
+                                    completion_id.encode(), created, model.encode()
+                                )
+                                logger.info(
+                                    f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
+                                    f"sent nudge #{i+1}/3 to keep stream alive"
+                                )
                             tool_just_completed = True
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
                         continue
