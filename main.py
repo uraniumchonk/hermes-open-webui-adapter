@@ -220,12 +220,12 @@ def _encode_detail_attribute(value: Any) -> str:
     return html.escape(json_str, quote=True)
 
 
-def _build_completion_details(tool_name: str, label: str = "", result: str = "") -> str:
+def _build_completion_details(tool_name: str, label: str = "", result: str = "", arguments: Optional[dict] = None) -> str:
     """
     Build a complete <details> tag for a completed tool call.
     
     - 確保 name 屬性正確（不會為空）
-    - 使用 label 作為 input 參數顯示（放在 <arguments> 標籤內）
+    - 完整 arguments JSON 放在 <arguments> 標籤內（讓模型能理解輸入參數）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
     """
@@ -235,8 +235,11 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
     
     inner = "\n<summary>Done</summary>"
     
-    if label:
-        # arguments 放在標籤內，用 html.escape 避免 XSS
+    # <arguments> 標籤：優先使用完整 arguments，否則 fallback 到 label
+    if arguments:
+        args_str = json.dumps(arguments, ensure_ascii=False)
+        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
+    elif label:
         inner += f"\n<arguments>{html.escape(label)}</arguments>"
     
     if result:
@@ -337,7 +340,8 @@ class ToolCallBuffer:
             # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
             emoji = state.get("emoji", get_tool_emoji(tool_name))
             label = state.get("label", tool_name)
-            details = _build_completion_details(tool_name, label, result)
+            arguments = state.get("arguments", {})
+            details = _build_completion_details(tool_name, label, result, arguments)
             
             # 加 \n\n 確保 Markdown 正確解析 <details> block
             # 整個 <details> 在一個 chunk 中發出，避免被分割
