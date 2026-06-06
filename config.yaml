@@ -11,8 +11,9 @@ bind_host: "0.0.0.0"
 bind_port: 9099
 
 # ── Tool Display Mode ──────────────────────────────────────
+# enhance-v2  : 推薦模式 — 即時串流 + <details> 子標籤格式（OpenWebUI 相容）
+# enhance     : 過濾 done=false + 注入帶 label 的完成標籤
 # passthrough : 直接透傳 <details> 標籤（最安全）
-# enhance     : 過濾 done=false + 注入帶 label 的完成標籤（推薦）
 # strip       : 移除 <details> 並替換為純文字
 tool_mode: "enhance-v2"
 
