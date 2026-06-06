@@ -399,7 +399,7 @@ async def transform_stream(
     
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
-    heartbeat_interval = 10.0  # 每 10 秒發送心跳（比 gateway 的 30 秒更頻繁）
+    heartbeat_interval = 5.0  # 每 5 秒發送心跳（比 gateway 的 30 秒更頻繁）
     
     # enhance-v2 專用緩衝器
     v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
@@ -408,13 +408,21 @@ async def transform_stream(
     tool_just_completed = False
 
     while True:
-        # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
+        # ── 非阻塞心跳：使用 asyncio.wait_for 讓 readline 有超時 ──
+        # 這樣即使 upstream 沒有數據，我們也能定期發送 heartbeat 保持連線活躍
         now = time.monotonic()
-        if now - last_heartbeat > heartbeat_interval:
+        time_since_heartbeat = now - last_heartbeat
+        
+        # 計算 readline 的最長等待時間（不能超過心跳間隔）
+        readline_timeout = max(0.5, heartbeat_interval - time_since_heartbeat)
+        
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=readline_timeout)
+        except asyncio.TimeoutError:
+            # 超時了，發送 heartbeat 然後繼續等待
             yield b": heartbeat\n\n"
-            last_heartbeat = now
-
-        line = await reader.readline()
+            last_heartbeat = time.monotonic()
+            continue
 
         # Empty line means end of connection — LOG THIS!
         if not line:
