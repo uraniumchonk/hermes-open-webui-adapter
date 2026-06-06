@@ -240,7 +240,7 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
         truncated = result[:5000] + ("..." if len(result) > 5000 else "")
         attrs += f' result="{_encode_detail_attribute(truncated)}"'
     
-    return f'<details {attrs}>\n<summary>Done</summary>\n</details>\n'
+    return f'<details {attrs}>\n<summary>🔧 {safe_name} ✓</summary>\n</details>\n'
 
 
 def _build_content_chunk(content: str) -> bytes:
@@ -255,109 +255,7 @@ def handle_tool_completion(tool_name: str, label: str = "", result: str = "") ->
     return _build_content_chunk(details)
 
 
-# ── Standard OpenAI tool_calls format builders ─────────────
-
-def _build_tool_call_delta_chunk(
-    completion_id: str, created: int, model: str,
-    index: int, tool_call_id: str, tool_name: str, arguments: Any
-) -> bytes:
-    """
-    Build a standard OpenAI tool_calls delta chunk.
-    
-    Format:
-    {
-      "id": "...",
-      "object": "chat.completion.chunk",
-      "created": ...,
-      "model": "...",
-      "choices": [{
-        "index": 0,
-        "delta": {
-          "tool_calls": [{
-            "index": 0,
-            "id": "call_xxx",
-            "type": "function",
-            "function": {
-              "name": "terminal",
-              "arguments": "{\"input\": \"echo hello\"}"
-            }
-          }]
-        }
-      }]
-    }
-    """
-    # Ensure arguments is a JSON string
-    if isinstance(arguments, dict):
-        args_str = json.dumps(arguments, ensure_ascii=False)
-    elif isinstance(arguments, str):
-        args_str = arguments
-    else:
-        args_str = str(arguments)
-    
-    chunk = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": [{
-                    "index": index,
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": args_str,
-                    }
-                }]
-            },
-            "finish_reason": None,
-        }],
-    }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-def _build_tool_result_chunk(
-    completion_id: str, created: int, model: str,
-    tool_call_id: str, result: str
-) -> bytes:
-    """
-    Build a standard OpenAI tool role message chunk.
-    
-    Format:
-    {
-      "id": "...",
-      "object": "chat.completion.chunk",
-      "created": ...,
-      "model": "...",
-      "choices": [{
-        "index": 0,
-        "delta": {
-          "role": "tool",
-          "tool_call_id": "call_xxx",
-          "content": "result..."
-        },
-        "finish_reason": None
-      }]
-    }
-    """
-    chunk = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result if result else "",
-            },
-            "finish_reason": None,
-        }],
-    }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+# ── Finish chunk builder ─────────────
 
 
 def _build_finish_chunk(
@@ -390,64 +288,53 @@ def _build_finish_chunk(
 
 class ToolCallBuffer:
     """
-    輕量級工具狀態追蹤器。
+    輕量級工具狀態追蹤器（for enhance-v2）。
     
-    不緩衝 content — content 正常串流輸出。
-    只在 tool completed 時輸出標準格式的 tool_calls + tool result。
+    ⚠️ 重要修正：
+    - content 正常即時串流（不緩衝）
+    - 只在 tool completed 時，注入 <details type="tool_calls" done="true" arguments="..." result="...">
+    - **絕對不 emit delta.tool_calls 或 role:"tool"** 
+      → 否則 Open WebUI 會觸發 client-side tool execution loop，
+        造成「會話重跑 + 一口氣出全部調用 + 模型失智」
     
-    這樣 content 可以即時串流，不會被阻塞。
+    這是 Open WebUI 官方對「server-side tool execution」（像 Hermes Agent）的推薦做法。
+    詳見 Pipes 文件。
     """
     
     def __init__(self):
-        # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments, index}
+        # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments}
         self.active_tools: Dict[str, dict] = {}
-        # 工具調用索引計數器（用於 OpenAI index 欄位）
-        self.tool_call_index = 0
     
     def on_tool_running(self, tc_id: str, payload: dict) -> None:
-        """工具開始執行，記錄狀態。"""
+        """工具開始執行，記錄狀態（不發送 running 卡片）。"""
         self.active_tools[tc_id] = {
             "tool": payload.get("tool", "unknown"),
             "emoji": payload.get("emoji", ""),
             "label": payload.get("label", payload.get("tool", "unknown")),
             "arguments": payload.get("arguments", {}),
-            "index": self.tool_call_index,
         }
-        self.tool_call_index += 1
     
     def on_tool_completed(self, tc_id: str, payload: dict, 
                           completion_id: str, created: int, model: str) -> List[bytes]:
         """
-        工具完成，立即返回標準格式的 chunks。
-        不緩衝，直接返回。
+        工具完成 → 只注入 <details type="tool_calls" done="true"> 到 content stream。
+        這樣 Open WebUI 會正確渲染 tool card，並把 result 存進歷史訊息。
         """
         state = self.active_tools.pop(tc_id, {})
         state["result"] = payload.get("result", "")
         state["arguments"] = payload.get("arguments", state.get("arguments", {}))
         
         tool_name = state.get("tool", "unknown")
-        arguments = state.get("arguments", {})
         result = state.get("result", "")
-        index = state.get("index", 0)
         
         chunks = []
         
-        # 1. 標準 tool_calls delta
-        chunks.append(_build_tool_call_delta_chunk(
-            completion_id, created, model,
-            index, tc_id, tool_name, arguments
-        ))
-        
-        # 2. 標準 tool role message
-        chunks.append(_build_tool_result_chunk(
-            completion_id, created, model,
-            tc_id, result
-        ))
-        
-        # 3. <details> 標籤（供 UI 渲染）
+        # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
         emoji = state.get("emoji", get_tool_emoji(tool_name))
-        label = state.get("label", "")
+        label = state.get("label", tool_name)
         details = _build_completion_details(tool_name, label, result)
+        
+        # 加 \n\n 確保 Markdown 正確解析 <details> block
         chunks.append(_build_content_chunk(f"\n\n{details}"))
         
         return chunks
@@ -472,10 +359,10 @@ async def transform_stream(
     - passthrough: 直接透傳所有資料
     - enhance: 過濾 done=false + 在 completed 時注入帶 label 的完成標籤
     - strip: 移除 <details> 並替換為純文字
-    - enhance-v2: 堵塞翻譯模式
-      - 不發送 running 卡片
-      - 在 completed 時輸出標準 OpenAI tool_calls delta + tool role + <details>
-      - 緩衝 tool 執行期間的 content，等 completed 後再輸出
+    - enhance-v2: 推薦模式（即時串流 + 正確 tool card）
+      - content 正常即時輸出
+      - 只在 completed 時注入 <details type="tool_calls" done="true" arguments="..." result="...">
+      - **不** emit delta.tool_calls（避免 Open WebUI 重複執行工具）
     
     性能優化：
     - 使用 bytes buffer 避免反覆 decode/encode
