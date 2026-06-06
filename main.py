@@ -407,6 +407,7 @@ async def transform_stream(
     
     # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
     tool_just_completed = False
+    tool_completed_at = 0  # 記錄 tool completed 的時間戳
     
     # 主循環
     while True:
@@ -416,9 +417,14 @@ async def transform_stream(
             # 雙重保險：SSE comment + empty content delta
             # 某些 client 對 comment 反應更好，某些對 data chunk 反應更好
             heartbeat_count += 1
+            # 如果在 tool completed 後，記錄 idle 時間
+            idle_since_tool = 0
+            if tool_just_completed and tool_completed_at > 0:
+                idle_since_tool = time.monotonic() - tool_completed_at
             logger.info(
                 f"[enhance-v2] Heartbeat #{heartbeat_count} ({elapsed:.1f}s), "
                 f"tool_just_completed={tool_just_completed}, "
+                f"idle_since_tool={idle_since_tool:.1f}s, "
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
             yield b': keepalive\n\n'
@@ -465,17 +471,20 @@ async def transform_stream(
             # 心跳檢查：處理數據時也更新心跳時間戳
             last_heartbeat = time.monotonic()
 
-            # Check for [DONE] signal early - stop processing after it
+            # Check for [DONE] signal - mark it but DON'T break immediately
+            # 關鍵修復：[DONE] 不代表 upstream 已經結束，agent loop 可能還在執行
+            # 我們標記 done_received，但繼續讀取直到 upstream 真正關閉 (EOF)
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
                 logger.info(
-                    f"[enhance-v2] Received [DONE] from upstream. "
+                    f"[enhance-v2] ⚠️ Received [DONE] from upstream. "
                     f"tool_just_completed={tool_just_completed}, "
                     f"heartbeat_count={heartbeat_count}, "
-                    f"buffer_len={len(buffer)}"
+                    f"buffer_len={len(buffer)} — 繼續等待 upstream EOF"
                 )
-                break
+                # ✅ 不再 break — 繼續讀取，讓 upstream 自然關閉
+                continue
 
             try:
                 # Parse the frame - support both "data:" and "data: " formats
@@ -534,6 +543,7 @@ async def transform_stream(
                                 f"sent 3 nudges + thinking chunk to keep stream alive"
                             )
                             tool_just_completed = True
+                            tool_completed_at = time.monotonic()  # 記錄 tool completed 時間
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
                         continue
                     
@@ -651,9 +661,10 @@ async def transform_stream(
                 logging.error(f"[transform_stream] Frame processing ERROR: {e} | frame_preview={frame[:200]}")
                 continue
 
-        # 如果收到 [DONE]，跳出外層循環
-        if done_received:
-            break
+        # ✅ 關鍵修復：收到 [DONE] 後不再立即跳出
+        # 而是繼續等待 upstream 真正關閉 (EOF)
+        # 這樣可以避免 prematurely 關閉與 Gateway 的連線，
+        # 導致 Gateway 認為 client disconnected → interrupt agent loop
 
     # Flush remaining buffer with proper SSE termination
     if buffer.strip():
