@@ -403,6 +403,9 @@ async def transform_stream(
     
     # enhance-v2 專用緩衝器
     v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
+    
+    # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
+    tool_just_completed = False
 
     while True:
         # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
@@ -476,6 +479,13 @@ async def transform_stream(
                             )
                             for chunk in chunks:
                                 yield chunk
+                            # Tool completed 後主動發送 SSE comment 保持連線活躍
+                            yield b": tool completed, continuing...\n\n"
+                            logger.info(
+                                f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
+                                f"sent heartbeat to keep connection alive"
+                            )
+                            tool_just_completed = True
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
                         continue
                     
@@ -526,13 +536,14 @@ async def transform_stream(
                                 pass
                         modified_frame = frame
                     elif TOOL_MODE == "enhance-v2":
-                        # enhance-v2: 過濾掉 Gateway 發送的原始 <details> 標籤
-                        # 我們自己在 completed 時注入正確的格式
+                        # enhance-v2: 只過濾 Gateway 發送的 <details type="tool_calls"> 標籤
+                        # 避免誤殺正常內容中包含 <details 字串的情況
                         if parsed_json:
                             try:
                                 delta = parsed_json.get("choices", [{}])[0].get("delta", {})
                                 content = delta.get("content", "")
-                                if "<details" in content:
+                                # 只過濾我們自己的 tool_calls details 標籤
+                                if 'type="tool_calls"' in content or 'type="tool_calls">' in content:
                                     continue
                             except (IndexError, KeyError):
                                 pass
@@ -571,6 +582,21 @@ async def transform_stream(
                                     accumulated_content = ""
                 
                 # 即時輸出，避免累積
+                # 過渡期 logging：tool completed 後的第一個 content chunk
+                if tool_just_completed and modified_frame:
+                    try:
+                        fc = json.loads(modified_frame) if not modified_frame.startswith(':') else None
+                        if fc:
+                            delta = fc.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                logger.info(
+                                    f"[enhance-v2] Post-tool transition: first content chunk "
+                                    f"({len(content)} chars) -> {content[:80]}..."
+                                )
+                                tool_just_completed = False
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        tool_just_completed = False
                 yield (modified_frame + "\n\n").encode("utf-8")
                 
             except Exception as e:
@@ -647,20 +673,26 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
     if stream_flag and "chat/completions" in original_path:
 
         async def generate():
+            upstream_resp = None
             try:
-                async with sess.post(
+                upstream_resp = await sess.post(
                     upstream_url, data=body, headers=fwd_headers
-                ) as resp:
-                    logger.info(
-                        f"[port={upstream_port}] Proxied chat completions, "
-                        f"upstream status={resp.status}, "
-                        f"strip_details={strip_details} (UA: {user_agent[:50]})"
-                    )
-                    async for chunk in transform_stream(
-                        resp.content, model, completion_id, created_ts,
-                        upstream_port, strip_details,
-                    ):
-                        yield chunk
+                )
+                logger.info(
+                    f"[port={upstream_port}] Proxied chat completions, "
+                    f"upstream status={upstream_resp.status}, "
+                    f"strip_details={strip_details} (UA: {user_agent[:50]})"
+                )
+                async for chunk in transform_stream(
+                    upstream_resp.content, model, completion_id, created_ts,
+                    upstream_port, strip_details,
+                ):
+                    yield chunk
+            except asyncio.CancelledError:
+                # Client (Open WebUI) disconnected — gracefully close upstream
+                logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
+                if upstream_resp is not None:
+                    upstream_resp.close()
             except aiohttp.ServerDisconnectedError:
                 # Upstream disconnected after auto-split — this is expected, not an error
                 logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
@@ -677,6 +709,10 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
                     }
                 }
                 yield f"data: {json.dumps(err)}\n\n".encode()
+            finally:
+                # Ensure upstream response is closed even on unexpected exits
+                if upstream_resp is not None and not upstream_resp.closed:
+                    upstream_resp.close()
 
         return StreamingResponse(
             generate(),
