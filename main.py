@@ -224,23 +224,27 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
     """
     Build a complete <details> tag for a completed tool call.
     
-    Conduit APP 規格：arguments/result 必須是屬性（attribute），不是子標籤。
-    屬性值經過 JSON 編碼 -> HTML 轉義雙重編碼。
+    - 確保 name 屬性正確（不會為空）
+    - 使用 label 作為 input 參數顯示（放在 <arguments> 標籤內）
+    - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
+    - 結果截斷（最多 5000 字元）
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
-    # arguments 作為屬性
+    inner = "\n<summary>Done</summary>"
+    
     if label:
-        attrs += f' arguments="{_encode_detail_attribute(label)}"'
+        # arguments 放在標籤內，用 html.escape 避免 XSS
+        inner += f"\n<arguments>{html.escape(label)}</arguments>"
     
-    # result 作為屬性（截斷到 5000 字元）
     if result:
+        # result 放在標籤內，用 html.escape 避免 XSS
         truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        attrs += f' result="{_encode_detail_attribute(truncated)}"'
+        inner += f"\n<result>{html.escape(truncated)}</result>"
     
-    return f'<details {attrs}>\n<summary>🔧 {safe_name} ✓</summary>\n</details>\n'
+    return f'<details {attrs}>{inner}\n</details>\n'
 
 
 def _build_content_chunk(content: str) -> bytes:
