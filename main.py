@@ -242,9 +242,7 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "")
         inner += f"\n<arguments>{html.escape(label)}</arguments>"
     
     if result:
-        # result 放在標籤內，用 html.escape 避免 XSS
-        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        inner += f"\n<result>{html.escape(truncated)}</result>"
+        inner += f"\n<result>{html.escape(result)}</result>"
     
     return f'<details {attrs}>{inner}\n</details>\n'
 
