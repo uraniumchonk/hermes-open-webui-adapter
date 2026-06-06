@@ -469,6 +469,12 @@ async def transform_stream(
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
+                logger.info(
+                    f"[enhance-v2] Received [DONE] from upstream. "
+                    f"tool_just_completed={tool_just_completed}, "
+                    f"heartbeat_count={heartbeat_count}, "
+                    f"buffer_len={len(buffer)}"
+                )
                 break
 
             try:
@@ -521,9 +527,11 @@ async def transform_stream(
                                 yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
                                     completion_id.encode(), created, model.encode()
                                 )
+                            # 發送可見的 thinking chunk，讓 Open WebUI 知道還在處理
+                            yield _build_content_chunk("\n\n")
                             logger.info(
                                 f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
-                                f"sent 3 nudges to keep stream alive"
+                                f"sent 3 nudges + thinking chunk to keep stream alive"
                             )
                             tool_just_completed = True
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
