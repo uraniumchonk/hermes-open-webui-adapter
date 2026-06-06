@@ -1,9 +1,9 @@
 # Hermes Tool Filter
 
-**讓 Hermes 工具調用在任何客戶端都能正確顯示的透明 SSE 代理**
+**Transparent SSE proxy that makes Hermes tool calls render correctly in any client**
 
 <p align="center">
-  <a href="README.en.md">English</a> · 繁體中文
+  English · <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
 <p align="center">
@@ -14,32 +14,32 @@
 
 ---
 
-## 為什麼需要它？
+## Why do you need it?
 
-Hermes Gateway 的 SSE 串流使用自訂的 `<details>` HTML 標籤格式來顯示工具調用狀態，但這個格式與 Open WebUI / Conduit APP 期望的格式不符，導致**工具卡片完全不顯示**且**工具結果丟失在對話上下文中**。
+Hermes Gateway's SSE stream uses custom `<details>` HTML tags to display tool call status, but this format doesn't match what Open WebUI / Conduit APP expects, resulting in **tool cards not showing at all** and **tool results lost from conversation context**.
 
-Hermes Tool Filter 在兩者之間做即時轉換，將 Hermes 的格式轉為客戶端能正確渲染的格式：
+Hermes Tool Filter sits between them and converts Hermes' format to what clients can render properly:
 
-**enhance-v2 模式**（預設，推薦）：即時串流 + `<details>` 子標籤格式，完全相容 OpenWebUI：
+**enhance-v2 mode** (default, recommended): Real-time streaming + `<details>` child element format, fully compatible with OpenWebUI:
 
 ```html
-<!-- 經過 enhance-v2 轉換後： -->
+<!-- After enhance-v2 transformation: -->
 <details type="tool_calls" done="true" name="web_search">
 <summary>Done</summary>
-<arguments>台北天氣 今天</arguments>
+<arguments>Taipei weather today</arguments>
 <result>{"success":true,"data":"..."}</result>
 </details>
 ```
 
-**enhance 模式**：過濾掉中間狀態的標籤，只在工具完成時注入一個符合標準的 `done="true"` 標籤。
+**enhance mode**: Filters out intermediate state tags, only injects a standard `done="true"` tag when a tool completes.
 
-**passthrough 模式**：直接透傳，適合已支援 Hermes 格式的客戶端。
+**passthrough mode**: Passes through directly, suitable for clients that already support Hermes format.
 
-**strip 模式**：移除 `<details>` 並替換為純文字 Markdown（舊版兼容）。
+**strip mode**: Removes `<details>` and replaces with plain text Markdown (legacy compatibility).
 
 ---
 
-## 快速開始
+## Quick Start
 
 ```bash
 git clone https://github.com/uraniumchonk/hermes-open-webui-adapter.git
@@ -48,9 +48,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-服務啟動在 `http://0.0.0.0:9099`
+Service starts on `http://0.0.0.0:9099`
 
-將 Open WebUI 的 API Base URL 設為：
+Set Open WebUI's API Base URL to:
 
 ```
 http://127.0.0.1:9099/30000/v1
@@ -58,19 +58,19 @@ http://127.0.0.1:9099/30000/v1
 
 ---
 
-## 配置
+## Configuration
 
-編輯 `config.yaml` 即可調整設定：
+Edit `config.yaml` to adjust settings:
 
-- **tool_mode** — `enhance-v2`（預設，推薦）/ `enhance` / `passthrough` / `strip`
-- **auto_split_threshold** — 串流自動分割閾值（字元數，`0` = 關閉）
-- **bind_host / bind_port** — 監聽位址與埠號
+- **tool_mode** — `enhance-v2` (default, recommended) / `enhance` / `passthrough` / `strip`
+- **auto_split_threshold** — Stream auto-split threshold (characters, `0` = disabled)
+- **bind_host / bind_port** — Listen address and port
 
-環境變數可覆蓋 config.yaml 設定（`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`）。
+Environment variables can override config.yaml settings (`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`).
 
-### 路由表
+### Routing Table
 
-| 路徑 | 上游 | 用途 |
+| Path | Upstream | Purpose |
 |------|------|------|
 | `/30000/v1/*` | `127.0.0.1:30000` | Default |
 | `/30001/v1/*` | `127.0.0.1:30001` | Coder |
@@ -79,34 +79,34 @@ http://127.0.0.1:9099/30000/v1
 
 ---
 
-## 工作方式
+## How It Works
 
 ```
 Open WebUI ──▶ Hermes Tool Filter ──▶ Hermes Gateway
    (30010)            (9099)                 (30000)
-      ◀──────── 轉換後 SSE ◀────────────────────────────
+      ◀──── Transformed SSE ◀────────────────────────────
 ```
 
-1. 客戶端發送請求到代理（Port 9099）
-2. 代理根據路徑轉發到對應的 Hermes Gateway
-3. Gateway 回傳 SSE 串流（含 `hermes.tool.progress` 事件）
-4. 代理即時解析並轉換為標準 `<details>` 格式
-5. 回傳乾淨的串流給客戶端
+1. Client sends request to proxy (Port 9099)
+2. Proxy forwards to the corresponding Hermes Gateway based on path
+3. Gateway returns SSE stream (with `hermes.tool.progress` events)
+4. Proxy parses and transforms to standard `<details>` format in real-time
+5. Returns clean stream to client
 
 ---
 
-## 功能
+## Features
 
-- **格式轉換** — 將 Hermes 自訂格式轉為客戶端可渲染的標準格式
-- **四種處理模式** — enhance-v2（預設）、enhance、passthrough、strip
-- **多租戶路由** — 一個代理對應多個 Gateway profiles
-- **智能過濾** — enhance-v2 自動過濾 hermes.tool.progress 事件，只輸出完成標籤
-- **完整工具資訊** — 注入的標籤包含工具名稱、參數、結果（子標籤格式）
-- **config.yaml 配置** — 集中管理，無需修改程式碼
+- **Format conversion** — Converts Hermes' custom format to a standard format clients can render
+- **Four processing modes** — enhance-v2 (default), enhance, passthrough, strip
+- **Multi-tenant routing** — One proxy for multiple Gateway profiles
+- **Smart filtering** — enhance-v2 automatically filters hermes.tool.progress events, only outputs completion tags
+- **Complete tool info** — Injected tags include tool name, arguments, and results (child element format)
+- **config.yaml configuration** — Centralized management, no code changes needed
 
 ---
 
-## Systemd 服務
+## Systemd Service
 
 ```ini
 [Unit]
@@ -130,85 +130,84 @@ sudo systemctl enable --now hermes-tool-filter
 
 ---
 
-## 🔧 Hermes API Server Patch 指南
+## 🔧 Hermes API Server Patch Guide
 
-> [!IMPORTANT]
-> **為什麼需要 Patch？**
+> **Why is a patch needed?**
 >
-> Hermes Gateway 的 `_on_tool_complete` 函數沒有在 `__tool_progress__` completed 事件中發送 `arguments` 和 `result` 欄位，導致 hermes_tool_filter 無法取得工具參數與結果來建構 `<details>` 標籤。
+> Hermes Gateway's `_on_tool_complete` function doesn't send `arguments` and `result` fields in the `__tool_progress__` completed event, so hermes_tool_filter can't retrieve tool parameters and results to build `<details>` tags.
 
-### 自動套用（推薦）
+### Auto-Apply (Recommended)
 
 ```bash
-# 檢查 patch 是否已套用
+# Check if patch is applied
 grep -c '"result": str(function_result)' /opt/hermes/hermes-agent/gateway/platforms/api_server.py
 
-# 如果回傳 0，表示未套用，執行：
+# If it returns 0, it's not applied. Run:
 cd ~/.hermes/hermes/hermes-agent
 git apply /path/to/hermes_tool_filter/patches/api_server_tool_result.patch 2>/dev/null || \
-  echo "Patch 無法套用 — 可能已套用或 Hermes 版本已變更"
+  echo "Patch cannot be applied — may already be applied or Hermes version changed"
 ```
 
-### 手動套用
+### Manual Apply
 
-1. **找到 `_on_tool_complete` 函數**（在 `gateway/platforms/api_server.py`，約第 1858 行）
+1. **Find `_on_tool_complete` function** (in `gateway/platforms/api_server.py`, around line 1858)
 
-2. **在 `progress_data` 字典中加入 `arguments` 和 `result`**：
+2. **Add `arguments` and `result` to `progress_data` dict**:
 
 ```python
 async def _on_tool_complete(self, tool_call_id, function_name, function_args, function_result):
-    # ... 其他程式碼 ...
+    # ... other code ...
     progress_data = {
         "type": "__tool_progress__",
         "event": "completed",
         "tool_call_id": tool_call_id,
         "name": function_name,
-        "arguments": function_args or {},          # ← 新增
-        "result": str(function_result) if function_result is not None else "",  # ← 新增
+        "arguments": function_args or {},          # ← Add this
+        "result": str(function_result) if function_result is not None else "",  # ← Add this
     }
 ```
 
-3. **重啟 Hermes Gateway**：
+3. **Restart Hermes Gateway**:
 
 ```bash
-# 找到並停止舊程序
+# Find and stop old process
 ps aux | grep "hermes.*gateway"
 kill <PID>
 
-# 啟動新的 Gateway
+# Start new Gateway
 python -m hermes_cli.main --profile chatting gateway run --replace
 ```
 
-### 維護：Hermes 更新後
+### Maintenance: After Hermes Update
 
-`hermes update`（git pull/reset）會覆蓋手動修改！每次更新 Hermes 後：
+`hermes update` (git pull/reset) will overwrite manual changes! After each Hermes update:
 
 ```bash
-# 方法 1：用 patch 檔案
+# Method 1: Use patch file
 cd ~/.hermes/hermes/hermes-agent
 git apply /path/to/hermes_tool_filter/patches/api_server_tool_result.patch
 
-# 方法 2：手動檢查
+# Method 2: Manual check
 grep '"result":' /opt/hermes/hermes-agent/gateway/platforms/api_server.py
-# 如果找不到，表示 patch 被覆蓋了，需要重新套用
+# If not found, the patch was overwritten and needs to be re-applied
 ```
 
-### 驗證 Patch 是否生效
+### Verify Patch is Active
 
 ```bash
-# 測試腳本
+# Test script
 python3 /path/to/hermes_tool_filter/test_api_server.py
 
-# 預期：completed 事件包含 arguments 和 result 欄位
+# Expected: completed event includes arguments and result fields
 ```
 
 ---
 
-## 技術細節
+## Technical Details
 
-- **依賴** — FastAPI, aiohttp, PyYAML
-- **架構** — 單檔案，無外部資料庫，零狀態
-- **部署** — systemd 或直接執行
+- **Dependencies** — FastAPI, aiohttp, PyYAML
+- **Architecture** — Single file, no external database, stateless
+- **Deployment** — systemd or run directly
 
 ---
 
