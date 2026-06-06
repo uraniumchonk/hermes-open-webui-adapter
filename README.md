@@ -12,6 +12,34 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
 </p>
 
+> **Solves**: Hermes Gateway tool cards not rendering in Open WebUI / Conduit APP, and tool results being lost from conversation context — causing model amnesia.
+
+---
+
+## 🌟 Highlights
+
+- ⚡ **enhance-v2 mode** — Real-time streaming + complete `<details>` child-element format, fully compatible with OpenWebUI
+- 🏢 **Multi-profile routing** — One proxy for multiple Gateway profiles (Chatting / Coder / Analyst / Trader)
+- 🧹 **Smart filtering** — Auto-filters intermediate states, outputs only completion tags
+- 🔧 **One-click patch** — Includes auto-apply patch + verification script for Hermes API Server
+- 📦 **Zero state** — Single file, no database, config-driven via `config.yaml`
+
+---
+
+## Table of Contents
+
+- [The Problem: Tool Context Loss](#the-problem-tool-context-loss)
+- [The Solution](#the-solution)
+- [Architecture](#architecture)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [How It Works](#how-it-works)
+- [Features](#features)
+- [Systemd Service](#systemd-service)
+- [🔧 Hermes API Server Patch Guide](#-hermes-api-server-patch-guide)
+- [Troubleshooting](#troubleshooting)
+- [Technical Details](#technical-details)
+
 ---
 
 ## The Problem: Tool Context Loss in Open WebUI
@@ -31,47 +59,46 @@ Time         Model              Input    Output  TTFT      TG/s    Duration
 ```
 
 **Key findings:**
-- `05:46:12 → 05:46:27`: prompt_tokens increased from 18,301 to 21,240 (**+2,939 tokens** during tool loop)
-- `05:46:45` (new message after tool loop): prompt_tokens is only 18,698 — just **+397 tokens** over the original
-- **If tool results were properly included, 05:46:45 should have ~21,240+ tokens**
-- **Actual: only 18,698 — tool results were NOT in the conversation history**
+
+- `05:46:12 → 05:46:27`: prompt_tokens jumped from **18,301 → 21,240** (+2,939 tokens during tool loop)
+- `05:46:45` (new message after tool loop): prompt_tokens dropped to **18,698** — only +397 tokens over original
+- **Expected**: ~21,240+ tokens if tool results were properly included
+- **Actual**: 18,698 — tool results were **NOT** in the conversation history
 
 This proves Open WebUI reconstructed the conversation **without tool results**, causing the model to lose all context from tool execution.
 
 ### Root Cause: A Broken Chain
 
-The problem is a chain of failures across three layers:
-
 ```
 Hermes Gateway API Server
   │
-  │ Problem 1: Never emits standard OpenAI tool_calls delta format
+  │ ✗ Problem 1: Never emits standard OpenAI tool_calls delta
   │             Only sends custom hermes.tool.progress SSE events
-  │ Problem 2: completed event does NOT include the tool result
-  │             (function_result exists but is never added to the payload)
+  │ ✗ Problem 2: completed event does NOT include the tool result
+  │             (function_result exists but is never added to payload)
   │
   ▼
 hermes_tool_filter
   │
-  │ Problem 3: enhance-v2 mode was unimplemented (always fell back to passthrough)
-  │ Problem 4: Even enhance mode couldn't get results (due to Problem 2)
+  │ ✗ Problem 3: enhance-v2 mode was unimplemented (fell back to passthrough)
+  │ ✗ Problem 4: Even enhance mode couldn't get results (due to Problem 2)
   │             final_result = parsed_json.get("result", "") ← always empty
   │
   ▼
 Open WebUI
   │
-  │ Problem 5: Receives assistant message with only final text
+  │ ✗ Problem 5: Receives assistant message with only final text
   │             Tool information never enters conversation history
-  │ Problem 6: Unpaired tool_use/tool_result messages are discarded
+  │ ✗ Problem 6: Unpaired tool_use/tool_result messages are discarded
   │
   ▼
 Next request
   │
-  │ Problem 7: Open WebUI sends back messages WITHOUT tool results
+  │ ✗ Problem 7: Open WebUI sends back messages WITHOUT tool results
   │             Model has zero visibility into previous tool execution
   │
   ▼
-Model amnesia! 🧠💥
+🧠💥 Model amnesia!
 ```
 
 ### Detailed Breakdown
@@ -81,7 +108,7 @@ Model amnesia! 🧠💥
 The API server runs a full agent loop internally (correctly maintaining conversation history with tool results). However, its SSE output has two critical gaps:
 
 1. **No standard `tool_calls` delta**: It doesn't emit `delta.tool_calls` or `role: "tool"` messages — only custom `hermes.tool.progress` events.
-2. **Missing result in completed event**: The `_on_tool_complete` callback receives `function_result` but never includes it in the SSE payload:
+2. **Missing result in completed event**: The `_on_tool_complete` callback receives `function_result` but never includes it:
    ```python
    ("__tool_progress__", {
        "tool": function_name,
@@ -92,13 +119,13 @@ The API server runs a full agent loop internally (correctly maintaining conversa
 
 **Layer 2 — hermes_tool_filter** (`main.py`):
 
-The filter was configured as `enhance-v2` but the code only checked `TOOL_MODE == "enhance"`, so it was effectively a passthrough. Even in enhance mode, the `result` field was always empty because the API Server didn't send it.
+Configured as `enhance-v2` but code only checked `TOOL_MODE == "enhance"`, so it was effectively passthrough. Even in enhance mode, `result` was always empty.
 
 **Layer 3 — Open WebUI**:
 
-Open WebUI receives an assistant message containing only the final response text. Without standard tool_calls/tool messages in the stream, it has nothing to store in its conversation database. When the user sends a new message, Open WebUI reconstructs the history without any tool context.
+Receives an assistant message with only the final response text. Without standard tool messages in the stream, nothing gets stored. When the user sends a new message, the reconstructed history has no tool context.
 
-**Verification: Hermes Gateway internally is correct.** From `kv_cache.log`:
+**✅ Verification: Hermes Gateway internally is correct.** From `kv_cache.log`:
 ```
 19:26:01 | prompt_tokens=32833 | msgs=14 | tools_def=26
   system: 1 messages, 23897 chars
@@ -107,15 +134,15 @@ Open WebUI receives an assistant message containing only the final response text
   tool: 6 messages, 37033 chars  ← tool results ARE present internally
 ```
 
-This confirms the issue is in the **SSE transformation pipeline**, not in Hermes itself.
+The issue is in the **SSE transformation pipeline**, not in Hermes itself.
 
 ---
 
 ## The Solution
 
-Hermes Tool Filter bridges the gap between Hermes Gateway and Open WebUI by converting Hermes' custom SSE format into a format Open WebUI can parse, render, and persist.
+Hermes Tool Filter bridges the gap by converting Hermes' custom SSE format into a format Open WebUI can parse, render, and persist.
 
-**enhance-v2 mode** (default, recommended): Real-time streaming + `<details>` child element format, fully compatible with OpenWebUI:
+**enhance-v2 mode** (default, recommended):
 
 ```html
 <!-- After enhance-v2 transformation: -->
@@ -126,11 +153,11 @@ Hermes Tool Filter bridges the gap between Hermes Gateway and Open WebUI by conv
 </details>
 ```
 
-**enhance mode**: Filters out intermediate state tags, only injects a standard `done="true"` tag when a tool completes.
+**enhance mode**: Filters intermediate states, injects `done="true"` tag on completion.
 
-**passthrough mode**: Passes through directly, suitable for clients that already support Hermes format.
+**passthrough mode**: Direct passthrough for Hermes-compatible clients.
 
-**strip mode**: Removes `<details>` and replaces with plain text Markdown (legacy compatibility).
+**strip mode**: Removes `<details>`, replaces with plain Markdown (legacy).
 
 ---
 
@@ -157,17 +184,17 @@ vLLM (backend)
     └── metrics_proxy (18080) monitors vLLM instances
 ```
 
-> **Note**: metrics_proxy is NOT in the Hermes Gateway data path — it monitors a separate vLLM port.
+> **Note**: metrics_proxy is NOT in the data path — it monitors a separate vLLM port.
 
 ### Request Flow
 
-1. **Open WebUI** sends request to `hermes_tool_filter` (port 9099)
-2. **hermes_tool_filter** forwards to **Hermes Gateway** (port 30000)
-3. **Hermes Gateway** executes tool loop (maintains full conversation history internally)
-4. **Hermes Gateway** returns SSE stream to **hermes_tool_filter**
-5. **hermes_tool_filter** transforms SSE format and returns to **Open WebUI**
-6. **Open WebUI** receives response and stores to local database
-7. User sends new message → **Open WebUI reconstructs conversation history** and sends new request
+1. **Open WebUI** → `hermes_tool_filter` (port 9099)
+2. **Proxy** → **Hermes Gateway** (port 30000+)
+3. **Gateway** executes tool loop (full history maintained internally)
+4. **Gateway** → SSE stream → **Proxy**
+5. **Proxy** transforms format → **Open WebUI**
+6. **Open WebUI** stores to local database
+7. User sends new message → history reconstructed with tool context
 
 ---
 
@@ -192,13 +219,13 @@ http://127.0.0.1:9099/30000/v1
 
 ## Configuration
 
-Edit `config.yaml` to adjust settings:
+Edit `config.yaml`:
 
 - **tool_mode** — `enhance-v2` (default, recommended) / `enhance` / `passthrough` / `strip`
 - **auto_split_threshold** — Stream auto-split threshold (characters, `0` = disabled)
 - **bind_host / bind_port** — Listen address and port
 
-Environment variables can override config.yaml settings (`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`).
+Environment variables override config.yaml (`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`).
 
 ### Routing Table
 
@@ -223,12 +250,12 @@ Environment variables can override config.yaml settings (`TOOL_MODE`, `BIND_PORT
 
 ## Features
 
-- **Format conversion** — Converts Hermes' custom format to a standard format clients can render
-- **Four processing modes** — enhance-v2 (default), enhance, passthrough, strip
-- **Multi-tenant routing** — One proxy for multiple Gateway profiles
-- **Smart filtering** — enhance-v2 automatically filters hermes.tool.progress events, only outputs completion tags
-- **Complete tool info** — Injected tags include tool name, arguments, and results (child element format)
-- **Config-driven** — Centralized management via config.yaml, no code changes needed
+- 🔄 **Format conversion** — Hermes custom format → standard client-renderable format
+- 🎛️ **Four processing modes** — enhance-v2 (default), enhance, passthrough, strip
+- 🏢 **Multi-tenant routing** — One proxy, multiple Gateway profiles
+- 🧠 **Smart filtering** — Auto-filters hermes.tool.progress events, outputs only completion tags
+- 📋 **Complete tool info** — Tool name, arguments, and results (child element format)
+- ⚙️ **Config-driven** — Centralized management, no code changes needed
 
 ---
 
@@ -326,6 +353,19 @@ python3 /path/to/hermes_tool_filter/test_api_server.py
 
 # Expected: completed event includes arguments and result fields
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Tool cards don't show in Open WebUI | enhance-v2 not active | Verify `tool_mode: "enhance-v2"` in config.yaml |
+| `<details>` tags missing `result` | API Server patch not applied | Run the patch guide above |
+| Tool cards show but result is empty | API Server `result` field missing | Check `grep '"result":'` in api_server.py |
+| Proxy not responding | Service crashed | `journalctl -u hermes-tool-filter` or check logs |
+| Wrong upstream | Wrong route path | Verify routing table matches your Gateway ports |
+| `hermes update` broke things | Patch overwritten by git reset | Re-apply patch after update |
 
 ---
 
