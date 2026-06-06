@@ -419,13 +419,16 @@ async def transform_stream(
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=readline_timeout)
         except asyncio.TimeoutError:
-            # 超時了，發送 heartbeat 然後繼續等待
+            # 超時了，發送空 content delta（不是純 comment）保持 Open WebUI 認為 stream 活躍
+            # 空的 content delta 是有效的 SSE data chunk，會重置 Open WebUI 的 idle timer
             logger.debug(
                 f"[enhance-v2] Heartbeat timeout ({readline_timeout:.1f}s), "
-                f"sending heartbeat. tool_just_completed={tool_just_completed}, "
+                f"sending empty delta. tool_just_completed={tool_just_completed}, "
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
-            yield b": heartbeat\n\n"
+            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""}]}]\n\n' % (
+                completion_id.encode(), created, model.encode()
+            )
             last_heartbeat = time.monotonic()
             continue
 
@@ -500,11 +503,14 @@ async def transform_stream(
                             )
                             for chunk in chunks:
                                 yield chunk
-                            # Tool completed 後主動發送 SSE comment 保持連線活躍
-                            yield b": tool completed, continuing...\n\n"
+                            # Tool completed 後發送空 content delta（nudge）告訴 client 還有後續
+                            # 這不是純 comment，而是有效的 SSE data chunk，會重置 Open WebUI 的 idle timer
+                            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""}}]}\n\n' % (
+                                completion_id.encode(), created, model.encode()
+                            )
                             logger.info(
                                 f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
-                                f"sent heartbeat to keep connection alive"
+                                f"sent empty delta nudge to keep stream alive"
                             )
                             tool_just_completed = True
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
