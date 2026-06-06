@@ -234,6 +234,25 @@ upstreams:
 
 查看你的 profiles：`hermes profiles list`。只需在 `config.yaml` 中新增或移除項目即可。若省略 `upstreams`，會自動使用上方四個預設值。
 
+### Hermes Gateway 配置
+
+代理路由到多個 Hermes Gateway 實例。每個 Gateway 透過 `.env` 檔案配置（通常位於 `/opt/hermes/.env` 或 `~/.hermes/.env`）。重要設定：
+
+```bash
+# 啟用 API 伺服器
+API_SERVER_ENABLED=true
+
+# Gateway 埠號 — 必須與 upstreams 中的埠號一致
+API_SERVER_PORT=30000
+
+# API 金鑰 — 用於驗證請求
+API_SERVER_KEY=sk_你的自訂金鑰
+```
+
+> **重要：** `API_SERVER_PORT` 的值必須對應 `upstreams` 中的埠號。例如，若 `API_SERVER_PORT=30001`，則 upstreams 中必須包含 `"30001": "http://127.0.0.1:30001"`。
+
+在 Open WebUI 中連接時，API Base URL 設為 `http://127.0.0.1:9099/<PORT>/v1`，API 金鑰設為 Gateway 的 `API_SERVER_KEY`。
+
 ---
 
 ## 工作方式

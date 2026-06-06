@@ -234,6 +234,25 @@ Each key is a path prefix, each value is the upstream Hermes Gateway URL. The de
 
 To view your actual profiles: `hermes profiles list`. Simply add or remove entries in `config.yaml` to match your setup. If `upstreams` is omitted, the four defaults above are used automatically.
 
+### Hermes Gateway Configuration
+
+The proxy routes to Hermes Gateway instances. Each Gateway is configured via its `.env` file (typically at `/opt/hermes/.env` or `~/.hermes/.env`). Key settings:
+
+```bash
+# Enable the API server
+API_SERVER_ENABLED=true
+
+# Gateway port — must match the port in your upstreams config
+API_SERVER_PORT=30000
+
+# API key — used to authenticate requests
+API_SERVER_KEY=sk_YOUR_CUSTOM_KEY
+```
+
+> **Important:** The `API_SERVER_PORT` value must correspond to a port entry in your `upstreams` config. For example, if `API_SERVER_PORT=30001`, your upstreams must include `"30001": "http://127.0.0.1:30001"`.
+
+When Open WebUI connects, set the API Base URL to `http://127.0.0.1:9099/<PORT>/v1` and the API key to the Gateway's `API_SERVER_KEY`.
+
 ---
 
 ## How It Works
