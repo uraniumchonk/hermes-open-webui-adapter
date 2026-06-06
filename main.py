@@ -225,8 +225,8 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     Build a complete <details> tag for a completed tool call.
     
     - 確保 name 屬性正確（不會為空）
-    - <summary> 顯示工具名稱 + emoji（讓模型與用戶都能識別工具）
-    - 完整 arguments JSON 放在 <arguments> 標籤內（讓模型能理解輸入參數）
+    - <summary> 顯示工具名稱 + emoji（供用戶視覺識別）
+    - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
     """
@@ -234,18 +234,28 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
-    # <summary> 包含工具名稱 + emoji，讓工具身份明確可見
+    # <summary> 包含工具名稱 + emoji（供視覺渲染）
     emoji = get_tool_emoji(tool_name)
     display_name = label if label else tool_name
     safe_display = html.escape(display_name)
     inner = f"\n<summary>✅ {emoji} {safe_display}</summary>"
     
-    # <arguments> 標籤：優先使用完整 arguments，否則 fallback 到 label
+    # <arguments> 標籤：包含 tool_name + 完整參數（讓模型能識別工具）
     if arguments:
-        args_str = json.dumps(arguments, ensure_ascii=False)
+        # 將 tool_name 加入 arguments，讓模型知道這是哪個工具
+        full_args = {"tool_name": tool_name, **arguments}
+        args_str = json.dumps(full_args, ensure_ascii=False)
         inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     elif label:
-        inner += f"\n<arguments>{html.escape(label)}</arguments>"
+        # fallback: 只有 label，也加入 tool_name
+        full_args = {"tool_name": tool_name, "label": label}
+        args_str = json.dumps(full_args, ensure_ascii=False)
+        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
+    else:
+        # 最後 fallback: 只有 tool_name
+        full_args = {"tool_name": tool_name}
+        args_str = json.dumps(full_args, ensure_ascii=False)
+        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     
     if result:
         # result 放在標籤內，用 html.escape 避免 XSS
