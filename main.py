@@ -23,8 +23,9 @@ import html
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, AsyncGenerator
+from typing import Any, Dict, Optional, AsyncGenerator, List
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -208,6 +209,17 @@ def _strip_details_from_content(frame: str) -> str:
 # ── Tool Mode Handlers ─────────────────────────────────────
 
 
+def _encode_detail_attribute(value: Any) -> str:
+    """
+    Encode a value as a <details> attribute:
+    JSON encode -> HTML escape (for safe attribute embedding).
+    """
+    if not value:
+        return ""
+    json_str = json.dumps(value, ensure_ascii=False)
+    return html.escape(json_str, quote=True)
+
+
 def _build_completion_details(tool_name: str, label: str = "", result: str = "") -> str:
     """
     Build a complete <details> tag for a completed tool call.
@@ -246,8 +258,98 @@ def handle_tool_completion(tool_name: str, label: str = "", result: str = "") ->
     details = _build_completion_details(tool_name, label, result)
     return _build_content_chunk(details)
 
+
+# ── Finish chunk builder ─────────────
+
+
+def _build_finish_chunk(
+    completion_id: str, created: int, model: str,
+    finish_reason: str, usage: Optional[dict] = None
+) -> bytes:
+    """Build a finish chunk."""
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish_reason,
+        }],
+    }
+    if usage:
+        chunk["usage"] = usage
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+# ── Enhance-v2: Blocking Translation Mode ─────────────────
+# 
+# 核心概念：
+# 1. 收到 running 事件 → 開始緩衝後續 content
+# 2. 收到 completed 事件 → 輸出標準 tool_calls delta + tool role + 緩衝 content
+# 3. 這讓 Open WebUI 能正確儲存完整的 conversation history
+
+class ToolCallBuffer:
+    """
+    輕量級工具狀態追蹤器（for enhance-v2）。
+    
+    ⚠️ 重要修正：
+    - content 正常即時串流（不緩衝）
+    - 只在 tool completed 時，注入 <details type="tool_calls" done="true" arguments="..." result="...">
+    - **絕對不 emit delta.tool_calls 或 role:"tool"** 
+      → 否則 Open WebUI 會觸發 client-side tool execution loop，
+        造成「會話重跑 + 一口氣出全部調用 + 模型失智」
+    
+    這是 Open WebUI 官方對「server-side tool execution」（像 Hermes Agent）的推薦做法。
+    詳見 Pipes 文件。
+    """
+    
+    def __init__(self):
+        # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments}
+        self.active_tools: Dict[str, dict] = {}
+    
+    def on_tool_running(self, tc_id: str, payload: dict) -> None:
+        """工具開始執行，記錄狀態（不發送 running 卡片）。"""
+        self.active_tools[tc_id] = {
+            "tool": payload.get("tool", "unknown"),
+            "emoji": payload.get("emoji", ""),
+            "label": payload.get("label", payload.get("tool", "unknown")),
+            "arguments": payload.get("arguments", {}),
+        }
+    
+    def on_tool_completed(self, tc_id: str, payload: dict, 
+                          completion_id: str, created: int, model: str) -> List[bytes]:
+        """
+        工具完成 → 只注入 <details type="tool_calls" done="true"> 到 content stream。
+        這樣 Open WebUI 會正確渲染 tool card，並把 result 存進歷史訊息。
+        """
+        state = self.active_tools.pop(tc_id, {})
+        state["result"] = payload.get("result", "")
+        state["arguments"] = payload.get("arguments", state.get("arguments", {}))
+        
+        tool_name = state.get("tool", "unknown")
+        result = state.get("result", "")
+        
+        chunks = []
+        
+        # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
+        emoji = state.get("emoji", get_tool_emoji(tool_name))
+        label = state.get("label", tool_name)
+        details = _build_completion_details(tool_name, label, result)
+        
+        # 加 \n\n 確保 Markdown 正確解析 <details> block
+        chunks.append(_build_content_chunk(f"\n\n{details}"))
+        
+        return chunks
+    
+    @property
+    def has_active_tools(self) -> bool:
+        return bool(self.active_tools)
+
+
 async def transform_stream(
-    reader: asyncio.StreamReader,
+    reader: aiohttp.StreamReader,
     model: str,
     completion_id: str,
     created: int,
@@ -257,13 +359,14 @@ async def transform_stream(
     """
     從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件。
 
-    對於 status=completed 的事件，額外注入一個 <details done="true"> 的
-    delta.content chunk，讓 Conduit APP 能正確顯示工具卡片狀態。
-    
     TOOL_MODE 控制處理策略：
-    - passthrough: 直接透傳 <details> 標籤（預設）
+    - passthrough: 直接透傳所有資料
     - enhance: 過濾 done=false + 在 completed 時注入帶 label 的完成標籤
     - strip: 移除 <details> 並替換為純文字
+    - enhance-v2: 推薦模式（即時串流 + 正確 tool card）
+      - content 正常即時輸出
+      - 只在 completed 時注入 <details type="tool_calls" done="true" arguments="..." result="...">
+      - **不** emit delta.tool_calls（避免 Open WebUI 重複執行工具）
     
     性能優化：
     - 使用 bytes buffer 避免反覆 decode/encode
@@ -275,9 +378,9 @@ async def transform_stream(
     - 確保即使上游暫時沒有數據，客戶端也不會超時
     """
 
-    # Track tool states: toolCallId -> {tool, emoji, label, arguments, result}
+    # Track tool states for legacy modes
     tool_states: Dict[str, dict] = {}
-
+    
     done_received = False
     split_done = False  # 是否已發送過分割標記
 
@@ -291,6 +394,9 @@ async def transform_stream(
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
     heartbeat_interval = 10.0  # 每 10 秒發送心跳（比 gateway 的 30 秒更頻繁）
+    
+    # enhance-v2 專用緩衝器
+    v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
 
     while True:
         # ── 心跳檢查：在讀取數據前檢查，確保即使沒有數據也會發送心跳 ──
@@ -319,7 +425,6 @@ async def transform_stream(
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
-                # 不要直接 return！先處理 buffer 中剩餘的數據
                 break
 
             # Parse the frame - support both "data:" and "data: " formats
@@ -354,6 +459,21 @@ async def transform_stream(
                     arguments = parsed_json.get("arguments", {})
                     result = parsed_json.get("result", "")
 
+                    # ── enhance-v2 模式 ──
+                    if TOOL_MODE == "enhance-v2" and v2_buffer:
+                        if status == "running":
+                            v2_buffer.on_tool_running(tc_id, parsed_json)
+                        elif status == "completed":
+                            # 立即輸出標準格式（不緩衝，直接返回 chunks）
+                            chunks = v2_buffer.on_tool_completed(
+                                tc_id, parsed_json, completion_id, created, model
+                            )
+                            for chunk in chunks:
+                                yield chunk
+                        # 跳過 hermes.tool.progress 事件，不發送給客戶端
+                        continue
+                    
+                    # ── 其他模式 ──
                     if status == "running":
                         tool_states[tc_id] = {
                             "tool": tool,
@@ -363,7 +483,6 @@ async def transform_stream(
                             "result": "",
                         }
                         # 立即發送 running 狀態的佔位符，保持 stream 活躍
-                        # 這防止了工具執行期間 SSE stream 完全停頓導致超時
                         if TOOL_MODE == "enhance":
                             emoji = parsed_json.get("emoji", get_tool_emoji(tool))
                             label = parsed_json.get("label", tool)
@@ -396,6 +515,18 @@ async def transform_stream(
                             delta = parsed_json.get("choices", [{}])[0].get("delta", {})
                             content = delta.get("content", "")
                             if 'done="false"' in content:
+                                continue
+                        except (IndexError, KeyError):
+                            pass
+                    modified_frame = frame
+                elif TOOL_MODE == "enhance-v2":
+                    # enhance-v2: 過濾掉 Gateway 發送的原始 <details> 標籤
+                    # 我們自己在 completed 時注入正確的格式
+                    if parsed_json:
+                        try:
+                            delta = parsed_json.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if "<details" in content:
                                 continue
                         except (IndexError, KeyError):
                             pass
@@ -549,24 +680,29 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
 
     # --- Non-streaming path (passthrough) ---
     method = request.method.upper()
+    resp_body = b""
+    resp_status = 502
+    resp_headers = {}
     try:
         async with sess.request(
             method, upstream_url, data=body, headers=fwd_headers
         ) as resp:
             resp_body = await resp.read()
+            resp_status = resp.status
+            resp_headers = dict(resp.headers)
             try:
                 parsed = json.loads(resp_body) if resp_body else {}
             except json.JSONDecodeError:
                 parsed = {}
             return JSONResponse(
                 content=parsed,
-                status_code=resp.status,
+                status_code=resp_status,
             )
     except json.JSONDecodeError:
         return Response(
-            content=await resp.read() if resp_body else b"",
-            status_code=resp.status,
-            headers=dict(resp.headers),
+            content=resp_body,
+            status_code=resp_status,
+            headers=resp_headers,
         )
 
 
@@ -625,10 +761,8 @@ async def proxy_default(request: Request, rest: str):
                     ):
                         yield chunk
             except aiohttp.ServerDisconnectedError:
-                # Upstream disconnected after auto-split — this is expected, not an error
                 logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
             except aiohttp.ClientError as e:
-                # Other client errors (connection reset, timeout, etc.)
                 logger.warning(f"[port={upstream_port}] Client error: {e}")
             except Exception as e:
                 logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}")
