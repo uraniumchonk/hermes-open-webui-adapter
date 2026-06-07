@@ -33,6 +33,10 @@ import aiohttp
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
+# ── Handler modules ────────────────────────────────────────
+from completions_handler import handle_completions_request
+from responses_handler import handle_responses_request
+
 try:
     import yaml
     HAS_YAML = True
@@ -991,9 +995,12 @@ async def get_session() -> aiohttp.ClientSession:
 @APP.api_route("/{port_prefix}/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
     """
-    Main proxy route with SSE transformation for chat completions.
-
-    Matches paths like /30000/v1/chat/completions, /30001/v1/models, etc.
+    Main proxy route — routes to appropriate handler based on path.
+    
+    Routes:
+    - /{port}/v1/responses/** → ResponsesHandler
+    - /{port}/v1/chat/completions → CompletionsHandler (enhance-v2)
+    - Other paths → passthrough
     """
     upstream_port = port_prefix
     original_path = f"/{port_prefix}/{rest}"
@@ -1008,107 +1015,27 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
         if hl in ("authorization", "content-type"):
             fwd_headers[hn] = hv
 
-    # Parse request body for model name
+    # Parse request body
     try:
         req_json = json.loads(body) if body else {}
     except json.JSONDecodeError:
         req_json = {}
 
-    model = req_json.get("model", "hermes-agent")
-    stream_flag = req_json.get("stream", True)
-
-    # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
-    # 切斷污染反饋迴圈 — 把 <details> 轉為自然語言描述
-    if "messages" in req_json and isinstance(req_json["messages"], list):
-        req_json["messages"] = sanitize_request_messages(req_json["messages"])
-        # 更新 body 為清理後的 JSON
-        body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
-
-    # Detect client type from User-Agent to decide if we strip <details> tags
-    user_agent = request.headers.get("user-agent", "").lower()
-    strip_details = "dart" in user_agent or "conduit" in user_agent
-    # Open WebUI (user-agent contains "open-webui" or is a browser) keeps <details>
-
-    completion_id = f"chatcmpl-{int(time.time()*1000)}"
-    created_ts = int(time.time())
-
     sess = await get_session()
 
-    # --- Streaming path (chat completions with stream=true) ---
-    if stream_flag and "chat/completions" in original_path:
-
-        async def generate():
-            upstream_resp = None
-            try:
-                upstream_resp = await sess.post(
-                    upstream_url, data=body, headers=fwd_headers
-                )
-                logger.info(
-                    f"[port={upstream_port}] Proxied chat completions, "
-                    f"upstream status={upstream_resp.status}, "
-                    f"strip_details={strip_details} (UA: {user_agent[:50]})"
-                )
-                async for chunk in transform_stream(
-                    upstream_resp.content, model, completion_id, created_ts,
-                    upstream_port, strip_details,
-                ):
-                    yield chunk
-            except asyncio.CancelledError:
-                # Client (Open WebUI) disconnected — gracefully close upstream
-                logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
-                if upstream_resp is not None:
-                    upstream_resp.close()
-            except aiohttp.ServerDisconnectedError:
-                # Upstream disconnected after auto-split — this is expected, not an error
-                logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
-            except aiohttp.ClientError as e:
-                # Other client errors (connection reset, timeout, etc.)
-                logger.warning(f"[port={upstream_port}] Client error: {e}")
-            except Exception as e:
-                # CWE-209/CWE-497: 不要在 client 回應中洩露內部錯誤細節
-                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
-                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
-            finally:
-                # Ensure upstream response is closed even on unexpected exits
-                if upstream_resp is not None and not upstream_resp.closed:
-                    upstream_resp.close()
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+    # ── Route to appropriate handler ──
+    if "/v1/responses" in original_path:
+        return await handle_responses_request(
+            request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
-
-    # --- Non-streaming path (passthrough) ---
-    method = request.method.upper()
-    resp_body = b""
-    resp_status = 502
-    resp_headers = {}
-    try:
-        async with sess.request(
-            method, upstream_url, data=body, headers=fwd_headers
-        ) as resp:
-            resp_body = await resp.read()
-            resp_status = resp.status
-            resp_headers = dict(resp.headers)
-            try:
-                parsed = json.loads(resp_body) if resp_body else {}
-            except json.JSONDecodeError:
-                parsed = {}
-            return JSONResponse(
-                content=parsed,
-                status_code=resp_status,
-            )
-    except json.JSONDecodeError:
-        return Response(
-            content=resp_body,
-            status_code=resp_status,
-            headers=resp_headers,
+    elif "/v1/chat/completions" in original_path:
+        return await handle_completions_request(
+            request, upstream_url, fwd_headers, body, req_json, sess,
+            upstream_port, sanitize_request_messages, transform_stream,
         )
+    else:
+        # Passthrough for other endpoints (/v1/models, etc.)
+        return await _passthrough(request, upstream_url, fwd_headers, body, sess)
 
 
 @APP.api_route("/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -1116,8 +1043,6 @@ async def proxy_default(request: Request, rest: str):
     """
     Fallback proxy route for paths WITHOUT port prefix.
     Routes to default upstream (30000).
-
-    Matches /v1/models, /v1/chat/completions, etc.
     """
     original_path = f"/{rest}"
     upstream_url = resolve_upstream(original_path)
@@ -1135,71 +1060,42 @@ async def proxy_default(request: Request, rest: str):
     except json.JSONDecodeError:
         req_json = {}
 
-    model = req_json.get("model", "hermes-agent")
-    stream_flag = req_json.get("stream", True)
-
-    # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
-    if "messages" in req_json and isinstance(req_json["messages"], list):
-        req_json["messages"] = sanitize_request_messages(req_json["messages"])
-        body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
-
-    # Detect client type from User-Agent to decide if we strip <details> tags
-    user_agent = request.headers.get("user-agent", "").lower()
-    strip_details = "dart" in user_agent or "conduit" in user_agent
-
-    completion_id = f"chatcmpl-{int(time.time()*1000)}"
-    created_ts = int(time.time())
-
     sess = await get_session()
     upstream_port = "30000"  # default
 
-    if stream_flag and "chat/completions" in original_path:
-
-        async def generate():
-            try:
-                async with sess.post(
-                    upstream_url, data=body, headers=fwd_headers
-                ) as resp:
-                    logger.info(
-                        f"[port={upstream_port}] Proxied (default) chat completions, "
-                        f"upstream status={resp.status}, "
-                        f"strip_details={strip_details} (UA: {user_agent[:50]})"
-                    )
-                    async for chunk in transform_stream(
-                        resp.content, model, completion_id, created_ts,
-                        upstream_port, strip_details,
-                    ):
-                        yield chunk
-            except aiohttp.ServerDisconnectedError:
-                logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
-            except aiohttp.ClientError as e:
-                logger.warning(f"[port={upstream_port}] Client error: {e}")
-            except Exception as e:
-                # CWE-209/CWE-497: 不要在 client 回應中洩露內部錯誤細節
-                logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
-                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+    # ── Route to appropriate handler ──
+    if "/v1/responses" in original_path:
+        return await handle_responses_request(
+            request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
+    elif "/v1/chat/completions" in original_path:
+        return await handle_completions_request(
+            request, upstream_url, fwd_headers, body, req_json, sess,
+            upstream_port, sanitize_request_messages, transform_stream,
+        )
+    else:
+        # Passthrough for other endpoints
+        return await _passthrough(request, upstream_url, fwd_headers, body, sess)
 
-    # Non-streaming passthrough
+
+async def _passthrough(request, upstream_url, fwd_headers, body, sess):
+    """通用透傳：不處理，直接轉發"""
     method = request.method.upper()
-    async with sess.request(
-        method, upstream_url, data=body, headers=fwd_headers
-    ) as resp:
-        resp_body = await resp.read()
-        try:
-            parsed = json.loads(resp_body) if resp_body else {}
-        except json.JSONDecodeError:
-            parsed = {}
-        return JSONResponse(content=parsed, status_code=resp.status)
+    resp_body = b""
+    resp_status = 502
+    try:
+        async with sess.request(
+            method, upstream_url, data=body, headers=fwd_headers
+        ) as resp:
+            resp_body = await resp.read()
+            resp_status = resp.status
+            try:
+                parsed = json.loads(resp_body) if resp_body else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            return JSONResponse(content=parsed, status_code=resp_status)
+    except Exception:
+        return Response(content=resp_body, status_code=resp_status)
 
 
 # ── Health Check ───────────────────────────────────────────
