@@ -22,6 +22,7 @@ import json
 import html
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -204,6 +205,113 @@ def _strip_details_from_content(frame: str) -> str:
     """
     # Simply return the frame as-is — Conduit handles <details> natively
     return frame
+
+
+# ── History Sanitization (Anti-pollution) ─────────────────
+#
+# 問題：hermes_tool_filter 注入的 <details> 標籤以 delta.content 純文字形式
+# 進入 Open WebUI 的對話歷史。下次請求時，這些標籤會完整出現在模型的 prompt 中，
+# 導致模型模仿輸出 <details> 格式，形成污染反饋迴圈。
+#
+# 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
+# 把 <details type="tool_calls"> 區塊轉換為自然語言描述。
+
+
+def _details_to_natural_language(match: re.Match) -> str:
+    """
+    把 <details type="tool_calls"> 區塊轉換為第三人稱自然語言描述。
+    
+    格式：你執行了 tool_calls {tool_name}：{參數}，返回結果 {結果}
+    
+    這樣模型看到的是客觀的工具執行結果，而不是 HTML 標籤格式，
+    不會模仿輸出 <details> 格式。
+    """
+    tag = match.group(0)
+    
+    # 提取 name 屬性
+    name_match = re.search(r'name="([^"]*)"', tag)
+    tool_name = html.unescape(name_match.group(1)) if name_match else "unknown"
+    
+    # 提取 <arguments> 內容
+    args_match = re.search(r'<arguments>(.*?)</arguments>', tag, re.DOTALL)
+    args_str = ""
+    if args_match:
+        args_raw = html.unescape(args_match.group(1).strip())
+        try:
+            args_obj = json.loads(args_raw)
+            # 移除 tool_name 欄位（已經在文字中提及）
+            clean_args = {k: v for k, v in args_obj.items() if k != "tool_name"}
+            if clean_args:
+                args_str = json.dumps(clean_args, ensure_ascii=False)
+        except json.JSONDecodeError:
+            args_str = args_raw[:200]
+    
+    # 提取 <result> 內容
+    result_match = re.search(r'<result>(.*?)</result>', tag, re.DOTALL)
+    result_str = ""
+    if result_match:
+        result_raw = html.unescape(result_match.group(1).strip())
+        # 截斷過長的結果
+        if len(result_raw) > 1000:
+            result_str = result_raw[:1000] + "..."
+        else:
+            result_str = result_raw
+    
+    # 組裝第三人稱描述
+    desc = f"你執行了 tool_calls {tool_name}：{args_str}"
+    if result_str:
+        desc += f"\n返回結果 {result_str}"
+    
+    return desc
+
+
+def sanitize_message_content(content: str) -> str:
+    """
+    移除 assistant message 中的 <details type="tool_calls"> 區塊，
+    替換為自然語言描述，切斷污染反饋迴圈。
+    """
+    if not content:
+        return content
+    
+    # 1. 匹配 <details type="tool_calls" ...>...</details>（標準格式，支援多行）
+    pattern1 = r'<details\s+[^>]*type="tool_calls"[^>]*>.*?</details>'
+    sanitized = re.sub(pattern1, _details_to_natural_language, content, flags=re.DOTALL)
+    
+    # 2. 也處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
+    # 只處理包含 <arguments> 或 <result> 子標籤的（明顯是工具相關）
+    pattern2 = r'<details[^>]*>\s*\n\s*<summary>.*?</summary>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?\n\s*</details>'
+    sanitized = re.sub(pattern2, lambda m: "工具已執行", sanitized, flags=re.DOTALL)
+    
+    # 3. 兜底：任何包含 <arguments> 和 <result> 的 <details> 區塊
+    pattern3 = r'<details[^>]*>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?</details>'
+    sanitized = re.sub(pattern3, lambda m: "工具已執行", sanitized, flags=re.DOTALL)
+    
+    return sanitized
+
+
+def sanitize_request_messages(messages: list) -> list:
+    """
+    掃描並清理請求中的所有 messages，防止 <details> 污染。
+    只處理 assistant role 的 content。
+    """
+    if not messages:
+        return messages
+    
+    cleaned_count = 0
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("content"):
+            original = msg["content"]
+            msg["content"] = sanitize_message_content(original)
+            if msg["content"] != original:
+                cleaned_count += 1
+    
+    if cleaned_count > 0:
+        logger.info(
+            f"[sanitization] Cleaned {cleaned_count} message(s) "
+            f"of <details> tags from {len(messages)} total messages"
+        )
+    
+    return messages
 
 
 # ── Tool Mode Handlers ─────────────────────────────────────
@@ -702,7 +810,7 @@ async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        _http_session = aiohttp.ClientSession(timeout=timeout)
+        _http_session = aiohttp.ClientSession(timeout=timeout, max_line_size=65536)
     return _http_session
 
 
@@ -736,6 +844,13 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
 
     model = req_json.get("model", "hermes-agent")
     stream_flag = req_json.get("stream", True)
+
+    # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
+    # 切斷污染反饋迴圈 — 把 <details> 轉為自然語言描述
+    if "messages" in req_json and isinstance(req_json["messages"], list):
+        req_json["messages"] = sanitize_request_messages(req_json["messages"])
+        # 更新 body 為清理後的 JSON
+        body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
 
     # Detect client type from User-Agent to decide if we strip <details> tags
     user_agent = request.headers.get("user-agent", "").lower()
@@ -850,6 +965,11 @@ async def proxy_default(request: Request, rest: str):
 
     model = req_json.get("model", "hermes-agent")
     stream_flag = req_json.get("stream", True)
+
+    # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
+    if "messages" in req_json and isinstance(req_json["messages"], list):
+        req_json["messages"] = sanitize_request_messages(req_json["messages"])
+        body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
 
     # Detect client type from User-Agent to decide if we strip <details> tags
     user_agent = request.headers.get("user-agent", "").lower()
