@@ -22,6 +22,7 @@ import json
 import html
 import logging
 import os
+import random
 import re
 import time
 import uuid
@@ -226,92 +227,221 @@ def _get_sanitization_config() -> tuple:
     return bool(enabled), int(max_length)
 
 
-def _details_to_natural_language(match: re.Match) -> str:
+def _extract_tool_info(tag: str, max_result_length: int) -> dict:
     """
-    把 <details type="tool_calls"> 區塊轉換為中性、客觀的歷史陳述。
+    從 <details> 標籤中提取工具資訊。
     
-    格式：Tool {tool_name} was executed with parameters {...} and returned: {...}
-    
-    使用英文被動語態，讓模型看到這是已完成的歷史記錄，而不是指令或格式範例，
-    降低模型模仿輸出 <details> 格式的機率。
+    回傳: {tool_name, args_summary, result_summary, truncated}
     """
-    tag = match.group(0)
-    _, max_result_length = _get_sanitization_config()
-    
     # 提取 name 屬性（支援雙引號、單引號、無引號、大小寫不敏感）
     name_match = re.search(r'name=["\']?([^"\'>\s]*)["\']?', tag, flags=re.IGNORECASE)
     tool_name = html.unescape(name_match.group(1)) if name_match else "unknown"
     
-    # 提取 <arguments> 內容
+    # 提取 <arguments> 內容 — 只提取關鍵參數作為摘要
     args_match = re.search(r'<arguments>(.*?)</arguments>', tag, re.DOTALL)
-    args_str = ""
+    args_summary = ""
     if args_match:
         args_raw = html.unescape(args_match.group(1).strip())
         try:
             args_obj = json.loads(args_raw)
-            # 移除 tool_name 欄位（已經在文字中提及）
-            clean_args = {k: v for k, v in args_obj.items() if k != "tool_name"}
+            # 移除 tool_name/label 等元資料欄位
+            clean_args = {k: v for k, v in args_obj.items() 
+                        if k not in ("tool_name", "label")}
             if clean_args:
-                args_str = json.dumps(clean_args, ensure_ascii=False)
+                # 只取第一個有意義的參數作為摘要
+                for k, v in clean_args.items():
+                    if isinstance(v, str) and len(v) < 100:
+                        args_summary = f"查詢「{v}」"
+                        break
+                    elif isinstance(v, (int, float, bool)):
+                        args_summary = f"參數 {k}={v}"
+                        break
+                else:
+                    args_summary = json.dumps(clean_args, ensure_ascii=False)[:100]
         except json.JSONDecodeError:
-            args_str = args_raw[:200]
+            args_summary = args_raw[:100]
     
     # 提取 <result> 內容
     result_match = re.search(r'<result>(.*?)</result>', tag, re.DOTALL)
-    result_str = ""
+    result_summary = ""
+    truncated = False
     if result_match:
         result_raw = html.unescape(result_match.group(1).strip())
+        # 嘗試解析 JSON 並提取關鍵資訊
+        try:
+            result_obj = json.loads(result_raw)
+            # 如果是成功回應，提取核心數據
+            if isinstance(result_obj, dict):
+                # 移除巢狀的 result 包裝
+                if "result" in result_obj and isinstance(result_obj["result"], str):
+                    inner = result_obj["result"]
+                    try:
+                        inner_obj = json.loads(inner)
+                        result_summary = json.dumps(inner_obj, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        result_summary = inner
+                elif "data" in result_obj:
+                    result_summary = json.dumps(result_obj["data"], ensure_ascii=False)
+                elif "success" in result_obj:
+                    result_summary = json.dumps(result_obj, ensure_ascii=False)
+                else:
+                    result_summary = json.dumps(result_obj, ensure_ascii=False)
+            else:
+                result_summary = str(result_obj)
+        except json.JSONDecodeError:
+            result_summary = result_raw
+        
         # 截斷過長的結果
-        if len(result_raw) > max_result_length:
-            result_str = result_raw[:max_result_length] + "..."
+        if len(result_summary) > max_result_length:
+            result_summary = result_summary[:max_result_length] + "..."
+            truncated = True
             logger.debug(
                 f"[sanitization] Result truncated for tool '{tool_name}': "
-                f"{len(result_raw)} -> {max_result_length + 3} chars"
+                f"{len(result_summary)} -> {max_result_length + 3} chars"
             )
-        else:
-            result_str = result_raw
     
-    # 組裝中性客觀的英文描述
-    desc = f"Tool {tool_name} was executed with parameters {args_str} and returned: {result_str}"
-    
-    return desc
+    return {
+        "tool_name": tool_name,
+        "args_summary": args_summary,
+        "result_summary": result_summary,
+        "truncated": truncated,
+    }
 
 
-def sanitize_message_content(content: str | None) -> tuple:
+def _generate_natural_description(info: dict, seed: int = 0, index: int = 0) -> str:
+    """
+    根據工具資訊生成自然語言描述，使用確定性隨機選擇風格。
+    
+    核心設計原則：
+    1. 不使用固定模板格式（避免模型模仿）
+    2. 使用多種句式變化
+    3. 描述更像「對話中的上下文回顧」而非「工具呼叫紀錄」
+    4. 結果部分保留完整數據供模型使用
+    5. **確定性隨機**：相同 seed + index 產生相同結果，確保 vLLM KV cache 命中
+    
+    :param seed: 基於訊息內容 hash 的 seed，相同請求永遠相同
+    :param index: 同一訊息中第幾個 <details> 標籤（0-based）
+    """
+    tool_name = info["tool_name"]
+    args_summary = info["args_summary"]
+    result_summary = info["result_summary"]
+    
+    # 根據工具類型選擇適當的描述風格
+    tool_type = _classify_tool(tool_name)
+    
+    # 定義多種自然語言風格
+    if tool_type == "search":
+        styles = [
+            f"先前搜尋了{args_summary}，找到以下結果：{result_summary}",
+            f"根據搜尋{args_summary}的結果：{result_summary}",
+            f"搜尋{args_summary}後獲得的資訊：{result_summary}",
+            f"已查詢{args_summary}，回傳：{result_summary}",
+        ]
+    elif tool_type == "trading":
+        styles = [
+            f"先前查詢了交易{args_summary}，數據顯示：{result_summary}",
+            f"根據交易工具的回應{args_summary}：{result_summary}",
+            f"工具回傳的交易資料{args_summary}：{result_summary}",
+            f"從交易系統取得的{args_summary}資料：{result_summary}",
+        ]
+    elif tool_type == "file":
+        styles = [
+            f"讀取了檔案內容{args_summary}：{result_summary}",
+            f"檔案{args_summary}的內容如下：{result_summary}",
+            f"從檔案中讀取到的資料{args_summary}：{result_summary}",
+        ]
+    elif tool_type == "code":
+        styles = [
+            f"執行了程式碼{args_summary}，輸出：{result_summary}",
+            f"程式碼執行結果{args_summary}：{result_summary}",
+            f"程式碼回傳：{result_summary}",
+        ]
+    else:
+        styles = [
+            f"先前使用了{tool_name}工具{args_summary}，得到：{result_summary}",
+            f"根據{tool_name}工具的回應{args_summary}：{result_summary}",
+            f"工具{tool_name}回傳的資料{args_summary}：{result_summary}",
+            f"系統已執行{tool_name}{args_summary}，結果為：{result_summary}",
+            f"歷史上下文：{tool_name}查詢{args_summary}後的結果：{result_summary}",
+        ]
+    
+    # 使用確定性隨機：相同 seed + index → 相同風格
+    # 這樣同一個請求的 sanitization 結果永遠一致，KV cache 才能命中
+    rng = random.Random(seed + index)
+    return rng.choice(styles)
+
+
+def _classify_tool(tool_name: str) -> str:
+    """根據工具名稱分類工具類型"""
+    search_tools = ["web_search", "brave_web_search", "search_files", "session_search"]
+    trading_tools = ["mcp_trading_get_positions", "mcp_trading_get_wallet_balance",
+                    "mcp_trading_get_market_data", "mcp_trading_create_order"]
+    file_tools = ["read_file", "write_file", "patch"]
+    code_tools = ["execute_code", "terminal"]
+    
+    tn = tool_name.lower()
+    if any(s in tn for s in search_tools):
+        return "search"
+    elif any(s in tn for s in trading_tools):
+        return "trading"
+    elif any(s in tn for s in file_tools):
+        return "file"
+    elif any(s in tn for s in code_tools):
+        return "code"
+    else:
+        return "general"
+
+
+def sanitize_message_content(content: str | None, seed: int = 0) -> tuple:
     """
     移除 assistant message 中的 <details type="tool_calls"> 區塊，
     替換為自然語言描述，切斷污染反饋迴圈。
     
     回傳: (sanitized_content: str, replacement_count: int)
+    
+    :param seed: 用於確定性隨機的 seed，確保相同內容產生相同結果（KV cache 友好）
     """
     if not content:
         return content, 0
     
     total_replacements = 0
+    detail_index = 0  # 追蹤同一訊息中第幾個 <details>
     
     # 1. 匹配 <details ... type="tool_calls" ...>...</details>（標準格式，支援多行、屬性順序不限）
     pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>.*?</details>'
     def _count_and_replace(m: re.Match) -> str:
-        nonlocal total_replacements
+        nonlocal total_replacements, detail_index
         total_replacements += 1
-        return _details_to_natural_language(m)
+        idx = detail_index
+        detail_index += 1
+        _, max_result_length = _get_sanitization_config()
+        info = _extract_tool_info(m.group(0), max_result_length)
+        return _generate_natural_description(info, seed, idx)
     sanitized = re.sub(pattern1, _count_and_replace, content, flags=re.DOTALL | re.IGNORECASE)
     
     # 2. 處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
     # 只處理包含 <arguments> 或 <result> 子標籤的（明顯是工具相關）
     pattern2 = r'<details[^>]*>\s*\n\s*<summary>.*?</summary>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?\n\s*</details>'
     def _count_and_replace_fallback(m: re.Match) -> str:
-        nonlocal total_replacements
+        nonlocal total_replacements, detail_index
         total_replacements += 1
-        return "Previous tool was executed."
+        idx = detail_index
+        detail_index += 1
+        _, max_result_length = _get_sanitization_config()
+        info = _extract_tool_info(m.group(0), max_result_length)
+        return _generate_natural_description(info, seed, idx)
     sanitized = re.sub(pattern2, _count_and_replace_fallback, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     # 3. 兜底：任何包含 <arguments> 和 <result> 的 <details> 區塊
     pattern3 = r'<details[^>]*>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?</details>'
     def _count_and_replace_fallback2(m: re.Match) -> str:
-        nonlocal total_replacements
+        nonlocal total_replacements, detail_index
         total_replacements += 1
-        return "Previous tool was executed."
+        idx = detail_index
+        detail_index += 1
+        _, max_result_length = _get_sanitization_config()
+        info = _extract_tool_info(m.group(0), max_result_length)
+        return _generate_natural_description(info, seed, idx)
     sanitized = re.sub(pattern3, _count_and_replace_fallback2, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     return sanitized, total_replacements
@@ -323,6 +453,9 @@ def sanitize_request_messages(messages: list) -> list:
     只處理 assistant role 的 content。
     
     可透過 config.yaml 的 enable_history_sanitization 開關控制。
+    
+    **確定性隨機**：每個訊息使用自身內容的 hash 作為 seed，
+    確保相同請求的 sanitization 結果一致，vLLM KV cache 才能命中。
     """
     if not messages:
         return messages
@@ -336,7 +469,9 @@ def sanitize_request_messages(messages: list) -> list:
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("content"):
             original = msg["content"]
-            sanitized, count = sanitize_message_content(original)
+            # 使用訊息內容的 hash 作為 seed，確保相同內容產生相同結果
+            seed = hash(original) & 0xFFFFFFFF
+            sanitized, count = sanitize_message_content(original, seed)
             msg["content"] = sanitized
             if count > 0:
                 messages_cleaned += 1
