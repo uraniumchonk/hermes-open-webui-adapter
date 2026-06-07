@@ -250,12 +250,21 @@ async def _inject_previous_tool_results(
 ) -> Optional[bytes]:
     """
     當請求帶有 previous_response_id 時，取得上一輪的 response 並將其
-    function_call / function_call_output items 注入到 input 前面，
-    讓模型能看到上次的工具調用結果。
+    tool results 以文字摘要形式注入到 user message 中。
     
+    問題：
     Open WebUI 在 stateful 模式下只把 user messages 帶到 input 中，
-    tool results 雖然存在 conversation_history 裡，但不會被帶到下一次請求。
-    這個函數彌補這個缺口。
+    而 Hermes API Server 的 input parser / conversation_history parser
+    都無法完整保留 tool_calls / tool_call_id 等非標準欄位。
+    
+    方案（雙路徑）：
+    路徑 A — native conversation_history：保留 previous_response_id，
+    Hermes 內部從 _response_store 取出完整 history（含工具訊息），
+    這是主要機制。
+    
+    路徑 B — text summary injection（本函數）：
+    將工具結果轉為文字摘要，注入到 input 中作為 context，
+    提供雙重保險。
     
     返回新的 body bytes，如果不需要修改則返回 None。
     """
@@ -263,9 +272,7 @@ async def _inject_previous_tool_results(
     if not prev_id:
         return None
     
-    # 取得 upstream 的 base URL（去掉路徑部分）
-    # upstream_url 格式: http://127.0.0.1:30000/v1/responses
-    # 我们需要 GET http://127.0.0.1:30000/v1/responses/{prev_id}
+    # 取得 upstream 的 base URL
     upstream_base = upstream_url.rsplit("/v1/responses", 1)[0]
     get_url = f"{upstream_base}/v1/responses/{prev_id}"
     
@@ -276,64 +283,74 @@ async def _inject_previous_tool_results(
                 return None
             
             prev_resp = await resp.json()
-            output_items = prev_resp.get("response", {}).get("output", [])
+            output_items = prev_resp.get("output", [])
+            if not output_items:
+                output_items = prev_resp.get("response", {}).get("output", [])
             
-            # 找出有工具調用的 items
-            tool_items = [
-                item for item in output_items
-                if item.get("type") in ("function_call", "function_call_output")
-            ]
+            # 從 tool items 中提取文字摘要
+            tool_summaries: list[str] = []
+            for item in output_items:
+                item_type = item.get("type")
+                if item_type == "function_call":
+                    name = item.get("name", "unknown")
+                    try:
+                        args = json.loads(item.get("arguments", "{}"))
+                        arg_preview = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
+                    except (json.JSONDecodeError, TypeError):
+                        arg_preview = item.get("arguments", "")[:80]
+                    tool_summaries.append(f"[Previous turn] Tool called: {name}({arg_preview})")
+                elif item_type == "function_call_output":
+                    output = item.get("output", "")
+                    # Truncate long outputs
+                    if len(output) > 500:
+                        output = output[:500] + "..."
+                    tool_summaries.append(f"[Previous turn] Tool result: {output}")
             
-            if not tool_items:
-                logger.debug(f"[responses] No tool items in previous response {prev_id}")
+            if not tool_summaries:
+                logger.debug(f"[responses] No tool items to summarize from {prev_id}")
                 return None
             
-            # 取得目前的 input
+            summary_text = "\n".join(tool_summaries)
+            
+            # 注入到 input 的 user message 前面
             current_input = req_json.get("input", "")
             
-            # 將 input 轉換為物件陣列格式（Responses API 格式）
-            input_items: list[dict] = []
+            context_block = (
+                "<tool_results_from_previous_turn>\n"
+                f"{summary_text}\n"
+                "</tool_results_from_previous_turn>\n\n"
+            )
+            
             if isinstance(current_input, str):
-                input_items = [{"type": "message", "role": "user", "content": current_input}]
+                new_input = context_block + current_input
             elif isinstance(current_input, list):
-                input_items = list(current_input)
+                # 找到 user message 並在前面插入
+                new_input = []
+                injected = False
+                for item in current_input:
+                    if not injected and isinstance(item, dict) and item.get("role") == "user":
+                        orig_content = item.get("content", "")
+                        new_item = dict(item)
+                        new_item["content"] = context_block + orig_content
+                        new_input.append(new_item)
+                        injected = True
+                    else:
+                        new_input.append(item)
+                if not injected:
+                    new_input = [{"role": "user", "content": context_block}] + new_input
+                current_input = new_input
             else:
                 return None
             
-            # 建構注入的 items：function_call + function_call_output 配對
-            injected_items: list[dict] = []
-            
-            # 將 tool items 轉換為 Responses input format
-            for item in tool_items:
-                if item.get("type") == "function_call":
-                    injected_items.append({
-                        "type": "function_call",
-                        "id": item.get("id", item.get("call_id", "")),
-                        "call_id": item.get("call_id", item.get("id", "")),
-                        "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
-                    })
-                elif item.get("type") == "function_call_output":
-                    injected_items.append({
-                        "type": "function_call_output",
-                        "call_id": item.get("call_id", ""),
-                        "output": item.get("output", ""),
-                    })
-            
-            if not injected_items:
-                return None
-            
-            # 將注入的 items 放在 input 前面
-            new_input = injected_items + input_items
-            
-            # 更新 req_json 並轉回 bytes
-            req_json["input"] = new_input
+            req_json["input"] = current_input
             new_body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
             
             logger.info(
-                f"[responses] Injected {len(injected_items)} tool items "
-                f"from previous response {prev_id} into input "
-                f"(total input items: {len(new_input)})"
+                f"[responses] Injected {len(tool_summaries)} tool-result summaries "
+                f"from {prev_id} into input (path B: text injection)"
+            )
+            logger.debug(
+                f"[responses] Injected text:\n{context_block[:500]}"
             )
             
             return new_body
