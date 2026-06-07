@@ -21,9 +21,10 @@
 
 - ⚡ **enhance-v2 mode** — Real-time streaming + complete `<details>` child-element format, fully compatible with OpenWebUI
 - 🏢 **Multi-profile routing** — One proxy for multiple Gateway profiles (Chatting / Coder / Analyst / Trader)
-- 🧹 **Smart filtering** — Auto-filters intermediate states, outputs only completion tags
+- 🧹 **History sanitization** — Anti-pollution: converts `<details>` tags in conversation history to natural language (19 templates), preventing the model from mimicking HTML output
+- 📡 **Dual handler** — Separate handlers for `/v1/chat/completions` and `/v1/responses`, with automatic tool-result injection for stateful Responses API
 - 🔧 **One-click patch** — Includes auto-apply patch + verification script for Hermes API Server
-- 📦 **Zero state** — Single file, no database, config-driven via `config.yaml`
+- 📦 **Zero state** — No database, config-driven via `config.yaml`
 
 ---
 
@@ -36,6 +37,8 @@
 - [Configuration](#configuration)
 - [How It Works](#how-it-works)
 - [Features](#features)
+- [History Sanitization (Anti-Pollution)](#history-sanitization-anti-pollution)
+- [Responses API Support](#responses-api-support)
 - [Systemd Service](#systemd-service)
 - [🔧 Hermes API Server Patch Guide](#-hermes-api-server-patch-guide)
 - [Troubleshooting](#troubleshooting)
@@ -163,10 +166,11 @@ User Browser
     ▼
 Open WebUI (30010)
     │ POST http://127.0.0.1:9099/30001/v1/chat/completions
+    │ POST http://127.0.0.1:9099/30001/v1/responses
     ▼
 hermes_tool_filter (9099)
-    │ Mode: enhance-v2
-    │ Converts hermes.tool.progress events → <details> HTML tags
+    │ completions_handler.py  ← /v1/chat/completions (enhance-v2 + sanitization)
+    │ responses_handler.py    ← /v1/responses (tool injection + SSE passthrough)
     │ Routes: /30001/v1/* → http://127.0.0.1:30001/v1/*
     ▼
 Hermes Gateway API Server (30001)
@@ -185,6 +189,15 @@ vLLM (backend)
 5. **Proxy** transforms format → **Open WebUI**
 6. **Open WebUI** stores to local database
 7. User sends new message → history reconstructed with tool context
+
+### Dual Handler Design
+
+The proxy uses two separate handlers for different API formats:
+
+| Handler | Path | Features |
+|---------|------|----------|
+| `completions_handler.py` | `/v1/chat/completions` | enhance-v2 SSE transform, history sanitization |
+| `responses_handler.py` | `/v1/responses` | Tool-result injection, SSE passthrough/convert |
 
 ---
 
@@ -282,9 +295,109 @@ When Open WebUI connects, set the API Base URL to `http://127.0.0.1:9099/<PORT>/
 - 🔄 **Format conversion** — Hermes custom format → standard client-renderable format
 - 🎛️ **Four processing modes** — enhance-v2 (default), enhance, passthrough, strip
 - 🏢 **Multi-tenant routing** — One proxy, multiple Gateway profiles
-- 🧠 **Smart filtering** — Auto-filters hermes.tool.progress events, outputs only completion tags
+- 🧹 **History sanitization** — 19 natural language templates across 5 tool categories, deterministic randomness for vLLM KV cache
+- 📡 **Dual handler** — Separate handlers for Chat Completions and Responses API
+- 💉 **Tool-result injection** — Automatic injection for stateful Responses API (dual-path: native + proxy)
 - 📋 **Complete tool info** — Tool name, arguments, and results (child element format)
 - ⚙️ **Config-driven** — Centralized management, no code changes needed
+
+---
+
+## History Sanitization (Anti-Pollution)
+
+**Problem:** The `<details>` tags injected by enhance-v2 are stored as plain text in Open WebUI's conversation history. On the next request, the model sees these HTML tags in its prompt and starts mimicking them — outputting `<details>`, `<summary>`, `<arguments>`, `<result>` as part of its response. This creates a **pollution feedback loop** that gets worse over time.
+
+**Solution:** Before forwarding requests to the upstream Gateway, the proxy scans all assistant messages and replaces `<details>` blocks with natural language descriptions.
+
+### How It Works
+
+1. Intercept incoming `messages` array
+2. For each `role: "assistant"` message, find `<details type="tool_calls">` blocks
+3. Extract tool name, arguments, and result from the block
+4. Replace the block with a natural language sentence
+5. Forward the cleaned request to the Gateway
+
+### Example
+
+**Before sanitization (polluted):**
+```
+好的喵～讓我查一下喵～
+
+<details type="tool_calls" done="true" name="web_search">
+<summary>✅ 🌐 web_search</summary>
+<arguments>{"tool_name": "web_search", "query": "BTC price today"}</arguments>
+<result>{"data": [{"title": "Bitcoin Price", ...}]}</result>
+</details>
+
+BTC 現在的價格大約是...
+```
+
+**After sanitization (clean):**
+```
+好的喵～讓我查一下喵～
+
+搜尋「BTC price today」後獲得的資訊：{"data": [{"title": "Bitcoin Price", ...}]}
+
+BTC 現在的價格大約是...
+```
+
+### 19 Natural Language Templates
+
+To prevent the model from learning a fixed pattern, sanitization uses **19 different sentence templates** across 5 tool categories. A deterministic random selector (`random.Random(seed + index)`) ensures the same input always produces the same output — critical for **vLLM KV cache hits**.
+
+| Tool Type | Templates | Tools |
+|-----------|-----------|-------|
+| Search | 4 | `web_search`, `brave_web_search`, `search_files`, `session_search` |
+| Trading | 4 | `mcp_trading_get_positions`, `mcp_trading_get_wallet_balance`, ... |
+| File | 3 | `read_file`, `write_file`, `patch` |
+| Code | 3 | `execute_code`, `terminal` |
+| General | 5 | All other tools |
+
+### Configuration
+
+Controlled via `config.yaml`:
+
+```yaml
+enable_history_sanitization: true
+sanitization_result_max_length: 2000
+```
+
+---
+
+## Responses API Support
+
+**Problem:** When Open WebUI uses the Responses API in stateful mode (`previous_response_id`), it only carries user messages in the `input` — tool results from the previous turn are lost. The model has no visibility into what tools were executed or what they returned.
+
+**Solution:** The `responses_handler.py` fetches the previous response and injects tool results as text summaries into the current input.
+
+### Dual-Path Protection
+
+- **Path A (native):** `previous_response_id` is preserved so Hermes can retrieve the full `conversation_history` internally (primary mechanism).
+- **Path B (proxy injection):** Tool results are converted to text summaries and prepended to the user message as a fallback.
+
+### Injection Format
+
+```xml
+<tool_results_from_previous_turn>
+[Previous turn] Tool called: web_search(query=BTC price today)
+[Previous turn] Tool result: {"data": [{"title": "Bitcoin Price", ...}]}
+</tool_results_from_previous_turn>
+
+<User's new message here>
+```
+
+### SSE Modes
+
+| Mode | Behavior |
+|------|----------|
+| `passthrough` (default) | Forward Responses SSE events directly |
+| `convert` | Convert Responses SSE → Chat Completions SSE |
+
+### Configuration
+
+```yaml
+responses_sse_mode: "passthrough"  # or "convert"
+```
 
 ---
 
@@ -392,6 +505,8 @@ python3 /path/to/hermes_tool_filter/test_api_server.py
 | Tool cards don't show in Open WebUI | enhance-v2 not active | Verify `tool_mode: "enhance-v2"` in config.yaml |
 | `<details>` tags missing `result` | API Server patch not applied | Run the patch guide above |
 | Tool cards show but result is empty | API Server `result` field missing | Check `grep '"result":'` in api_server.py |
+| Model outputs `<details>` tags | Pollution feedback loop | Check `enable_history_sanitization: true` |
+| Model forgets tool results in Responses API | Stateful mode not injecting | Check `[responses] Injected` in filter logs |
 | Proxy not responding | Service crashed | `journalctl -u hermes-tool-filter` or check logs |
 | Wrong upstream | Wrong route path | Verify routing table matches your Gateway ports |
 | `hermes update` broke things | Patch overwritten by git reset | Re-apply patch after update |

@@ -21,21 +21,24 @@
 
 - ⚡ **enhance-v2 模式** — 即時串流 + 完整 `<details>` 子標籤格式，完全相容 OpenWebUI
 - 🏢 **多 Profile 路由** — 一個代理對應多個 Gateway profiles（Chatting / Coder / Analyst / Trader）
-- 🧹 **智能過濾** — 自動過濾中間狀態，只輸出完成標籤
+- 🧹 **歷史清理（防污染）** — 將對話歷史中的 `<details>` 標籤替換為自然語言（19 種模板），防止模型模仿輸出 HTML
+- 📡 **雙 Handler 架構** — 分別處理 `/v1/chat/completions` 和 `/v1/responses`，Responses API 自動注入工具結果
 - 🔧 **一鍵 Patch** — 包含自動套用 patch + 驗證腳本，修改 Hermes API Server
-- 📦 **零狀態** — 單檔案、無資料庫、config.yaml 驅動
+- 📦 **零狀態** — 無資料庫、config.yaml 驅動
 
 ---
 
 ## 目錄
 
-- [問題：工具上下文丟失](#問題工具上下文丟失)
+- [問題：工具上下文丟失](#問題：工具上下文丟失)
 - [解決方案](#解決方案)
 - [系統架構](#系統架構)
 - [快速開始](#快速開始)
 - [配置](#配置)
 - [工作方式](#工作方式)
 - [功能](#功能)
+- [歷史清理（防污染）](#歷史清理防污染)
+- [Responses API 支援](#responses-api-支援)
 - [Systemd 服務](#systemd-服務)
 - [🔧 Hermes API Server Patch 指南](#-hermes-api-server-patch-指南)
 - [故障排除](#故障排除)
@@ -163,17 +166,18 @@ Hermes Tool Filter 在 Hermes Gateway 與 Open WebUI 之間架起橋樑，將自
     ▼
 Open WebUI (30010)
     │ POST http://127.0.0.1:9099/30001/v1/chat/completions
+    │ POST http://127.0.0.1:9099/30001/v1/responses
     ▼
 hermes_tool_filter (9099)
-    │ 模式: enhance-v2
-    │ 轉換 hermes.tool.progress 事件 → <details> HTML 標籤
+    │ completions_handler.py  ← /v1/chat/completions（enhance-v2 + 歷史清理）
+    │ responses_handler.py    ← /v1/responses（工具注入 + SSE 透傳）
     │ 路由: /30001/v1/* → http://127.0.0.1:30001/v1/*
     ▼
 Hermes Gateway API Server (30001)
     │ 基於 aiohttp, OpenAI-compatible endpoint
     │ 內部執行完整 agent loop 與工具執行
     ▼
-vLLM (後端)
+vLLM（後端）
 ```
 
 ### 請求流程
@@ -185,6 +189,15 @@ vLLM (後端)
 5. **代理** 轉換格式 → **Open WebUI**
 6. **Open WebUI** 存入本地資料庫
 7. 用戶發送新訊息 → 歷史重構時包含工具上下文
+
+### 雙 Handler 設計
+
+代理使用兩個獨立的 handler 處理不同 API 格式：
+
+| Handler | 路徑 | 功能 |
+|---------|------|------|
+| `completions_handler.py` | `/v1/chat/completions` | enhance-v2 SSE 轉換、歷史清理 |
+| `responses_handler.py` | `/v1/responses` | 工具結果注入、SSE 透傳/轉換 |
 
 ---
 
@@ -282,9 +295,109 @@ API_SERVER_KEY=sk_你的自訂金鑰
 - 🔄 **格式轉換** — Hermes 自訂格式 → 客戶端可渲染的標準格式
 - 🎛️ **四種處理模式** — enhance-v2（預設）、enhance、passthrough、strip
 - 🏢 **多租戶路由** — 一個代理，多個 Gateway profiles
-- 🧠 **智能過濾** — 自動過濾 hermes.tool.progress 事件，只輸出完成標籤
+- 🧹 **歷史清理** — 19 種自然語言模板，涵蓋 5 種工具類型，確定性隨機確保 vLLM KV Cache 命中率
+- 📡 **雙 Handler** — 分別處理 Chat Completions 和 Responses API
+- 💉 **工具結果注入** — Responses API 狀態模式下自動注入（雙路徑：原生 + 代理）
 - 📋 **完整工具資訊** — 工具名稱、參數、結果（子標籤格式）
 - ⚙️ **配置驅動** — 集中管理，無需修改程式碼
+
+---
+
+## 歷史清理（防污染）
+
+**問題：** enhance-v2 注入的 `<details>` 標籤以純文字形式儲存在 Open WebUI 的對話歷史中。下一次請求時，模型在 prompt 中看到這些 HTML 標籤，開始模仿輸出——在回覆中加入 `<details>`、`<summary>`、`<arguments>`、`<result>`。這形成**污染反饋迴圈**，越聊越嚴重。
+
+**解決方案：** 在將請求轉發給上游 Gateway 之前，代理掃描所有 assistant 訊息，將 `<details>` 區塊替換為自然語言描述。
+
+### 工作原理
+
+1. 攔截傳入的 `messages` 陣列
+2. 針對每個 `role: "assistant"` 的訊息，尋找 `<details type="tool_calls">` 區塊
+3. 從區塊中提取工具名稱、參數和結果
+4. 用自然語言句子替換該區塊
+5. 將清理後的請求轉發給 Gateway
+
+### 範例
+
+**清理前（被污染）：**
+```
+好的喵～讓我查一下喵～
+
+<details type="tool_calls" done="true" name="web_search">
+<summary>✅ 🌐 web_search</summary>
+<arguments>{"tool_name": "web_search", "query": "BTC price today"}</arguments>
+<result>{"data": [{"title": "Bitcoin Price", ...}]}</result>
+</details>
+
+BTC 現在的價格大約是...
+```
+
+**清理後（乾淨）：**
+```
+好的喵～讓我查一下喵～
+
+搜尋「BTC price today」後獲得的資訊：{"data": [{"title": "Bitcoin Price", ...}]}
+
+BTC 現在的價格大約是...
+```
+
+### 19 種自然語言模板
+
+為了防止模型學會固定格式，清理功能使用 **19 種不同的句子模板**，涵蓋 5 種工具類型。確定性隨機選擇器（`random.Random(seed + index)`）確保相同輸入永遠產生相同輸出——這對 **vLLM KV Cache 命中** 至關重要。
+
+| 工具類型 | 模板數 | 工具 |
+|---------|--------|------|
+| 搜尋 | 4 | `web_search`, `brave_web_search`, `search_files`, `session_search` |
+| 交易 | 4 | `mcp_trading_get_positions`, `mcp_trading_get_wallet_balance`, ... |
+| 檔案 | 3 | `read_file`, `write_file`, `patch` |
+| 程式碼 | 3 | `execute_code`, `terminal` |
+| 通用 | 5 | 其他所有工具 |
+
+### 配置
+
+透過 `config.yaml` 控制：
+
+```yaml
+enable_history_sanitization: true
+sanitization_result_max_length: 2000
+```
+
+---
+
+## Responses API 支援
+
+**問題：** 當 Open WebUI 使用 Responses API 的有狀態模式（`previous_response_id`）時，`input` 中只帶入使用者訊息——上一輪的工具結果丟失。模型完全看不到之前執行了什麼工具、返回了什麼結果。
+
+**解決方案：** `responses_handler.py` 取得上一輪的 response，將工具結果以文字摘要形式注入到當前 input 中。
+
+### 雙路徑保護
+
+- **路徑 A（原生）：** 保留 `previous_response_id`，讓 Hermes 內部取得完整的 `conversation_history`（主要機制）。
+- **路徑 B（代理注入）：** 工具結果轉為文字摘要，前置到使用者訊息前作為備援。
+
+### 注入格式
+
+```xml
+<tool_results_from_previous_turn>
+[Previous turn] Tool called: web_search(query=BTC price today)
+[Previous turn] Tool result: {"data": [{"title": "Bitcoin Price", ...}]}
+</tool_results_from_previous_turn>
+
+<使用者的新訊息>
+```
+
+### SSE 模式
+
+| 模式 | 行為 |
+|------|------|
+| `passthrough`（預設） | 直接轉發 Responses SSE 事件 |
+| `convert` | 將 Responses SSE 轉換為 Chat Completions SSE |
+
+### 配置
+
+```yaml
+responses_sse_mode: "passthrough"  # 或 "convert"
+```
 
 ---
 
@@ -392,6 +505,8 @@ python3 /path/to/hermes_tool_filter/test_api_server.py
 | Open WebUI 中工具卡片不顯示 | enhance-v2 未啟用 | 確認 config.yaml 中 `tool_mode: "enhance-v2"` |
 | `<details>` 標籤缺少 `result` | API Server patch 未套用 | 執行上方的 patch 指南 |
 | 工具卡片顯示但結果空白 | API Server `result` 欄位缺失 | 檢查 `grep '"result":'` 在 api_server.py |
+| 模型輸出 `<details>` 標籤 | 污染反饋迴圈 | 確認 `enable_history_sanitization: true` |
+| Responses API 中模型忘記工具結果 | 有狀態模式未注入 | 檢查 filter 日誌中的 `[responses] Injected` |
 | 代理無回應 | 服務當機 | `journalctl -u hermes-tool-filter` 查看日誌 |
 | 路由到錯誤的上游 | 路徑不匹配 | 確認路由表與 Gateway 端口一致 |
 | `hermes update` 後失效 | Patch 被 git reset 覆蓋 | 更新後重新套用 patch |
