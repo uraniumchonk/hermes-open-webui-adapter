@@ -215,6 +215,15 @@ def _strip_details_from_content(frame: str) -> str:
 #
 # 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
 # 把 <details type="tool_calls"> 區塊轉換為自然語言描述。
+#
+# 配置：config.yaml 中的 enable_history_sanitization 和 sanitization_result_max_length
+
+
+def _get_sanitization_config() -> tuple:
+    """取得 sanitization 配置，回傳 (enabled: bool, max_result_length: int)"""
+    enabled = CONFIG.get("enable_history_sanitization", True)
+    max_length = CONFIG.get("sanitization_result_max_length", 2000)
+    return bool(enabled), int(max_length)
 
 
 def _details_to_natural_language(match: re.Match) -> str:
@@ -227,9 +236,10 @@ def _details_to_natural_language(match: re.Match) -> str:
     降低模型模仿輸出 <details> 格式的機率。
     """
     tag = match.group(0)
+    _, max_result_length = _get_sanitization_config()
     
-    # 提取 name 屬性
-    name_match = re.search(r'name="([^"]*)"', tag)
+    # 提取 name 屬性（支援雙引號、單引號、無引號、大小寫不敏感）
+    name_match = re.search(r'name=["\']?([^"\'>\s]*)["\']?', tag, flags=re.IGNORECASE)
     tool_name = html.unescape(name_match.group(1)) if name_match else "unknown"
     
     # 提取 <arguments> 內容
@@ -252,8 +262,12 @@ def _details_to_natural_language(match: re.Match) -> str:
     if result_match:
         result_raw = html.unescape(result_match.group(1).strip())
         # 截斷過長的結果
-        if len(result_raw) > 1000:
-            result_str = result_raw[:1000] + "..."
+        if len(result_raw) > max_result_length:
+            result_str = result_raw[:max_result_length] + "..."
+            logger.debug(
+                f"[sanitization] Result truncated for tool '{tool_name}': "
+                f"{len(result_raw)} -> {max_result_length + 3} chars"
+            )
         else:
             result_str = result_raw
     
@@ -263,50 +277,75 @@ def _details_to_natural_language(match: re.Match) -> str:
     return desc
 
 
-def sanitize_message_content(content: str) -> str:
+def sanitize_message_content(content: str | None) -> tuple:
     """
     移除 assistant message 中的 <details type="tool_calls"> 區塊，
     替換為自然語言描述，切斷污染反饋迴圈。
+    
+    回傳: (sanitized_content: str, replacement_count: int)
     """
     if not content:
-        return content
+        return content, 0
     
-    # 1. 匹配 <details type="tool_calls" ...>...</details>（標準格式，支援多行）
-    pattern1 = r'<details\s+[^>]*type="tool_calls"[^>]*>.*?</details>'
-    sanitized = re.sub(pattern1, _details_to_natural_language, content, flags=re.DOTALL)
+    total_replacements = 0
     
-    # 2. 也處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
+    # 1. 匹配 <details ... type="tool_calls" ...>...</details>（標準格式，支援多行、屬性順序不限）
+    pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>.*?</details>'
+    def _count_and_replace(m: re.Match) -> str:
+        nonlocal total_replacements
+        total_replacements += 1
+        return _details_to_natural_language(m)
+    sanitized = re.sub(pattern1, _count_and_replace, content, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 2. 處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
     # 只處理包含 <arguments> 或 <result> 子標籤的（明顯是工具相關）
     pattern2 = r'<details[^>]*>\s*\n\s*<summary>.*?</summary>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?\n\s*</details>'
-    sanitized = re.sub(pattern2, lambda m: "工具已執行", sanitized, flags=re.DOTALL)
+    def _count_and_replace_fallback(m: re.Match) -> str:
+        nonlocal total_replacements
+        total_replacements += 1
+        return "Previous tool was executed."
+    sanitized = re.sub(pattern2, _count_and_replace_fallback, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     # 3. 兜底：任何包含 <arguments> 和 <result> 的 <details> 區塊
     pattern3 = r'<details[^>]*>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?</details>'
-    sanitized = re.sub(pattern3, lambda m: "工具已執行", sanitized, flags=re.DOTALL)
+    def _count_and_replace_fallback2(m: re.Match) -> str:
+        nonlocal total_replacements
+        total_replacements += 1
+        return "Previous tool was executed."
+    sanitized = re.sub(pattern3, _count_and_replace_fallback2, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
-    return sanitized
+    return sanitized, total_replacements
 
 
 def sanitize_request_messages(messages: list) -> list:
     """
     掃描並清理請求中的所有 messages，防止 <details> 污染。
     只處理 assistant role 的 content。
+    
+    可透過 config.yaml 的 enable_history_sanitization 開關控制。
     """
     if not messages:
         return messages
     
-    cleaned_count = 0
+    enabled, _ = _get_sanitization_config()
+    if not enabled:
+        return messages
+    
+    total_details_cleaned = 0
+    messages_cleaned = 0
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("content"):
             original = msg["content"]
-            msg["content"] = sanitize_message_content(original)
-            if msg["content"] != original:
-                cleaned_count += 1
+            sanitized, count = sanitize_message_content(original)
+            msg["content"] = sanitized
+            if count > 0:
+                messages_cleaned += 1
+                total_details_cleaned += count
     
-    if cleaned_count > 0:
+    if total_details_cleaned > 0:
         logger.info(
-            f"[sanitization] Cleaned {cleaned_count} message(s) "
-            f"of <details> tags from {len(messages)} total messages"
+            f"[sanitization] Replaced {total_details_cleaned} <details> tag(s) "
+            f"across {messages_cleaned} message(s) from {len(messages)} total messages"
         )
     
     return messages

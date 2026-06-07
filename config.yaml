@@ -21,3 +21,10 @@ tool_mode: "enhance-v2"
 # 自動分割閾值（字元數），0 表示關閉
 # 注意: Conduit APP 不支援 session.split 事件
 auto_split_threshold: 0
+
+# ── History Sanitization (Anti-pollution) ──────────────────
+# 在轉發請求前，將 assistant content 中的 <details type="tool_calls"> 標籤
+# 轉換為自然語言描述，切斷污染反饋迴圈。
+enable_history_sanitization: true
+# 結果截斷字元數（超過此長度會加上 "..."）
+sanitization_result_max_length: 2000
