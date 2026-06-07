@@ -219,12 +219,12 @@ def _strip_details_from_content(frame: str) -> str:
 
 def _details_to_natural_language(match: re.Match) -> str:
     """
-    把 <details type="tool_calls"> 區塊轉換為第三人稱自然語言描述。
+    把 <details type="tool_calls"> 區塊轉換為中性、客觀的歷史陳述。
     
-    格式：你執行了 tool_calls {tool_name}：{參數}，返回結果 {結果}
+    格式：Tool {tool_name} was executed with parameters {...} and returned: {...}
     
-    這樣模型看到的是客觀的工具執行結果，而不是 HTML 標籤格式，
-    不會模仿輸出 <details> 格式。
+    使用英文被動語態，讓模型看到這是已完成的歷史記錄，而不是指令或格式範例，
+    降低模型模仿輸出 <details> 格式的機率。
     """
     tag = match.group(0)
     
@@ -257,10 +257,8 @@ def _details_to_natural_language(match: re.Match) -> str:
         else:
             result_str = result_raw
     
-    # 組裝第三人稱描述
-    desc = f"你執行了 tool_calls {tool_name}：{args_str}"
-    if result_str:
-        desc += f"\n返回結果 {result_str}"
+    # 組裝中性客觀的英文描述
+    desc = f"Tool {tool_name} was executed with parameters {args_str} and returned: {result_str}"
     
     return desc
 

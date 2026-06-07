@@ -28,8 +28,8 @@ print()
 
 # 驗證
 assert "<details" not in result1, "❌ <details> 標籤未被移除！"
-assert "你執行了 tool_calls mcp_trading_get_positions" in result1, "❌ 未找到第三人稱描述！"
-assert "返回結果" in result1, "❌ 未找到返回結果！"
+assert "Tool mcp_trading_get_positions was executed with parameters" in result1, "❌ 未找到客觀描述！"
+assert "and returned:" in result1, "❌ 未找到返回結果！"
 assert "這是分析結果喵～" in result1, "❌ 正常文字被破壞！"
 print("✅ TEST 1 PASSED\n")
 
@@ -60,7 +60,7 @@ print(result2)
 print()
 
 assert "<details" not in result2, "❌ <details> 標籤未被全部移除！"
-assert result2.count("你執行了 tool_calls") == 2, "❌ 應該有2個工具描述！"
+assert result2.count("was executed with parameters") == 2, "❌ 應該有2個工具描述！"
 assert "mcp_trading_get_positions" in result2, "❌ 第一個工具名稱遺失！"
 assert "mcp_trading_get_wallet_balance" in result2, "❌ 第二個工具名稱遺失！"
 assert "兩者都查完了喵" in result2, "❌ 正常文字被破壞！"
@@ -126,7 +126,7 @@ assert result5[0]["content"] == "你是一個助手。", "❌ system message 被
 assert result5[1]["content"] == "查一下倉位", "❌ user message 被修改！"
 # assistant message 應該被清洗
 assert "<details" not in result5[2]["content"], "❌ assistant 的 <details> 未被移除！"
-assert "你執行了 tool_calls terminal" in result5[2]["content"], "❌ 未找到工具描述！"
+assert "Tool terminal was executed with parameters" in result5[2]["content"], "❌ 未找到工具描述！"
 assert "查完了喵～" in result5[2]["content"], "❌ assistant 的正常文字被破壞！"
 
 print("System message:", result5[0]["content"])
