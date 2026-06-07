@@ -218,6 +218,17 @@ async def _handle_post_responses(
     
     # 取得設定
     sse_mode = config.get("responses_sse_mode", "passthrough")
+    
+    # ── Inject previous tool results into input ──
+    # When Open WebUI sends a stateful request with previous_response_id,
+    # it only carries user messages in the input — tool results from the
+    # previous turn are lost.  Fetch the prior response and inject its
+    # function_call / function_call_output items so the model can see them.
+    modified_body = await _inject_previous_tool_results(
+        request, upstream_url, fwd_headers, req_json, sess, config
+    )
+    if modified_body is not None:
+        body = modified_body
 
     if stream_flag:
         return await _stream_responses(
@@ -227,6 +238,109 @@ async def _handle_post_responses(
         return await _blocking_responses(
             upstream_url, fwd_headers, body
         )
+
+
+async def _inject_previous_tool_results(
+    request: Request,
+    upstream_url: str,
+    fwd_headers: Dict[str, str],
+    req_json: Dict[str, Any],
+    sess: aiohttp.ClientSession,
+    config: dict,
+) -> Optional[bytes]:
+    """
+    當請求帶有 previous_response_id 時，取得上一輪的 response 並將其
+    function_call / function_call_output items 注入到 input 前面，
+    讓模型能看到上次的工具調用結果。
+    
+    Open WebUI 在 stateful 模式下只把 user messages 帶到 input 中，
+    tool results 雖然存在 conversation_history 裡，但不會被帶到下一次請求。
+    這個函數彌補這個缺口。
+    
+    返回新的 body bytes，如果不需要修改則返回 None。
+    """
+    prev_id = req_json.get("previous_response_id")
+    if not prev_id:
+        return None
+    
+    # 取得 upstream 的 base URL（去掉路徑部分）
+    # upstream_url 格式: http://127.0.0.1:30000/v1/responses
+    # 我们需要 GET http://127.0.0.1:30000/v1/responses/{prev_id}
+    upstream_base = upstream_url.rsplit("/v1/responses", 1)[0]
+    get_url = f"{upstream_base}/v1/responses/{prev_id}"
+    
+    try:
+        async with sess.get(get_url, headers=fwd_headers) as resp:
+            if resp.status != 200:
+                logger.debug(f"[responses] Previous response {prev_id} not found (status={resp.status})")
+                return None
+            
+            prev_resp = await resp.json()
+            output_items = prev_resp.get("response", {}).get("output", [])
+            
+            # 找出有工具調用的 items
+            tool_items = [
+                item for item in output_items
+                if item.get("type") in ("function_call", "function_call_output")
+            ]
+            
+            if not tool_items:
+                logger.debug(f"[responses] No tool items in previous response {prev_id}")
+                return None
+            
+            # 取得目前的 input
+            current_input = req_json.get("input", "")
+            
+            # 將 input 轉換為物件陣列格式（Responses API 格式）
+            input_items: list[dict] = []
+            if isinstance(current_input, str):
+                input_items = [{"type": "message", "role": "user", "content": current_input}]
+            elif isinstance(current_input, list):
+                input_items = list(current_input)
+            else:
+                return None
+            
+            # 建構注入的 items：function_call + function_call_output 配對
+            injected_items: list[dict] = []
+            
+            # 將 tool items 轉換為 Responses input format
+            for item in tool_items:
+                if item.get("type") == "function_call":
+                    injected_items.append({
+                        "type": "function_call",
+                        "id": item.get("id", item.get("call_id", "")),
+                        "call_id": item.get("call_id", item.get("id", "")),
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    })
+                elif item.get("type") == "function_call_output":
+                    injected_items.append({
+                        "type": "function_call_output",
+                        "call_id": item.get("call_id", ""),
+                        "output": item.get("output", ""),
+                    })
+            
+            if not injected_items:
+                return None
+            
+            # 將注入的 items 放在 input 前面
+            new_input = injected_items + input_items
+            
+            # 更新 req_json 並轉回 bytes
+            req_json["input"] = new_input
+            new_body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
+            
+            logger.info(
+                f"[responses] Injected {len(injected_items)} tool items "
+                f"from previous response {prev_id} into input "
+                f"(total input items: {len(new_input)})"
+            )
+            
+            return new_body
+            
+    except Exception as e:
+        logger.warning(f"[responses] Failed to inject previous tool results: {e}")
+        return None
 
 
 async def _blocking_responses(
