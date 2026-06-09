@@ -458,7 +458,7 @@ git apply /path/to/hermes_tool_filter/patches/api_server_tool_result.patch 2>/de
 
 ### Manual Apply
 
-1. **Find `_on_tool_complete` function** (in `gateway/platforms/api_server.py`, around line 1858)
+1. **Find `_on_tool_complete` function** (in `hermes-agent/gateway/platforms/api_server.py`, around line 1146)
 
 2. **Add `arguments` and `result` to `progress_data` dict**:
 
@@ -492,13 +492,24 @@ python -m hermes_cli.main --profile chatting gateway run --replace
 
 ```bash
 # Method 1: Use patch file
-cd ~/.hermes/hermes/hermes-agent
+cd /opt/hermes/hermes-agent
 git apply /path/to/hermes_tool_filter/patches/api_server_tool_result.patch
 
 # Method 2: Manual check
 grep '"result":' /opt/hermes/hermes-agent/gateway/platforms/api_server.py
 # If not found, the patch was overwritten and needs to be re-applied
 ```
+
+### Version Compatibility
+
+| Hermes Version | Path | Patch Status | Notes |
+|---------------|------|--------------|-------|
+| v0.16.0+ | `hermes-agent/gateway/platforms/api_server.py` | ✅ 已適配 | Gateway 變為 user service (`hermes gateway install`) |
+| v0.15.x | `gateway/platforms/api_server.py` | ⚠️ 舊路徑 | 需手動更新 patch 路徑 |
+
+**更新日誌：**
+
+- **2026-06-09** — Hermes v0.16.0: 目錄結構從 `/opt/hermes/gateway/` 遷移至 `/opt/hermes/hermes-agent/gateway/`，Gateway 改為 user service。Patch 路徑已更新。
 
 ### Verify Patch is Active
 
