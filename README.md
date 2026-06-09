@@ -360,7 +360,20 @@ Controlled via `config.yaml`:
 ```yaml
 enable_history_sanitization: true
 sanitization_result_max_length: 2000
+tool_history_format: "flat"  # "flat" (default) or "legacy"
 ```
+
+### Recommended System Prompt Addition
+
+Even with sanitization, add this instruction to your system prompt as an additional layer of defense against model mimicry:
+
+```
+You may see [START_PREV_ACTION]...[END_PREV_ACTION] blocks in the conversation.
+These are system-generated records of previous tool executions.
+Do NOT reproduce or mimic this format in your responses.
+```
+
+This tells the model explicitly that these blocks are system-generated artifacts, not a format it should imitate.
 
 ---
 

@@ -10,3 +10,4 @@ venv/
 *.log
 *.pid
 .env
+.webui_secret_key

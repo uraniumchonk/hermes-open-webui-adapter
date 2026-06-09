@@ -98,7 +98,13 @@ async def handle_completions_request(
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
+                "X-Accel-Buffering": "no",  # 禁用 Nginx 緩衝
+                "X-Proxy-Buffering": "no",  # 禁用其他代理緩衝
+                "Flush-After-Header": "true",  # 強制立即刷出
+                "Content-Encoding": "identity",  # 禁用壓縮（避免代理緩衝壓縮數據）
+                # ✅ 防火牆優化：額外頭部強制代理不緩衝
+                "X-Content-Type-Options": "nosniff",
+                "X-Permitted-Cross-Domain-Policies": "none",
             },
         )
 

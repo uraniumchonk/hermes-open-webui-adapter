@@ -36,6 +36,12 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 # ── Handler modules ────────────────────────────────────────
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
+from tool_history_format import (
+    flatten_json,
+    format_tool_history_block,
+    _format_args_flat,
+    _format_result_flat,
+)
 
 try:
     import yaml
@@ -219,31 +225,38 @@ def _strip_details_from_content(frame: str) -> str:
 # 導致模型模仿輸出 <details> 格式，形成污染反饋迴圈。
 #
 # 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
-# 把 <details type="tool_calls"> 區塊轉換為自然語言描述。
+# 把 <details type="tool_calls"> 區塊轉換為安全的格式。
 #
-# 配置：config.yaml 中的 enable_history_sanitization 和 sanitization_result_max_length
+# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length, tool_history_format
+#
+# tool_history_format:
+#   legacy — 自然語言描述（舊版）
+#   flat   — [START_PREV_ACTION] k:v 格式（新版，防止 JSON 污染）
+#   → 實作在 tool_history_format.py 中
 
 
 def _get_sanitization_config() -> tuple:
-    """取得 sanitization 配置，回傳 (enabled: bool, max_result_length: int)"""
+    """取得 sanitization 配置，回傳 (enabled: bool, max_result_length: int, format: str)"""
     enabled = CONFIG.get("enable_history_sanitization", True)
     max_length = CONFIG.get("sanitization_result_max_length", 2000)
-    return bool(enabled), int(max_length)
+    fmt = CONFIG.get("tool_history_format", "flat")
+    return bool(enabled), int(max_length), str(fmt)
 
 
 def _extract_tool_info(tag: str, max_result_length: int) -> dict:
     """
     從 <details> 標籤中提取工具資訊。
     
-    回傳: {tool_name, args_summary, result_summary, truncated}
+    回傳: {tool_name, args_summary, args_obj, result_summary, result_raw, truncated}
     """
     # 提取 name 屬性（支援雙引號、單引號、無引號、大小寫不敏感）
     name_match = re.search(r'name=["\']?([^"\'>\s]*)["\']?', tag, flags=re.IGNORECASE)
     tool_name = html.unescape(name_match.group(1)) if name_match else "unknown"
     
-    # 提取 <arguments> 內容 — 只提取關鍵參數作為摘要
+    # 提取 <arguments> 內容
     args_match = re.search(r'<arguments>(.*?)</arguments>', tag, re.DOTALL)
     args_summary = ""
+    args_obj = None
     if args_match:
         args_raw = html.unescape(args_match.group(1).strip())
         try:
@@ -252,7 +265,7 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
             clean_args = {k: v for k, v in args_obj.items() 
                         if k not in ("tool_name", "label")}
             if clean_args:
-                # 只取第一個有意義的參數作為摘要
+                # 只取第一個有意義的參數作為摘要（legacy 格式用）
                 for k, v in clean_args.items():
                     if isinstance(v, str) and len(v) < 100:
                         args_summary = f"查詢「{v}」"
@@ -264,10 +277,12 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
                     args_summary = json.dumps(clean_args, ensure_ascii=False)[:100]
         except json.JSONDecodeError:
             args_summary = args_raw[:100]
+            args_obj = None
     
     # 提取 <result> 內容
     result_match = re.search(r'<result>(.*?)</result>', tag, re.DOTALL)
     result_summary = ""
+    result_raw = ""
     truncated = False
     if result_match:
         result_raw = html.unescape(result_match.group(1).strip())
@@ -307,7 +322,9 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
     return {
         "tool_name": tool_name,
         "args_summary": args_summary,
+        "args_obj": args_obj,
         "result_summary": result_summary,
+        "result_raw": result_raw,
         "truncated": truncated,
     }
 
@@ -399,7 +416,7 @@ def _classify_tool(tool_name: str) -> str:
 def sanitize_message_content(content: str | None, seed: int = 0) -> tuple:
     """
     移除 assistant message 中的 <details type="tool_calls"> 區塊，
-    替換為自然語言描述，切斷污染反饋迴圈。
+    替換為安全格式（flat 或 legacy），切斷污染反饋迴圈。
     
     回傳: (sanitized_content: str, replacement_count: int)
     
@@ -408,45 +425,44 @@ def sanitize_message_content(content: str | None, seed: int = 0) -> tuple:
     if not content:
         return content, 0
     
+    enabled, max_result_length, fmt = _get_sanitization_config()
+    if not enabled:
+        return content, 0
+    
     total_replacements = 0
     detail_index = 0  # 追蹤同一訊息中第幾個 <details>
     
-    # 1. 匹配 <details ... type="tool_calls" ...>...</details>（標準格式，支援多行、屬性順序不限）
-    pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>.*?</details>'
-    def _count_and_replace(m: re.Match) -> str:
+    def _replace_details(m: re.Match) -> str:
         nonlocal total_replacements, detail_index
         total_replacements += 1
         idx = detail_index
         detail_index += 1
-        _, max_result_length = _get_sanitization_config()
         info = _extract_tool_info(m.group(0), max_result_length)
-        return _generate_natural_description(info, seed, idx)
-    sanitized = re.sub(pattern1, _count_and_replace, content, flags=re.DOTALL | re.IGNORECASE)
+        
+        if fmt == "flat":
+            # 新格式：[START_PREV_ACTION] k:v 格式
+            return format_tool_history_block(
+                tool_name=info["tool_name"],
+                args=info["args_obj"],
+                result_raw=info["result_raw"] or info["result_summary"],
+                max_result_length=max_result_length,
+            )
+        else:
+            # 舊格式：自然語言描述
+            return _generate_natural_description(info, seed, idx)
+    
+    # 1. 匹配 <details ... type="tool_calls" ...>...</details>（標準格式，支援多行、屬性順序不限）
+    pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>.*?</details>'
+    sanitized = re.sub(pattern1, _replace_details, content, flags=re.DOTALL | re.IGNORECASE)
     
     # 2. 處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
     # 只處理包含 <arguments> 或 <result> 子標籤的（明顯是工具相關）
     pattern2 = r'<details[^>]*>\s*\n\s*<summary>.*?</summary>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?\n\s*</details>'
-    def _count_and_replace_fallback(m: re.Match) -> str:
-        nonlocal total_replacements, detail_index
-        total_replacements += 1
-        idx = detail_index
-        detail_index += 1
-        _, max_result_length = _get_sanitization_config()
-        info = _extract_tool_info(m.group(0), max_result_length)
-        return _generate_natural_description(info, seed, idx)
-    sanitized = re.sub(pattern2, _count_and_replace_fallback, sanitized, flags=re.DOTALL | re.IGNORECASE)
+    sanitized = re.sub(pattern2, _replace_details, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     # 3. 兜底：任何包含 <arguments> 和 <result> 的 <details> 區塊
     pattern3 = r'<details[^>]*>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?</details>'
-    def _count_and_replace_fallback2(m: re.Match) -> str:
-        nonlocal total_replacements, detail_index
-        total_replacements += 1
-        idx = detail_index
-        detail_index += 1
-        _, max_result_length = _get_sanitization_config()
-        info = _extract_tool_info(m.group(0), max_result_length)
-        return _generate_natural_description(info, seed, idx)
-    sanitized = re.sub(pattern3, _count_and_replace_fallback2, sanitized, flags=re.DOTALL | re.IGNORECASE)
+    sanitized = re.sub(pattern3, _replace_details, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     return sanitized, total_replacements
 
@@ -464,7 +480,7 @@ def sanitize_request_messages(messages: list) -> list:
     if not messages:
         return messages
     
-    enabled, _ = _get_sanitization_config()
+    enabled, _, _ = _get_sanitization_config()
     if not enabled:
         return messages
     
@@ -712,36 +728,53 @@ async def transform_stream(
     tool_just_completed = False
     tool_completed_at = 0  # 記錄 tool completed 的時間戳
     
+    # ✅ 修復：追蹤是否已發送第一個有內容的 chunk，避免心跳干擾
+    first_content_sent = False
+    
+    # ✅ 防火牆優化：在開始讀取 upstream 前，先發送初始心跳強制連接建立
+    # 學校防火牆/代理可能會緩衝小數據包，我們用多層策略確保連接不被卡住
+    
+    # 策略 1: SSE comment 強制連接建立（最小包，立即刷出）
+    yield b': initial-connection-established\n\n'
+    
+    # 策略 2: 發送初始 chunk（帶 completion_id 讓客戶端識別串流）
+    yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":null}]}%s\n\n' % (
+        completion_id.encode(), created, model.encode(), b''
+    )
+    
+    logger.info(f"[firewall-optimization] Sent initial packets to force connection establishment")
+    
+    # ✅ 新增：在等待 upstream 第一塊內容時，使用更短的心跳間隔（0.5 秒）
+    # 學校網路可能需要更頻繁的心跳來保持連接活躍
+    initial_wait_heartbeat = time.monotonic()
+    initial_wait_interval = 0.5  # 初始等待階段每 0.5 秒發送心跳
+    
     # 主循環
     while True:
-        # 心跳檢查 — 在 readline 之前檢查，確保即使 upstream 沒有數據也能發送心跳
+        # ✅ 防火牆優化：在等待第一塊內容時使用更短的心跳間隔
+        current_heartbeat_interval = initial_wait_interval if not first_content_sent else heartbeat_interval
+        
+        # 心跳檢查
         elapsed = time.monotonic() - last_heartbeat
-        if elapsed >= heartbeat_interval:
-            # 雙重保險：SSE comment + empty content delta
-            # 某些 client 對 comment 反應更好，某些對 data chunk 反應更好
-            heartbeat_count += 1
-            # 如果在 tool completed 後，記錄 idle 時間
-            idle_since_tool = 0
-            if tool_just_completed and tool_completed_at > 0:
-                idle_since_tool = time.monotonic() - tool_completed_at
-            logger.info(
-                f"[enhance-v2] Heartbeat #{heartbeat_count} ({elapsed:.1f}s), "
-                f"tool_just_completed={tool_just_completed}, "
-                f"idle_since_tool={idle_since_tool:.1f}s, "
-                f"done_received={done_received}, buffer_len={len(buffer)}"
-            )
-            yield b': keepalive\n\n'
-            yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
-                completion_id.encode(), created, model.encode()
-            )
-            last_heartbeat = time.monotonic()
-            tool_just_completed = False
+        if elapsed >= current_heartbeat_interval:
+            if not first_content_sent:
+                # 還在等待第一塊內容，發送 SSE comment 保持連接活躍
+                heartbeat_count += 1
+                yield b': keepalive-waiting-first-chunk\n\n'
+                last_heartbeat = time.monotonic()
+                logger.debug(f"[firewall-optimization] Sent keepalive while waiting for first chunk (count={heartbeat_count})")
+            elif elapsed >= heartbeat_interval:
+                # 正常心跳（第一個 content 之後）
+                heartbeat_count += 1
+                yield b': keepalive\n\n'
+                last_heartbeat = time.monotonic()
+                tool_just_completed = False
 
         # 非阻塞讀取 — 使用 asyncio.wait_for 確保不會永久阻塞
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=1.0)
         except asyncio.TimeoutError:
-            # 超時了，繼續循環，下次心跳會發送 empty delta
+            # 超時了，繼續循環，下次心跳會發送
             continue
         except Exception as e:
             # readline() 可能丟出 exception（例如 client 斷開連線）
@@ -959,6 +992,17 @@ async def transform_stream(
                     except (json.JSONDecodeError, IndexError, KeyError):
                         tool_just_completed = False
                 yield (modified_frame + "\n\n").encode("utf-8")
+                
+                # ✅ 修復：追蹤第一個有內容的 chunk，之後才啟動心跳
+                if not first_content_sent and data_str:
+                    try:
+                        pj = json.loads(data_str)
+                        delta = pj.get("choices", [{}])[0].get("delta", {})
+                        if delta.get("content"):
+                            first_content_sent = True
+                            logger.info(f"[enhance-v2] First content chunk sent, heartbeat enabled")
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        pass
                 
             except Exception as e:
                 logging.error(f"[transform_stream] Frame processing ERROR: {e} | frame_preview={frame[:200]}")

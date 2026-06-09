@@ -27,6 +27,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
+# Import from tool_history_format module for format consistency
+from tool_history_format import format_tool_history_block, flatten_json
+
 
 # ── Format Conversion: Responses ↔ Chat Completions ───────
 
@@ -287,39 +290,87 @@ async def _inject_previous_tool_results(
             if not output_items:
                 output_items = prev_resp.get("response", {}).get("output", [])
             
-            # 從 tool items 中提取文字摘要
-            tool_summaries: list[str] = []
+            # 配對 function_call + function_call_output，產生 [START_PREV_ACTION] 區塊
+            fmt = config.get("tool_history_format", "flat")
+            max_result_length = config.get("sanitization_result_max_length", 2000)
+            
+            # 先收集所有 function_call 和 function_call_output
+            pending_calls: dict[str, dict] = {}  # call_id -> function_call item
+            tool_blocks: list[str] = []
+            
             for item in output_items:
                 item_type = item.get("type")
                 if item_type == "function_call":
-                    name = item.get("name", "unknown")
-                    try:
-                        args = json.loads(item.get("arguments", "{}"))
-                        arg_preview = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
-                    except (json.JSONDecodeError, TypeError):
-                        arg_preview = item.get("arguments", "")[:80]
-                    tool_summaries.append(f"[Previous turn] Tool called: {name}({arg_preview})")
+                    call_id = item.get("id", item.get("call_id", ""))
+                    pending_calls[call_id] = item
                 elif item_type == "function_call_output":
+                    call_id = item.get("call_id", "")
                     output = item.get("output", "")
-                    # Truncate long outputs
-                    if len(output) > 500:
-                        output = output[:500] + "..."
-                    tool_summaries.append(f"[Previous turn] Tool result: {output}")
+                    
+                    if call_id and call_id in pending_calls:
+                        fc = pending_calls[call_id]
+                        name = fc.get("name", "unknown")
+                        try:
+                            args = json.loads(fc.get("arguments", "{}"))
+                        except (json.JSONDecodeError, TypeError):
+                            args = None
+                        
+                        block = format_tool_history_block(
+                            tool_name=name,
+                            args=args,
+                            result_raw=output,
+                            max_result_length=max_result_length,
+                        )
+                        tool_blocks.append(block)
+                    elif output:
+                        # 沒有配對的 output，直接用一般格式
+                        if fmt == "flat":
+                            if len(output) > max_result_length:
+                                output = output[:max_result_length] + "..."
+                            block = (
+                                f"[START_PREV_ACTION]\n"
+                                f"[ACTION_TYPE]\nunknown\n"
+                                f"[ACTION_ARG]\n(none)\n"
+                                f"[RESULT]\n{output}\n"
+                                f"[END_PREV_ACTION]"
+                            )
+                        else:
+                            block = f"[Previous turn] Tool result: {output}"
+                        tool_blocks.append(block)
             
-            if not tool_summaries:
+            # 處理有 call 但沒有 output 的
+            for call_id, fc in pending_calls.items():
+                name = fc.get("name", "unknown")
+                try:
+                    args = json.loads(fc.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args = None
+                
+                block = format_tool_history_block(
+                    tool_name=name,
+                    args=args,
+                    result_raw="",
+                    max_result_length=max_result_length,
+                )
+                tool_blocks.append(block)
+            
+            if not tool_blocks:
                 logger.debug(f"[responses] No tool items to summarize from {prev_id}")
                 return None
             
-            summary_text = "\n".join(tool_summaries)
+            summary_text = "\n\n".join(tool_blocks)
             
             # 注入到 input 的 user message 前面
             current_input = req_json.get("input", "")
             
-            context_block = (
-                "<tool_results_from_previous_turn>\n"
-                f"{summary_text}\n"
-                "</tool_results_from_previous_turn>\n\n"
-            )
+            if fmt == "flat":
+                context_block = f"{summary_text}\n\n"
+            else:
+                context_block = (
+                    "<tool_results_from_previous_turn>\n"
+                    f"{summary_text}\n"
+                    "</tool_results_from_previous_turn>\n\n"
+                )
             
             if isinstance(current_input, str):
                 new_input = context_block + current_input
@@ -346,8 +397,8 @@ async def _inject_previous_tool_results(
             new_body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
             
             logger.info(
-                f"[responses] Injected {len(tool_summaries)} tool-result summaries "
-                f"from {prev_id} into input (path B: text injection)"
+                f"[responses] Injected {len(tool_blocks)} tool-result blocks "
+                f"from {prev_id} into input (path B: text injection, format={fmt})"
             )
             logger.debug(
                 f"[responses] Injected text:\n{context_block[:500]}"
