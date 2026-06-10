@@ -452,16 +452,17 @@ def sanitize_message_content(content: str | None, seed: int = 0) -> tuple:
             return _generate_natural_description(info, seed, idx)
     
     # 1. 匹配 <details ... type="tool_calls" ...>...</details>（標準格式，支援多行、屬性順序不限）
-    pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>.*?</details>'
+    # 使用 [^<] 和 [(?:(?!<details>).)* 避免 ReDoS 問題
+    pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>((?:(?!<details>).)*?)</details>'
     sanitized = re.sub(pattern1, _replace_details, content, flags=re.DOTALL | re.IGNORECASE)
     
     # 2. 處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
     # 只處理包含 <arguments> 或 <result> 子標籤的（明顯是工具相關）
-    pattern2 = r'<details[^>]*>\s*\n\s*<summary>.*?</summary>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?\n\s*</details>'
+    pattern2 = r'<details[^>]*>\s*\n\s*<summary>(?:(?!<summary>).)*?</summary>(?:(?!<arguments>).)*?<arguments>(?:(?!<arguments>).)*?</arguments>(?:(?!<result>).)*?<result>(?:(?!<result>).)*?</result>(?:(?!</details>).)*?\n\s*</details>'
     sanitized = re.sub(pattern2, _replace_details, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     # 3. 兜底：任何包含 <arguments> 和 <result> 的 <details> 區塊
-    pattern3 = r'<details[^>]*>.*?<arguments>.*?</arguments>.*?<result>.*?</result>.*?</details>'
+    pattern3 = r'<details[^>]*>(?:(?!<arguments>).)*?<arguments>(?:(?!</arguments>).)*?</arguments>(?:(?!<result>).)*?<result>(?:(?!</result>).)*?</result>(?:(?!</details>).)*?</details>'
     sanitized = re.sub(pattern3, _replace_details, sanitized, flags=re.DOTALL | re.IGNORECASE)
     
     return sanitized, total_replacements
@@ -502,7 +503,36 @@ def sanitize_request_messages(messages: list) -> list:
             f"[sanitization] Replaced {total_details_cleaned} <details> tag(s) "
             f"across {messages_cleaned} message(s) from {len(messages)} total messages"
         )
-    
+
+    # ── Inject tool usage hint from file into the last user message ──
+    template = ""
+    hint_file = CONFIG.get("tool_usage_hint_file", "")
+    if hint_file:
+        hint_path = CONFIG_PATH.parent / hint_file
+        try:
+            with open(hint_path, "r", encoding="utf-8") as f:
+                template = f.read().strip()
+        except Exception as e:
+            logger.warning(f"[tool_hint] Failed to read hint file {hint_path}: {e}")
+
+    if template:
+        # Find the last user message with non-empty content
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "user" and msg.get("content"):
+                last_user_idx = i
+                break
+
+        if last_user_idx is not None:
+            # Append template to existing user message
+            messages[last_user_idx]["content"] += "\n\n" + template
+            logger.debug(f"[tool_hint] Appended hint from {hint_file} to last user message (index {last_user_idx})")
+        else:
+            # No user message found; create a new one at the end
+            messages.append({"role": "user", "content": template})
+            logger.debug(f"[tool_hint] Appended new user message with hint from {hint_file}")
+
     return messages
 
 
