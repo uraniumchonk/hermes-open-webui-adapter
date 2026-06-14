@@ -36,13 +36,14 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 # ── Handler modules ────────────────────────────────────────
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
+import tool_history_format
 from tool_history_format import (
     flatten_json,
     format_tool_history_block,
     _format_args_flat,
     _format_result_flat,
+    sanitize_message_content,
 )
-
 try:
     import yaml
     HAS_YAML = True
@@ -235,269 +236,39 @@ def _strip_details_from_content(frame: str) -> str:
 #   → 實作在 tool_history_format.py 中
 
 
-def _get_sanitization_config() -> tuple:
-    """取得 sanitization 配置，回傳 (enabled: bool, max_result_length: int, format: str)"""
-    enabled = CONFIG.get("enable_history_sanitization", True)
-    max_length = CONFIG.get("sanitization_result_max_length", 2000)
-    fmt = CONFIG.get("tool_history_format", "flat")
-    return bool(enabled), int(max_length), str(fmt)
-
-
-def _extract_tool_info(tag: str, max_result_length: int) -> dict:
+def sanitize_request_messages(
+    messages: list, model: str = "", hermes_sid: str = ""
+) -> list:
     """
-    從 <details> 標籤中提取工具資訊。
-    
-    回傳: {tool_name, args_summary, args_obj, result_summary, result_raw, truncated}
-    """
-    # 提取 name 屬性（支援雙引號、單引號、無引號、大小寫不敏感）
-    name_match = re.search(r'name=["\']?([^"\'>\s]*)["\']?', tag, flags=re.IGNORECASE)
-    tool_name = html.unescape(name_match.group(1)) if name_match else "unknown"
-    
-    # 提取 <arguments> 內容
-    args_match = re.search(r'<arguments>(.*?)</arguments>', tag, re.DOTALL)
-    args_summary = ""
-    args_obj = None
-    if args_match:
-        args_raw = html.unescape(args_match.group(1).strip())
-        try:
-            args_obj = json.loads(args_raw)
-            # 移除 tool_name/label 等元資料欄位
-            clean_args = {k: v for k, v in args_obj.items() 
-                        if k not in ("tool_name", "label")}
-            if clean_args:
-                # 只取第一個有意義的參數作為摘要（legacy 格式用）
-                for k, v in clean_args.items():
-                    if isinstance(v, str) and len(v) < 100:
-                        args_summary = f"查詢「{v}」"
-                        break
-                    elif isinstance(v, (int, float, bool)):
-                        args_summary = f"參數 {k}={v}"
-                        break
-                else:
-                    args_summary = json.dumps(clean_args, ensure_ascii=False)[:100]
-        except json.JSONDecodeError:
-            args_summary = args_raw[:100]
-            args_obj = None
-    
-    # 提取 <result> 內容
-    result_match = re.search(r'<result>(.*?)</result>', tag, re.DOTALL)
-    result_summary = ""
-    result_raw = ""
-    truncated = False
-    if result_match:
-        result_raw = html.unescape(result_match.group(1).strip())
-        # 嘗試解析 JSON 並提取關鍵資訊
-        try:
-            result_obj = json.loads(result_raw)
-            # 如果是成功回應，提取核心數據
-            if isinstance(result_obj, dict):
-                # 移除巢狀的 result 包裝
-                if "result" in result_obj and isinstance(result_obj["result"], str):
-                    inner = result_obj["result"]
-                    try:
-                        inner_obj = json.loads(inner)
-                        result_summary = json.dumps(inner_obj, ensure_ascii=False)
-                    except json.JSONDecodeError:
-                        result_summary = inner
-                elif "data" in result_obj:
-                    result_summary = json.dumps(result_obj["data"], ensure_ascii=False)
-                elif "success" in result_obj:
-                    result_summary = json.dumps(result_obj, ensure_ascii=False)
-                else:
-                    result_summary = json.dumps(result_obj, ensure_ascii=False)
-            else:
-                result_summary = str(result_obj)
-        except json.JSONDecodeError:
-            result_summary = result_raw
-        
-        # 截斷過長的結果
-        if len(result_summary) > max_result_length:
-            result_summary = result_summary[:max_result_length] + "..."
-            truncated = True
-            logger.debug(
-                f"[sanitization] Result truncated for tool '{tool_name}': "
-                f"{len(result_summary)} -> {max_result_length + 3} chars"
-            )
-    
-    return {
-        "tool_name": tool_name,
-        "args_summary": args_summary,
-        "args_obj": args_obj,
-        "result_summary": result_summary,
-        "result_raw": result_raw,
-        "truncated": truncated,
-    }
+    Scan and sanitize all messages in the request to prevent <details> pollution.
+    Only processes assistant role content.
 
+    Configurable via config.yaml's enable_history_sanitization toggle.
 
-def _generate_natural_description(info: dict, seed: int = 0, index: int = 0) -> str:
-    """
-    根據工具資訊生成自然語言描述，使用確定性隨機選擇風格。
-    
-    核心設計原則：
-    1. 不使用固定模板格式（避免模型模仿）
-    2. 使用多種句式變化
-    3. 描述更像「對話中的上下文回顧」而非「工具呼叫紀錄」
-    4. 結果部分保留完整數據供模型使用
-    5. **確定性隨機**：相同 seed + index 產生相同結果，確保 vLLM KV cache 命中
-    
-    :param seed: 基於訊息內容 hash 的 seed，相同請求永遠相同
-    :param index: 同一訊息中第幾個 <details> 標籤（0-based）
-    """
-    tool_name = info["tool_name"]
-    args_summary = info["args_summary"]
-    result_summary = info["result_summary"]
-    
-    # 根據工具類型選擇適當的描述風格
-    tool_type = _classify_tool(tool_name)
-    
-    # 定義多種自然語言風格
-    if tool_type == "search":
-        styles = [
-            f"先前搜尋了{args_summary}，找到以下結果：{result_summary}",
-            f"根據搜尋{args_summary}的結果：{result_summary}",
-            f"搜尋{args_summary}後獲得的資訊：{result_summary}",
-            f"已查詢{args_summary}，回傳：{result_summary}",
-        ]
-    elif tool_type == "trading":
-        styles = [
-            f"先前查詢了交易{args_summary}，數據顯示：{result_summary}",
-            f"根據交易工具的回應{args_summary}：{result_summary}",
-            f"工具回傳的交易資料{args_summary}：{result_summary}",
-            f"從交易系統取得的{args_summary}資料：{result_summary}",
-        ]
-    elif tool_type == "file":
-        styles = [
-            f"讀取了檔案內容{args_summary}：{result_summary}",
-            f"檔案{args_summary}的內容如下：{result_summary}",
-            f"從檔案中讀取到的資料{args_summary}：{result_summary}",
-        ]
-    elif tool_type == "code":
-        styles = [
-            f"執行了程式碼{args_summary}，輸出：{result_summary}",
-            f"程式碼執行結果{args_summary}：{result_summary}",
-            f"程式碼回傳：{result_summary}",
-        ]
-    else:
-        styles = [
-            f"先前使用了{tool_name}工具{args_summary}，得到：{result_summary}",
-            f"根據{tool_name}工具的回應{args_summary}：{result_summary}",
-            f"工具{tool_name}回傳的資料{args_summary}：{result_summary}",
-            f"系統已執行{tool_name}{args_summary}，結果為：{result_summary}",
-            f"歷史上下文：{tool_name}查詢{args_summary}後的結果：{result_summary}",
-        ]
-    
-    # 使用確定性隨機：相同 seed + index → 相同風格
-    # 這樣同一個請求的 sanitization 結果永遠一致，KV cache 才能命中
-    rng = random.Random(seed + index)
-    return rng.choice(styles)
-
-
-def _classify_tool(tool_name: str) -> str:
-    """根據工具名稱分類工具類型"""
-    search_tools = ["web_search", "brave_web_search", "search_files", "session_search"]
-    trading_tools = ["mcp_trading_get_positions", "mcp_trading_get_wallet_balance",
-                    "mcp_trading_get_market_data", "mcp_trading_create_order"]
-    file_tools = ["read_file", "write_file", "patch"]
-    code_tools = ["execute_code", "terminal"]
-    
-    tn = tool_name.lower()
-    if any(s in tn for s in search_tools):
-        return "search"
-    elif any(s in tn for s in trading_tools):
-        return "trading"
-    elif any(s in tn for s in file_tools):
-        return "file"
-    elif any(s in tn for s in code_tools):
-        return "code"
-    else:
-        return "general"
-
-
-def sanitize_message_content(content: str | None, seed: int = 0) -> tuple:
-    """
-    移除 assistant message 中的 <details type="tool_calls"> 區塊，
-    替換為安全格式（flat 或 legacy），切斷污染反饋迴圈。
-    
-    回傳: (sanitized_content: str, replacement_count: int)
-    
-    :param seed: 用於確定性隨機的 seed，確保相同內容產生相同結果（KV cache 友好）
-    """
-    if not content:
-        return content, 0
-    
-    enabled, max_result_length, fmt = _get_sanitization_config()
-    if not enabled:
-        return content, 0
-    
-    total_replacements = 0
-    detail_index = 0  # 追蹤同一訊息中第幾個 <details>
-    
-    def _replace_details(m: re.Match) -> str:
-        nonlocal total_replacements, detail_index
-        total_replacements += 1
-        idx = detail_index
-        detail_index += 1
-        info = _extract_tool_info(m.group(0), max_result_length)
-        
-        if fmt == "flat":
-            # 新格式：[START_PREV_ACTION] k:v 格式
-            return format_tool_history_block(
-                tool_name=info["tool_name"],
-                args=info["args_obj"],
-                result_raw=info["result_raw"] or info["result_summary"],
-                max_result_length=max_result_length,
-            )
-        else:
-            # 舊格式：自然語言描述
-            return _generate_natural_description(info, seed, idx)
-    
-    # 1. 匹配 <details ... type="tool_calls" ...>...</details>（標準格式，支援多行、屬性順序不限）
-    # 使用 [^<] 和 [(?:(?!<details>).)* 避免 ReDoS 問題
-    pattern1 = r'<details[^>]*type=["\']?tool_calls["\']?[^>]*>((?:(?!<details>).)*?)</details>'
-    sanitized = re.sub(pattern1, _replace_details, content, flags=re.DOTALL | re.IGNORECASE)
-    
-    # 2. 處理沒有 type="tool_calls" 屬性的 <details>（模型自己模仿輸出的格式）
-    # 只處理包含 <arguments> 或 <result> 子標籤的（明顯是工具相關）
-    pattern2 = r'<details[^>]*>\s*\n\s*<summary>(?:(?!<summary>).)*?</summary>(?:(?!<arguments>).)*?<arguments>(?:(?!<arguments>).)*?</arguments>(?:(?!<result>).)*?<result>(?:(?!<result>).)*?</result>(?:(?!</details>).)*?\n\s*</details>'
-    sanitized = re.sub(pattern2, _replace_details, sanitized, flags=re.DOTALL | re.IGNORECASE)
-    
-    # 3. 兜底：任何包含 <arguments> 和 <result> 的 <details> 區塊
-    pattern3 = r'<details[^>]*>(?:(?!<arguments>).)*?<arguments>(?:(?!</arguments>).)*?</arguments>(?:(?!<result>).)*?<result>(?:(?!</result>).)*?</result>(?:(?!</details>).)*?</details>'
-    sanitized = re.sub(pattern3, _replace_details, sanitized, flags=re.DOTALL | re.IGNORECASE)
-    
-    return sanitized, total_replacements
-
-
-def sanitize_request_messages(messages: list) -> list:
-    """
-    掃描並清理請求中的所有 messages，防止 <details> 污染。
-    只處理 assistant role 的 content。
-    
-    可透過 config.yaml 的 enable_history_sanitization 開關控制。
-    
-    **確定性隨機**：每個訊息使用自身內容的 hash 作為 seed，
-    確保相同請求的 sanitization 結果一致，vLLM KV cache 才能命中。
+    **Deterministic random**: each message uses its own content hash as seed,
+    ensuring consistent sanitization results for the same request (vLLM KV cache friendly).
     """
     if not messages:
         return messages
-    
-    enabled, _, _ = _get_sanitization_config()
+
+    enabled, max_length, fmt = tool_history_format._get_sanitization_config(CONFIG)
     if not enabled:
         return messages
-    
+
     total_details_cleaned = 0
     messages_cleaned = 0
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("content"):
             original = msg["content"]
-            # 使用訊息內容的 hash 作為 seed，確保相同內容產生相同結果
             seed = hash(original) & 0xFFFFFFFF
-            sanitized, count = sanitize_message_content(original, seed)
+            sanitized, count = sanitize_message_content(
+                original, seed=seed, max_result_length=max_length, fmt=fmt
+            )
             msg["content"] = sanitized
             if count > 0:
                 messages_cleaned += 1
                 total_details_cleaned += count
-    
+
     if total_details_cleaned > 0:
         logger.info(
             f"[sanitization] Replaced {total_details_cleaned} <details> tag(s) "
@@ -534,6 +305,64 @@ def sanitize_request_messages(messages: list) -> list:
             logger.debug(f"[tool_hint] Appended new user message with hint from {hint_file}")
 
     return messages
+
+
+# ── Conversation Compression ───────────────────────────────
+#
+# 當 X-Hermes-Session-Id 存在時，Hermes Gateway 會從 state.db 載入完整
+# 會話歷史，忽略請求中的 messages 歷史。因此我們可以只傳送 system prompt
+# + 最後一則 user message，大幅減少請求大小。
+#
+# 配置：config.yaml 中的 compression_mode
+#   server-side — 依賴 Gateway 的 server-side history（預設）
+#   disabled    — 傳送完整 messages（舊版行為）
+
+
+def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> list:
+    """
+    Compress the messages array when server-side session history is available.
+
+    When X-Hermes-Session-Id is present, Hermes Gateway loads the full
+    conversation from its database. The messages in the request body are
+    redundant — we only need the system prompt and the last user message.
+
+    Returns the compressed messages list.
+    """
+    if not messages:
+        return messages
+
+    mode = config.get("compression_mode", "server-side")
+    if mode != "server-side" or not hermes_sid:
+        return messages
+
+    if len(messages) <= 2:
+        return messages
+
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+
+    # Find the last user message
+    last_user = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user = m
+            break
+
+    if not last_user:
+        return messages
+
+    original_count = len(messages)
+    original_size = sum(len(str(m.get("content", ""))) for m in messages)
+
+    compressed = system_msgs + [last_user]
+    compressed_size = sum(len(str(m.get("content", ""))) for m in compressed)
+
+    logger.info(
+        f"[compression] Reduced {original_count} messages ({original_size} chars) "
+        f"→ {len(compressed)} messages ({compressed_size} chars) "
+        f"via server-side session history (session={hermes_sid[:8]}...)"
+    )
+
+    return compressed
 
 
 # ── Tool Mode Handlers ─────────────────────────────────────
@@ -1064,6 +893,33 @@ async def get_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+# ── Test Mode: Tool Card Rendering Samples ─────────────────
+# ⚠️ 必須放在 catch-all route 之前，否則會被捕獲！
+
+@APP.get("/test-tool-cards")
+async def test_tool_cards():
+    """
+    測試模式：直接輸出各種 <details> 格式的 SSE stream，
+    讓使用者在 Open WebUI 前端觀察渲染效果。
+    """
+    import time as _time
+    from test_mode import generate_test_stream
+
+    completion_id = f"chatcmpl-{int(_time.time()*1000)}"
+    created_ts = int(_time.time())
+
+    return StreamingResponse(
+        generate_test_stream(completion_id, created_ts, "test-model"),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+        },
+    )
+
+
 # ── Route: Catch-all proxy ────────────────────────────────
 
 @APP.api_route("/{port_prefix}/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -1082,11 +938,11 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
 
     body = await request.body()
 
-    # Build forwarded headers
+    # Build forwarded headers — include Hermes session headers for stateful mode
     fwd_headers = {}
     for hn, hv in request.headers.items():
         hl = hn.lower()
-        if hl in ("authorization", "content-type"):
+        if hl in ("authorization", "content-type", "x-hermes-session-id", "x-hermes-session-key"):
             fwd_headers[hn] = hv
 
     # Parse request body
@@ -1103,6 +959,12 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
     elif "/v1/chat/completions" in original_path:
+        # ✅ Conversation Compression: compress messages before forwarding
+        hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if "messages" in req_json and isinstance(req_json["messages"], list):
+            req_json["messages"] = compress_request_messages(
+                req_json["messages"], hermes_sid, CONFIG
+            )
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
@@ -1123,10 +985,11 @@ async def proxy_default(request: Request, rest: str):
 
     body = await request.body()
 
+    # Build forwarded headers — include Hermes session headers for stateful mode
     fwd_headers = {}
     for hn, hv in request.headers.items():
         hl = hn.lower()
-        if hl in ("authorization", "content-type"):
+        if hl in ("authorization", "content-type", "x-hermes-session-id", "x-hermes-session-key"):
             fwd_headers[hn] = hv
 
     try:
@@ -1143,6 +1006,12 @@ async def proxy_default(request: Request, rest: str):
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
     elif "/v1/chat/completions" in original_path:
+        # ✅ Conversation Compression: compress messages before forwarding
+        hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if "messages" in req_json and isinstance(req_json["messages"], list):
+            req_json["messages"] = compress_request_messages(
+                req_json["messages"], hermes_sid, CONFIG
+            )
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,

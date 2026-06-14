@@ -46,11 +46,11 @@ auto_split_threshold: 0
 # in assistant content to a safe format, breaking the pollution feedback loop.
 enable_history_sanitization: true
 # Result truncation length (adds "..." if exceeded)
-sanitization_result_max_length: 2000
+sanitization_result_max_length: 20000
 # History format:
 #   flat   — [START_PREV_ACTION] k:v format (recommended, prevents JSON pollution)
 #   legacy — natural language description (legacy)
-tool_history_format: "legacy"
+tool_history_format: "flat"
 
 # ── Tool Usage Hint ────────────────────────────────────────
 # Append a tool usage hint at the end of the last user message
@@ -59,3 +59,15 @@ tool_history_format: "legacy"
 # This reads the content from a file (relative to this config file).
 # Leave empty or set to "" to disable.
 tool_usage_hint_file: "tool_hint.txt"
+
+# ── Conversation Compression ───────────────────────────────
+# When X-Hermes-Session-Id is present, Hermes Gateway loads full
+# conversation history from its state.db, making the messages array
+# in the request redundant. This feature reduces the request size
+# by keeping only the system prompt + last user message.
+#
+# Modes:
+#   server-side  — Rely on Hermes Gateway's server-side history (requires
+#                  X-Hermes-Session-Id header). Most efficient, ~90%+ reduction.
+#   disabled     — Send full message history (current behavior).
+compression_mode: "server-side"
