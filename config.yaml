@@ -71,3 +71,15 @@ tool_usage_hint_file: "tool_hint.txt"
 #                  X-Hermes-Session-Id header). Most efficient, ~90%+ reduction.
 #   disabled     — Send full message history (current behavior).
 compression_mode: "server-side"
+
+# ── Session Isolation (Collision Prevention) ────────────────
+# When two conversations start with identical first messages, they would
+# collide on the same session ID. This feature prevents that by injecting
+# a unique timestamp and tracking sessions via markers in assistant responses.
+#
+# Modes:
+#   disabled  — No isolation (default, relies on X-Hermes-Session-Id header)
+#   marker    — Inject timestamp into first user message + embed session
+#                marker in assistant response as a visible code block.
+#                Recommended when Open WebUI does NOT send X-Hermes-Session-Id.
+session_isolation_mode: "disabled"

@@ -78,6 +78,7 @@ async def handle_completions_request(
     # 從 main.py 傳入的函數引用
     sanitize_request_messages,
     transform_stream,
+    hermes_sid: str = "",
 ) -> Any:
     """
     主處理器：處理所有 /v1/chat/completions 請求。
@@ -128,6 +129,13 @@ async def handle_completions_request(
 
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
 
+    # ✅ Session Isolation: inject session ID header if marker mode is enabled
+    from main import _session_isolation_enabled
+    if _session_isolation_enabled() and hermes_sid:
+        fwd_headers = dict(fwd_headers)
+        fwd_headers["X-Hermes-Session-Id"] = hermes_sid
+        logger.info(f"[session] Injecting X-Hermes-Session-Id: {hermes_sid[:8]}...")
+
     # Detect client type from User-Agent to decide if we strip <details> tags
     user_agent = request.headers.get("user-agent", "").lower()
     strip_details = "dart" in user_agent or "conduit" in user_agent
@@ -148,9 +156,18 @@ async def handle_completions_request(
                     f"upstream status={upstream_resp.status}, "
                     f"strip_details={strip_details} (UA: {user_agent[:50]})"
                 )
+                
+                # ✅ Session Isolation: update cached session ID from upstream response
+                from main import _session_isolation_enabled, update_session_id
+                if _session_isolation_enabled() and hermes_sid:
+                    new_sid = upstream_resp.headers.get("X-Hermes-Session-Id", "").strip()
+                    if new_sid and new_sid != hermes_sid:
+                        update_session_id(req_json.get("messages", []), new_sid)
+                        logger.info(f"[session] Updated cache: {hermes_sid[:8]}... → {new_sid[:8]}...")
+                
                 async for chunk in transform_stream(
                     upstream_resp.content, model, completion_id, created_ts,
-                    upstream_port, strip_details,
+                    upstream_port, strip_details, hermes_sid,
                 ):
                     yield chunk
             except asyncio.CancelledError:
