@@ -318,6 +318,256 @@ def sanitize_request_messages(
 #   disabled    — 傳送完整 messages（舊版行為）
 
 
+# ── Session Isolation (Collision Prevention) ────────────────
+#
+# When two conversations start with identical first messages, they would
+# collide on the same session ID. This feature prevents that by:
+# 1. Injecting a unique timestamp into the first user message
+# 2. Embedding a session marker in the assistant's response
+# 3. On subsequent requests, recovering the session from the marker
+#
+# Configuration: config.yaml session_isolation_mode
+#   disabled — No isolation (default, relies on X-Hermes-Session-Id header)
+#   marker   — Full isolation with visible code block markers
+
+
+import hashlib
+
+
+# Global session cache: {original_fingerprint → hermes_session_id}
+_session_cache: Dict[str, str] = {}
+
+# Pending session markers: {stamped_session_id: (original_fp, timestamp)}
+# Use a dict instead of a single global to avoid race conditions between requests.
+_pending_session_markers: dict = {}
+
+
+def _session_isolation_enabled() -> bool:
+    """Check if session isolation (marker mode) is enabled."""
+    return CONFIG.get("session_isolation_mode", "disabled") == "marker"
+
+
+def derive_session_id(messages: list) -> str:
+    """
+    Derive a stable session ID from the conversation's first user message.
+
+    Matches API Server's _derive_chat_session_id():
+    seed = f"{system_prompt}\\n{first_user_message}"
+    digest = sha256(seed).hexdigest()[:16]
+    return f"api-{digest}"
+    """
+    if not messages:
+        return ""
+
+    # Extract system prompt
+    system_prompt = ""
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                system_prompt = content
+            elif isinstance(content, list):
+                system_prompt = "".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            break
+
+    # Extract first user message
+    first_user = ""
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                first_user = content
+            elif isinstance(content, list):
+                first_user = "".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            break
+
+    seed = f"{system_prompt}\n{first_user}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"api-{digest}"
+
+
+_TS_RE = re.compile(r"\n```session\s*\n.*?\n```\n", re.DOTALL)
+
+
+def _strip_timestamp_and_derive(messages: list) -> str:
+    """Strip the injected timestamp from the first user message and re-derive."""
+    if not messages:
+        return ""
+
+    system_prompt = ""
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                system_prompt = content
+            elif isinstance(content, list):
+                system_prompt = "".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            break
+
+    first_user = ""
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                first_user = _TS_RE.sub("", content)
+            elif isinstance(content, list):
+                parts = []
+                for p in content:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        parts.append(_TS_RE.sub("", p.get("text", "")))
+                    else:
+                        parts.append(p.get("text", ""))
+                first_user = "".join(parts)
+            break
+
+    seed = f"{system_prompt}\n{first_user}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"api-{digest}"
+
+
+def get_or_create_session_id(messages: list) -> str:
+    """
+    Get existing session ID from cache, or derive a new one with collision prevention.
+
+    Strategy to prevent collisions when two conversations start with identical
+    content:
+
+    1. First, scan the conversation history for an embedded session marker in
+       any assistant message (code block or legacy zero-width space format).
+       If found, we reuse that session.
+
+    2. If no marker is found, this is a new conversation. We inject a timestamp
+       into the first user message so the Gateway creates a unique session,
+       and arrange for the marker to be embedded in the assistant's reply.
+
+    3. On the very next request, step-1 picks up the marker from history.
+
+    Cache structure: {original_fingerprint → hermes_session_id}
+    """
+    from datetime import datetime
+
+    # ── Step 1: Look for an embedded session marker in assistant history ──
+    marker_pattern = re.compile(
+        r"```session\s*\n\s*(api-[a-f0-9]{16})\s+(\d{4}-\d{2}-\d{2}T[^\s]+)\s*\n```",
+        re.IGNORECASE
+    )
+    legacy_pattern = re.compile(
+        r"(api-[a-f0-9]{16}):(\d{4}-\d{2}-\d{2}T[^\s\u200b]+)", re.IGNORECASE
+    )
+    found_ts = None
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                m = marker_pattern.search(content)
+                if m:
+                    found_ts = m.group(1), m.group(2)
+                    logger.info(f"[session] ✅ Marker found in assistant message (code block): {found_ts[0][:8]}...")
+                    break
+                m = legacy_pattern.search(content)
+                if m:
+                    found_ts = m.group(1), m.group(2)
+                    logger.info(f"[session] ✅ Marker found in assistant message (legacy): {found_ts[0][:8]}...")
+                    break
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        m = marker_pattern.search(part["text"])
+                        if m:
+                            found_ts = m.group(1), m.group(2)
+                            logger.info(f"[session] ✅ Marker found in assistant message (list, code block): {found_ts[0][:8]}...")
+                            break
+                        m = legacy_pattern.search(part["text"])
+                        if m:
+                            found_ts = m.group(1), m.group(2)
+                            logger.info(f"[session] ✅ Marker found in assistant message (list, legacy): {found_ts[0][:8]}...")
+                            break
+        if found_ts:
+            break
+
+    if not found_ts:
+        logger.info(f"[session] ⚠️ No marker found in {len(messages)} messages")
+
+    if found_ts:
+        original_fp, recovered_ts = found_ts
+        if original_fp in _session_cache:
+            logger.info(f"[session] ✅ Marker found in history: {original_fp[:8]}... → cache hit")
+            return _session_cache[original_fp]
+        logger.warning(f"[session] Marker found but NOT in cache: {original_fp[:8]}...")
+        # Fallback: reconstruct stamped fingerprint and try that
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                ts_marker = f"\n```session\n{original_fp}  {recovered_ts}\n```\n"
+                if isinstance(content, str):
+                    msg["content"] = ts_marker + content
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            part["text"] = ts_marker + part["text"]
+                            break
+                break
+        stamped_fp = derive_session_id(messages)
+        if stamped_fp in _session_cache:
+            return _session_cache[stamped_fp]
+        return original_fp
+
+    # ── Step 2: No marker — new conversation, inject timestamp ──
+    derived = derive_session_id(messages)
+    if not derived:
+        return ""
+
+    timestamp = datetime.now().isoformat()
+    stamped_derived_temp = derived
+    ts_marker = f"\n```session\n{stamped_derived_temp}  {timestamp}\n```\n"
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                msg["content"] = ts_marker + content
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["text"] = ts_marker + part["text"]
+                        break
+            break
+
+    stamped_derived = derive_session_id(messages)
+
+    # Store in cache keyed by original fingerprint
+    original = _strip_timestamp_and_derive(messages)
+    _session_cache[original] = stamped_derived
+
+    # Remember the marker so transform_stream can embed it in the first
+    # assistant response.
+    _pending_session_markers[stamped_derived] = (original, timestamp)
+    logger.info(f"[session] NEW session created: {original} → {stamped_derived}, marker pending")
+
+    return stamped_derived
+
+
+def update_session_id(messages: list, new_sid: str) -> None:
+    """
+    Update the cached session ID after compression rotates it.
+
+    Hermes Gateway creates a new session after compression and returns
+    the new session ID in the response header. We need to track this.
+
+    The messages passed here may carry the injected timestamp, so we
+    strip it first to find the correct cache entry.
+    """
+    original = _strip_timestamp_and_derive(messages)
+    if original and new_sid:
+        _session_cache[original] = new_sid
+
+
 def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> list:
     """
     Compress the messages array when server-side session history is available.
@@ -539,6 +789,7 @@ async def transform_stream(
     created: int,
     upstream_port: str,
     strip_details: bool = False,
+    hermes_sid: str = "",
 ) -> AsyncGenerator[bytes, None]:
     """
     從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件。
@@ -670,6 +921,19 @@ async def transform_stream(
             # 關鍵修復：[DONE] 不代表 upstream 已經結束，agent loop 可能還在執行
             # 我們標記 done_received，但繼續讀取直到 upstream 真正關閉 (EOF)
             if "[DONE]" in frame and not done_received:
+                # ✅ Session Isolation: inject marker before [DONE] if pending
+                if _session_isolation_enabled() and hermes_sid in _pending_session_markers:
+                    original_fp, ts = _pending_session_markers.pop(hermes_sid)
+                    marker = f"\n```session\n{original_fp}  {ts}\n```\n"
+                    marker_json = json.dumps(marker)
+                    marker_chunk = (
+                        f'data: {{"id":"{completion_id}","object":"chat.completion.chunk",'
+                        f'"created":{created},"model":"{model}",'
+                        f'"choices":[{{"index":0,"delta":{{"content":{marker_json}}},"finish_reason":null}}]}}\n\n'
+                    )
+                    yield marker_chunk.encode("utf-8")
+                    logger.info(f"[session] ✅ Marker embedded: {original_fp[:8]}... ts={ts[:19]}")
+                
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
                 logger.info(
@@ -959,15 +1223,19 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
     elif "/v1/chat/completions" in original_path:
-        # ✅ Conversation Compression: compress messages before forwarding
+        # ✅ Session Isolation: derive/inject session ID if marker mode is enabled
         hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
         if "messages" in req_json and isinstance(req_json["messages"], list):
+            if _session_isolation_enabled():
+                hermes_sid = get_or_create_session_id(req_json["messages"])
+            # ✅ Conversation Compression: compress messages before forwarding
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
             )
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
+            hermes_sid,
         )
     else:
         # Passthrough for other endpoints (/v1/models, etc.)
@@ -1006,15 +1274,19 @@ async def proxy_default(request: Request, rest: str):
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
     elif "/v1/chat/completions" in original_path:
-        # ✅ Conversation Compression: compress messages before forwarding
+        # ✅ Session Isolation: derive/inject session ID if marker mode is enabled
         hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
         if "messages" in req_json and isinstance(req_json["messages"], list):
+            if _session_isolation_enabled():
+                hermes_sid = get_or_create_session_id(req_json["messages"])
+            # ✅ Conversation Compression: compress messages before forwarding
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
             )
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
+            hermes_sid,
         )
     else:
         # Passthrough for other endpoints
