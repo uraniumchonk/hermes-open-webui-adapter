@@ -1,0 +1,16 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index eeff4e6ce..74bc1aec9 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -640,10 +640,7 @@ PLATFORM_HINTS = {
+         "— when a sticker is the right response, use yb_send_sticker."
+     ),
+     "api_server": (
+-        "You're responding through an API server. The rendering layer is unknown — "
+-        "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
+-        "code fences). Treat this like a conversation, not a document. Keep responses "
+-        "brief and natural."
++        "You're responding through an API server."
+     ),
+     "webui": (
+         "You are in the Hermes WebUI, a browser-based chat interface. "
