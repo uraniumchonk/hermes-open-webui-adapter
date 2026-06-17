@@ -20,8 +20,13 @@ Tool History Format — 給模型看的工具歷史格式。
 from __future__ import annotations
 
 import json
+import logging
+import random
+import re
 import html
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def flatten_json(obj: Any, parent_key: str = "", sep: str = ".") -> list[tuple[str, str]]:
@@ -204,3 +209,220 @@ def format_tool_history_block(
     )
 
     return block
+
+
+def _generate_natural_description(info: dict, seed: int = 0, index: int = 0) -> str:
+    """
+    Generate natural language description based on tool info.
+
+    Core design principles:
+    1. No fixed template format (avoid model mimicry)
+    2. Multiple sentence style variations
+    3. Describes like "context review in conversation" not "tool call record"
+    4. Result part keeps full data for model to use
+    5. **Deterministic random**: same seed + index produces same result for KV cache
+    """
+    tool_name = info["tool_name"]
+    args_summary = info["args_summary"]
+    result_summary = info["result_summary"]
+
+    tool_type = _classify_tool(tool_name)
+
+    if tool_type == "search":
+        styles = [
+            f"先前搜尋了{args_summary}，找到以下結果：{result_summary}",
+            f"根據搜尋{args_summary}的結果：{result_summary}",
+            f"搜尋{args_summary}後獲得的資訊：{result_summary}",
+            f"已查詢{args_summary}，回傳：{result_summary}",
+        ]
+    elif tool_type == "trading":
+        styles = [
+            f"先前查詢了交易{args_summary}，數據顯示：{result_summary}",
+            f"根據交易工具的回應{args_summary}：{result_summary}",
+            f"工具回傳的交易資料{args_summary}：{result_summary}",
+            f"從交易系統取得的{args_summary}資料：{result_summary}",
+        ]
+    elif tool_type == "file":
+        styles = [
+            f"讀取了檔案內容{args_summary}：{result_summary}",
+            f"檔案{args_summary}的內容如下：{result_summary}",
+            f"從檔案中讀取到的資料{args_summary}：{result_summary}",
+        ]
+    elif tool_type == "code":
+        styles = [
+            f"執行了程式碼{args_summary}，輸出：{result_summary}",
+            f"程式碼執行結果{args_summary}：{result_summary}",
+            f"程式碼回傳：{result_summary}",
+        ]
+    else:
+        styles = [
+            f"先前使用了{tool_name}工具{args_summary}，得到：{result_summary}",
+            f"根據{tool_name}工具的回應{args_summary}：{result_summary}",
+            f"工具{tool_name}回傳的資料{args_summary}：{result_summary}",
+            f"系統已執行{tool_name}{args_summary}，結果為：{result_summary}",
+            f"歷史上下文：{tool_name}查詢{args_summary}後的結果：{result_summary}",
+        ]
+
+    rng = random.Random(seed + index)
+    return rng.choice(styles)
+
+
+def format_tool_history_legacy(info: dict, seed: int = 0, index: int = 0) -> str:
+    """Legacy format: natural language description."""
+    return _generate_natural_description(info, seed, index)
+
+
+def _get_sanitization_config(config: dict) -> tuple:
+    """Get sanitization config, return (enabled, max_result_length, format)."""
+    enabled = config.get("enable_history_sanitization", True)
+    max_length = config.get("sanitization_result_max_length", 2000)
+    fmt = config.get("tool_history_format", "flat")
+    return bool(enabled), int(max_length), str(fmt)
+
+
+def _extract_tool_info(tag: str, max_result_length: int) -> dict:
+    """
+    Extract tool info from a <details> tag.
+
+    Returns: {tool_name, args_summary, args_obj, result_summary, result_raw, truncated}
+    """
+    import re as _re
+    import html as _html
+    import json as _json
+
+    name_match = _re.search(r'name=([^ >]+)', tag, flags=_re.IGNORECASE)
+    tool_name = _html.unescape(name_match.group(1)) if name_match else "unknown"
+
+    args_match = _re.search(r'<arguments>(.*?)</arguments>', tag, _re.DOTALL)
+    args_summary = ""
+    args_obj = None
+    if args_match:
+        args_raw = _html.unescape(args_match.group(1).strip())
+        try:
+            args_obj = _json.loads(args_raw)
+            clean_args = {k: v for k, v in args_obj.items() if k not in ("tool_name", "label")}
+            if clean_args:
+                for k, v in clean_args.items():
+                    if isinstance(v, str) and len(v) < 100:
+                        args_summary = f"查詢「{v}」"
+                        break
+                    elif isinstance(v, (int, float, bool)):
+                        args_summary = f"參數 {k}={v}"
+                        break
+                else:
+                    args_summary = _json.dumps(clean_args, ensure_ascii=False)[:100]
+        except _json.JSONDecodeError:
+            args_summary = args_raw[:100]
+
+    result_match = _re.search(r'<result>(.*?)</result>', tag, _re.DOTALL)
+    result_summary = ""
+    result_raw = ""
+    truncated = False
+    if result_match:
+        result_raw = _html.unescape(result_match.group(1).strip())
+        try:
+            result_obj = _json.loads(result_raw)
+            if isinstance(result_obj, dict):
+                if "result" in result_obj and isinstance(result_obj["result"], str):
+                    inner = result_obj["result"]
+                    try:
+                        inner_obj = _json.loads(inner)
+                        result_summary = _json.dumps(inner_obj, ensure_ascii=False)
+                    except _json.JSONDecodeError:
+                        result_summary = inner
+                elif "data" in result_obj:
+                    result_summary = _json.dumps(result_obj["data"], ensure_ascii=False)
+                elif "success" in result_obj:
+                    result_summary = _json.dumps(result_obj, ensure_ascii=False)
+                else:
+                    result_summary = _json.dumps(result_obj, ensure_ascii=False)
+            else:
+                result_summary = str(result_obj)
+        except _json.JSONDecodeError:
+            result_summary = result_raw
+
+        if len(result_summary) > max_result_length:
+            result_summary = result_summary[:max_result_length] + "..."
+            truncated = True
+
+    return {
+        "tool_name": tool_name,
+        "args_summary": args_summary,
+        "args_obj": args_obj,
+        "result_summary": result_summary,
+        "result_raw": result_raw,
+        "truncated": truncated,
+    }
+
+
+def _classify_tool(tool_name: str) -> str:
+    """Classify tool type by name."""
+    search_tools = ["web_search", "brave_web_search", "search_files", "session_search"]
+    trading_tools = ["coinglass", "mtf_analysis", "signal", "trading", "position", "order"]
+    file_tools = ["read_file", "write_file", "patch", "search_files", "file"]
+    code_tools = ["execute_code", "terminal", "process", "terminal_command"]
+
+    tn = tool_name.lower()
+    if any(s in tn for s in search_tools):
+        return "search"
+    if any(s in tn for s in trading_tools):
+        return "trading"
+    if any(s in tn for s in file_tools):
+        return "file"
+    if any(s in tn for s in code_tools):
+        return "code"
+    return "general"
+
+
+def sanitize_message_content(content: str | None, seed: int = 0, max_result_length: int = 2000, fmt: str = "flat") -> tuple[str, int]:
+    """
+    Sanitize a single message's content by replacing <details> tags with safe format.
+
+    Parameters:
+        content: The message content
+        seed: Random seed for deterministic style selection
+        max_result_length: Max length for result summary
+        fmt: Format type - "flat" or "legacy"
+
+    Returns:
+        (sanitized_content, replacement_count)
+    """
+    import re as _re
+
+    if not content:
+        return (content, 0)
+
+    total_replacements = 0
+
+    def _replace_details(match):
+        nonlocal total_replacements
+        total_replacements += 1
+        idx = total_replacements
+        tag = match.group(0)
+
+        info = _extract_tool_info(tag, max_result_length)
+
+        if fmt == "flat":
+            return format_tool_history_block(
+                tool_name=info["tool_name"],
+                args=info["args_obj"],
+                result_raw=info["result_raw"],
+                max_result_length=max_result_length,
+            )
+        else:
+            return format_tool_history_legacy(info, seed, idx)
+
+    # 1. Standard <details type="tool_calls"> blocks (safe patterns, ReDoS-resistant)
+    pattern1 = r'<details[^>]*type=tool_calls[^>]*>((?:(?!<details>).)*?)</details>'
+    sanitized = _re.sub(pattern1, _replace_details, content, flags=_re.DOTALL | _re.IGNORECASE)
+
+    # 2. <details> without type attribute (model-imitated format), with sub-tags
+    # Use \s+ instead of \s*\n\s* since DOTALL makes . match newlines anyway
+    pattern2 = r'<details[^>]*>\s+<summary>(?:(?!<summary>).)*?</summary>(?:(?!<arguments>).)*?<arguments>(?:(?!<arguments>).)*?</arguments>(?:(?!<result>).)*?<result>(?:(?!<result>).)*?</result>(?:(?!<details>).)*?</details>'
+    sanitized = _re.sub(pattern2, _replace_details, sanitized, flags=_re.DOTALL | _re.IGNORECASE)
+
+    # 3. Catch-all: any <details> containing <arguments> and <result>
+    pattern3 = r'<details[^>]*>(?:(?!<details>).)*?<arguments>(?:(?!<arguments>).)*?</arguments>(?:(?!<result>).)*?<result>(?:(?!<result>).)*?</result>(?:(?!<details>).)*?</details>'
+    sanitized = _re.sub(pattern3, _replace_details, sanitized, flags=_re.DOTALL | _re.IGNORECASE)
+
+    return sanitized, total_replacements
