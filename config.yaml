@@ -72,7 +72,7 @@ tool_usage_hint_file: "tool_hint.txt"
 #   server-side  — Rely on Hermes Gateway's server-side history (requires
 #                  X-Hermes-Session-Id header). Most efficient, ~90%+ reduction.
 #   disabled     — Send full message history (current behavior).
-compression_mode: "server-side"
+compression_mode: "disabled"
 
 # ── Session Isolation (Collision Prevention) ────────────────
 # When two conversations start with identical first messages, they would
