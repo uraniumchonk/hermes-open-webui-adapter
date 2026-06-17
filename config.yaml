@@ -39,7 +39,9 @@ upstreams:
 # ── Auto Split ─────────────────────────────────────────────
 # Auto-split threshold (characters), 0 to disable
 # Note: Conduit APP does not support session.split events
+############ experimental, may unable to work as expected. #################
 auto_split_threshold: 0
+############ experimental, may unable to work as expected. #################
 
 # ── History Sanitization (Anti-pollution) ──────────────────
 # Before forwarding requests, convert <details type="tool_calls"> tags
