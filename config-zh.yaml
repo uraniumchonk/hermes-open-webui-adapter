@@ -1,0 +1,63 @@
+# ═══════════════════════════════════════════════════════════
+# Hermes Tool Card Enhancer Proxy — Configuration
+# ═══════════════════════════════════════════════════════════
+#
+# 環境變數可以覆蓋此設定 (TOOL_MODE, BIND_PORT, BIND_HOST, AUTO_SPLIT_THRESHOLD)
+#
+# 詳細說明請參考 README.md
+
+# ── Server ─────────────────────────────────────────────────
+bind_host: "127.0.0.1"  # 僅允許本機連線，防止外部存取
+bind_port: 9099
+
+# ── Tool Display Mode ──────────────────────────────────────
+# enhance-v2  : 推薦模式 — 即時串流 + <details> 子標籤格式（OpenWebUI 相容）
+# enhance     : 過濾 done=false + 注入帶 label 的完成標籤
+# passthrough : 直接透傳 <details> 標籤（最安全）
+# strip       : 移除 <details> 並替換為純文字
+tool_mode: "enhance-v2"
+
+# ── Upstream Routing ───────────────────────────────────────
+# 路由表：路徑前綴 → 上游 Hermes Gateway 位址
+# 格式: "端口": "http://位址:端口"
+#
+# 預設 Hermes profiles（執行 `hermes profiles list` 查看你的 profiles）：
+#   30000: 通用聊天
+#   30001: 程式開發專家
+#   30002: 資料與研究
+#   30003: 交易與市場
+#
+# 你可以自由增減 — 只需符合你的 Gateway 設定即可！
+# 若省略此區塊，會使用預設的 30000-30003。
+upstreams:
+  "30000": "http://127.0.0.1:30000"
+  "30001": "http://127.0.0.1:30001"
+  "30002": "http://127.0.0.1:30002"
+  "30003": "http://127.0.0.1:30003"
+
+# ── Auto Split ─────────────────────────────────────────────
+# 自動分割閾值（字元數），0 表示關閉
+# 注意: Conduit APP 不支援 session.split 事件
+auto_split_threshold: 0
+
+# ── History Sanitization (Anti-pollution) ──────────────────
+# 在轉發請求前，將 assistant content 中的 <details type="tool_calls"> 標籤
+# 轉換為安全格式，切斷污染反饋迴圈。
+enable_history_sanitization: true
+# 結果截斷字元數（超過此長度會加上 "..."）
+sanitization_result_max_length: 2000
+# 歷史格式：
+#   flat   — [START_PREV_ACTION] k:v 格式（推薦，防止 JSON 污染）
+#   legacy — 自然語言描述（舊版）
+tool_history_format: "legacy"
+
+# ── Tool Usage Hint (Jinja Template) ───────────────────────
+# 在訊息末尾插入工具調用提示，防止模型注意力稀釋。
+# 這是一個 Jinja2 模板，會被渲染後附加在 user message 的最後。
+# 模板變數：
+#   - tools: 工具列表（每個工具包含 name, description, parameters 等）
+# 
+# 注意：此模板由外部系統（如 Open WebUI 的 Jinja 處理器）渲染，
+# 不是由 hermes_tool_filter 渲染。
+# 留空或設置為 "" 表示不插入任何提示。
+tool_usage_hint_template: ""
