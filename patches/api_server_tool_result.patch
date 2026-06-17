@@ -1,7 +1,8 @@
-diff --git a/hermes-agent/gateway/platforms/api_server.py b/hermes-agent/gateway/platforms/api_server.py
---- a/hermes-agent/gateway/platforms/api_server.py
-+++ b/hermes-agent/gateway/platforms/api_server.py
-@@ -1146,6 +1146,8 @@ class APIServerAdapter(BasePlatformAdapter):
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index da86952a0..71d9e8a78 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1905,6 +1905,8 @@ class APIServerAdapter(BasePlatformAdapter):
                      "tool": function_name,
                      "toolCallId": tool_call_id,
                      "status": "completed",
