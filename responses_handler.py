@@ -423,7 +423,7 @@ async def _blocking_responses(
     期望的就是 Responses 格式的回應。
     """
     timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-    async with aiohttp.ClientSession(timeout=timeout, max_line_size=65536) as local_sess:
+    async with aiohttp.ClientSession(timeout=timeout, read_bufsize=524288) as local_sess:
         async with local_sess.post(
             upstream_url, data=body, headers=fwd_headers
         ) as resp:
@@ -453,7 +453,7 @@ async def _stream_responses(
 
     async def generate() -> AsyncGenerator[bytes, None]:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        async with aiohttp.ClientSession(timeout=timeout, max_line_size=65536) as local_sess:
+        async with aiohttp.ClientSession(timeout=timeout, read_bufsize=524288) as local_sess:
             try:
                 async with local_sess.post(
                     upstream_url, data=body, headers=fwd_headers

@@ -177,10 +177,11 @@ async def handle_completions_request(
             except aiohttp.ServerDisconnectedError:
                 logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
             except aiohttp.ClientError as e:
-                logger.warning(f"[port={upstream_port}] Client error: {e}")
+                logger.warning(f"[port={upstream_port}] Client error: {type(e).__name__}: {e}")
+                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
             except Exception as e:
                 logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
-                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
+                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure","detail": "' + str(e).encode('utf-8', errors='replace') + b'"}}\n\n'
             finally:
                 if upstream_resp is not None and not upstream_resp.closed:
                     upstream_resp.close()
