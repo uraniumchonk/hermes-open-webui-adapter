@@ -44,6 +44,7 @@ from tool_history_format import (
     _format_result_flat,
     sanitize_message_content,
 )
+from comp_mode import compress_tool_results
 try:
     import yaml
     HAS_YAML = True
@@ -305,6 +306,276 @@ def sanitize_request_messages(
             logger.debug(f"[tool_hint] Appended new user message with hint from {hint_file}")
 
     return messages
+
+
+# ── Client-Side [comp] Compression ─────────────────────────
+#
+# When the user includes [comp] in their message, compress all tool results
+# in the conversation history BEFORE that message to reduce context window size.
+#
+# This is a client-side compression that directly modifies the messages array
+# sent to the model — unlike server-side compression which relies on Gateway's
+# state.db. Useful when you want to manually control context size mid-conversation.
+#
+# Modes:
+#   enabled   — Active. Scans for [comp] in the last user message, then truncates
+#               all tool results in previous messages to a summary + inserts a
+#               marker so the LLM knows history was compressed.
+#   disabled  — No client-side compression (default).
+#
+# If the user sends ONLY "[comp]" (no other content), the proxy returns a
+# pre-written auto-reply directly without forwarding to the LLM. The compressed
+# messages + marker are still processed, so the conversation context includes
+# the compression notification.
+
+_COMP_TRIGGER = "[comp]"
+
+_COMP_MARKER_CODE = "comp"
+
+_COMP_NOTIFICATION = """[CONVERSATION COMPRESSED] Previous tool results have been truncated to save context space. The full results are still available in the server-side session history. If you need to reference specific data from earlier tool calls, please re-run the relevant tools to reload the data into context."""
+
+# Auto-reply text when user sends ONLY "[comp]" — returned directly without LLM.
+_COMP_AUTO_REPLY = """[CONVERSATION COMPRESSED] Tool execution history has been truncated to reduce context size. You can now continue with new instructions."""
+
+
+def _comp_mode_enabled(config: dict = None) -> bool:
+    """Check if client-side compression mode is enabled."""
+    cfg = config if config is not None else CONFIG
+    return cfg.get("comp_mode", "disabled") == "enabled"
+
+
+def _strip_comp_trigger(content):
+    """Remove [comp] trigger from user message content."""
+    if isinstance(content, str):
+        return content.replace(_COMP_TRIGGER, "").strip()
+    elif isinstance(content, list):
+        new_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                new_parts.append({**part, "text": part["text"].replace(_COMP_TRIGGER, "").strip()})
+            else:
+                new_parts.append(part)
+        return new_parts
+    return content
+
+
+def _compress_prev_action_blocks(content: str, max_length: int) -> tuple[str, int]:
+    """
+    Compress [START_PREV_ACTION]...[END_PREV_ACTION] blocks in content.
+    
+    **只壓縮最後一個區塊** — 保留歷史上下文，只截斷最新的工具結果。
+    Keeps the tool name and args, but truncates the [RESULT] section.
+    Returns (compressed_content, blocks_compressed).
+    """
+    if not content:
+        return (content, 0)
+    
+    # 找到所有區塊的位置
+    pattern = r'\[START_PREV_ACTION\](.*?)\[END_PREV_ACTION\]'
+    matches = list(re.finditer(pattern, content, flags=re.DOTALL))
+    
+    if not matches:
+        return (content, 0)
+    
+    # 只壓縮最後一個區塊
+    last_match = matches[-1]
+    blocks_compressed = 1
+    
+    block_inner = last_match.group(1)
+    
+    # Extract tool name
+    tool_name_match = re.search(r'\[ACTION_TYPE\]\s*\n\s*([^\n]+)', block_inner)
+    tool_name = tool_name_match.group(1).strip() if tool_name_match else "unknown"
+    
+    # Extract args section
+    args_match = re.search(r'\[ACTION_ARG\]\s*\n(.*?)(?=\n\[RESULT\]|\n\[END)', block_inner, re.DOTALL)
+    args_text = args_match.group(1).strip() if args_match else "(none)"
+    if len(args_text) > 100:
+        args_text = args_text[:100] + "..."
+    
+    # Build compressed block
+    if max_length <= 0:
+        result_text = "(compressed)"
+    else:
+        result_text = f"(compressed from original, {max_length} chars kept)"
+    
+    compressed_block = (
+        f"[START_PREV_ACTION]\n"
+        f"[ACTION_TYPE]\n"
+        f"{tool_name}\n"
+        f"[ACTION_ARG]\n"
+        f"{args_text}\n"
+        f"[RESULT]\n"
+        f"{result_text}\n"
+        f"[END_PREV_ACTION]"
+    )
+    
+    # 只替換最後一個區塊
+    compressed = content[:last_match.start()] + compressed_block + content[last_match.end():]
+    
+    # 除錯: 記錄壓縮前後的大小
+    original_size = last_match.end() - last_match.start()
+    new_size = len(compressed_block)
+    logger.debug(f"[comp] PREV_ACTION block: {original_size} -> {new_size} chars ({(1-new_size/original_size)*100:.1f}% reduction)")
+    
+    return (compressed, blocks_compressed)
+
+
+def _compress_details_tags(content: str, max_length: int) -> tuple[str, int]:
+    """
+    Compress <details type="tool_calls"> tags in content.
+    
+    **只壓縮最後一個標籤** — 保留歷史上下文，只截斷最新的工具結果。
+    Replaces the <result> section with a truncated version.
+    Returns (compressed_content, tags_compressed).
+    """
+    if not content:
+        return (content, 0)
+    
+    # 修正: 支援 type="tool_calls" 和 type=tool_calls (有/無引號)
+    pattern = r'(<details[^>]*type=["\']?tool_calls["\']?[^>]*>)(.*?)(</details>)'
+    
+    # 找到所有標籤的位置
+    matches = list(re.finditer(pattern, content, flags=re.DOTALL | re.IGNORECASE))
+    
+    if not matches:
+        return (content, 0)
+    
+    # 只壓縮最後一個標籤
+    last_match = matches[-1]
+    tags_compressed = 1
+    
+    opening = last_match.group(1)
+    inner = last_match.group(2)
+    closing = last_match.group(3)
+    
+    # Find and compress <result> section
+    result_pattern = r'(<result>)(.*?)(</result>)'
+    def _compress_result(rm):
+        result_content = rm.group(2)
+        if len(result_content) > max_length:
+            return f"{rm.group(1)}{result_content[:max_length]}... (truncated by [comp]){rm.group(3)}"
+        return rm.group(0)
+    
+    inner_compressed = re.sub(result_pattern, _compress_result, inner, flags=re.DOTALL)
+    compressed_tag = f"{opening}{inner_compressed}{closing}"
+    
+    # 只替換最後一個標籤
+    compressed = content[:last_match.start()] + compressed_tag + content[last_match.end():]
+    return (compressed, tags_compressed)
+
+
+def compress_tool_results(messages: list, config: dict) -> tuple[list, bool]:
+    """
+    Client-side conversation compression triggered by [comp] in user message.
+    
+    When enabled and [comp] is detected in the last user message:
+    1. Remove [comp] from the user message
+    2. Compress all tool results in messages BEFORE this user message
+    3. Insert a notification message so the LLM knows history was compressed
+    4. Insert a persistent marker code block
+    
+    Returns (modified_messages, is_comp_only).
+    - is_comp_only=True means the user sent ONLY "[comp]" — caller should
+      return an auto-reply directly without forwarding to the LLM.
+    - is_comp_only=False means normal compression (still forward to LLM).
+    """
+    if not _comp_mode_enabled(config):
+        return (messages, False)
+    
+    if not messages:
+        return (messages, False)
+    
+    max_length = config.get("comp_result_max_length", 100)
+    
+    # Find the last user message and check for [comp]
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+    
+    if last_user_idx is None:
+        return (messages, False)
+    
+    last_user = messages[last_user_idx]
+    content = last_user.get("content", "")
+    
+    # Check if [comp] is present AND if it's the ONLY content
+    has_comp = False
+    is_comp_only = False
+    if isinstance(content, str):
+        has_comp = _COMP_TRIGGER in content
+        # is_comp_only: content is exactly "[comp]" after stripping whitespace
+        is_comp_only = content.strip() == _COMP_TRIGGER
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and _COMP_TRIGGER in part.get("text", ""):
+                has_comp = True
+                # is_comp_only: single text part that is exactly "[comp]"
+                if len(content) == 1 and part.get("text", "").strip() == _COMP_TRIGGER:
+                    is_comp_only = True
+                break
+    
+    if not has_comp:
+        return (messages, False)
+    
+    # ── [comp] detected — perform compression ──
+    
+    # 1. Strip [comp] from the user message
+    last_user["content"] = _strip_comp_trigger(last_user["content"])
+    
+    # 2. Compress tool results in all messages BEFORE this user message
+    total_compressed = 0
+    
+    # 除錯: 記錄壓縮前的總大小
+    original_total_size = sum(len(str(m.get("content", ""))) for m in messages[:last_user_idx])
+    
+    for i in range(last_user_idx):
+        msg = messages[i]
+        role = msg.get("role", "")
+        raw_content = msg.get("content", "")
+        
+        if not raw_content:
+            continue
+        
+        # Handle both string and list content
+        if isinstance(raw_content, str):
+            # Compress [START_PREV_ACTION] blocks (flat format)
+            compressed, count1 = _compress_prev_action_blocks(raw_content, max_length)
+            # Also compress <details> tags if present
+            compressed, count2 = _compress_details_tags(compressed, max_length)
+            msg["content"] = compressed
+            total_compressed += count1 + count2
+            
+        elif isinstance(raw_content, list):
+            for part in raw_content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    compressed, count1 = _compress_prev_action_blocks(part["text"], max_length)
+                    compressed, count2 = _compress_details_tags(compressed, max_length)
+                    part["text"] = compressed
+                    total_compressed += count1 + count2
+    
+    # 除錯: 記錄壓縮後的總大小
+    new_total_size = sum(len(str(m.get("content", ""))) for m in messages[:last_user_idx])
+    logger.info(
+        f"[comp] Total size: {original_total_size} -> {new_total_size} chars "
+        f"({(1-new_total_size/original_total_size)*100:.1f}% reduction, {total_compressed} blocks)"
+    )
+    
+    # 3. Insert compression marker as a system message right before the last user message
+    marker_msg = {
+        "role": "system",
+        "content": f"{_COMP_NOTIFICATION}\n\n```\n{_COMP_MARKER_CODE}\ncompression: applied at message {last_user_idx}\nblocks_compressed: {total_compressed}\nmax_result_length: {max_length}\n```",
+    }
+    messages.insert(last_user_idx, marker_msg)
+    
+    logger.info(
+        f"[comp] Compression applied: {total_compressed} tool result(s) compressed "
+        f"across {last_user_idx} message(s), marker inserted at index {last_user_idx}"
+    )
+    
+    return (messages, is_comp_only)
 
 
 # ── Conversation Compression ───────────────────────────────
@@ -708,6 +979,40 @@ def _build_finish_chunk(
     if usage:
         chunk["usage"] = usage
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _build_comp_auto_reply_stream(
+    text: str, model: str, completion_id: str, created: int
+) -> StreamingResponse:
+    """
+    Build a streaming response for [comp] auto-reply.
+    Emits the text as a series of content chunks followed by a finish chunk.
+    """
+    async def generate():
+        # Split text into small chunks for realistic streaming feel
+        chunk_size = 20
+        for i in range(0, len(text), chunk_size):
+            segment = text[i:i + chunk_size]
+            yield _build_content_chunk(segment)
+            await asyncio.sleep(0.01)  # Small delay for streaming effect
+        yield _build_finish_chunk(
+            completion_id, created, model,
+            finish_reason="stop",
+            usage={"prompt_tokens": 0, "completion_tokens": len(text), "total_tokens": len(text)}
+        )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Proxy-Buffering": "no",
+            "Flush-After-Header": "true",
+            "Content-Encoding": "identity",
+        },
+    )
 
 
 # ── Enhance-v2: Blocking Translation Mode ─────────────────
@@ -1153,7 +1458,14 @@ async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        _http_session = aiohttp.ClientSession(timeout=timeout, max_line_size=65536)
+        # read_bufsize: session_search 等工具可能回傳超大 SSE frame (>200KB)
+        # aiohttp 的 StreamReader._high_water = read_bufsize * 2
+        # readline() 的 max_size 預設為 _high_water
+        # 設為 512KB 使 _high_water = 1MB，足以容納最大的 tool result
+        _http_session = aiohttp.ClientSession(
+            timeout=timeout,
+            read_bufsize=524288,
+        )
     return _http_session
 
 
@@ -1228,6 +1540,21 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
         if "messages" in req_json and isinstance(req_json["messages"], list):
             if _session_isolation_enabled():
                 hermes_sid = get_or_create_session_id(req_json["messages"])
+            
+            # ✅ Client-side [comp] compression: truncate tool results if [comp] triggered
+            result = compress_tool_results(req_json["messages"], CONFIG)
+            req_json["messages"] = result[0]
+            is_comp_only = result[1]
+            
+            # ✅ If user sent ONLY [comp], return auto-reply directly without LLM
+            if is_comp_only:
+                model = req_json.get("model", "hermes-agent")
+                completion_id = f"chatcmpl-{int(time.time()*1000)}"
+                created_ts = int(time.time())
+                logger.info(f"[comp] Auto-reply triggered - returning compressed context directly")
+                auto_reply = CONFIG.get("comp_auto_reply", _COMP_AUTO_REPLY)
+                return _build_comp_auto_reply_stream(auto_reply, model, completion_id, created_ts)
+            
             # ✅ Conversation Compression: compress messages before forwarding
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
@@ -1279,6 +1606,21 @@ async def proxy_default(request: Request, rest: str):
         if "messages" in req_json and isinstance(req_json["messages"], list):
             if _session_isolation_enabled():
                 hermes_sid = get_or_create_session_id(req_json["messages"])
+            
+            # ✅ Client-side [comp] compression: truncate tool results if [comp] triggered
+            result = compress_tool_results(req_json["messages"], CONFIG)
+            req_json["messages"] = result[0]
+            is_comp_only = result[1]
+            
+            # ✅ If user sent ONLY [comp], return auto-reply directly without LLM
+            if is_comp_only:
+                model = req_json.get("model", "hermes-agent")
+                completion_id = f"chatcmpl-{int(time.time()*1000)}"
+                created_ts = int(time.time())
+                logger.info(f"[comp] Auto-reply triggered - returning compressed context directly")
+                auto_reply = CONFIG.get("comp_auto_reply", _COMP_AUTO_REPLY)
+                return _build_comp_auto_reply_stream(auto_reply, model, completion_id, created_ts)
+            
             # ✅ Conversation Compression: compress messages before forwarding
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
