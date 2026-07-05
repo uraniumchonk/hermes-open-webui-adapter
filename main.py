@@ -45,6 +45,7 @@ from tool_history_format import (
     sanitize_message_content,
 )
 from comp_mode import compress_tool_results
+import native_tool_context
 try:
     import yaml
     HAS_YAML = True
@@ -1559,6 +1560,23 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
             )
+            
+            # ✅ Component 4: Session Marker Detection & History Injection (Native Tool Context)
+            if TOOL_MODE == "native_passthrough" and hermes_sid:
+                marker_info = native_tool_context.detect_session_marker(req_json["messages"])
+                if marker_info:
+                    detected_sid, ts = marker_info
+                    target_sid = detected_sid if detected_sid == hermes_sid else hermes_sid
+                    try:
+                        db = native_tool_context.get_tool_context_db()
+                        tool_results = await db.get_tool_results_by_session(target_sid)
+                        if tool_results:
+                            req_json["messages"] = native_tool_context.inject_tool_results_into_history(
+                                req_json["messages"], target_sid, tool_results
+                            )
+                    except Exception as e:
+                        logger.warning(f"[tool-context] Failed to inject history: {e}")
+        
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
@@ -1625,6 +1643,22 @@ async def proxy_default(request: Request, rest: str):
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
             )
+            
+            # ✅ Component 4: Session Marker Detection & History Injection (Native Tool Context)
+            if TOOL_MODE == "native_passthrough" and hermes_sid:
+                marker_info = native_tool_context.detect_session_marker(req_json["messages"])
+                if marker_info:
+                    detected_sid, ts = marker_info
+                    target_sid = detected_sid if detected_sid == hermes_sid else hermes_sid
+                    try:
+                        db = native_tool_context.get_tool_context_db()
+                        tool_results = await db.get_tool_results_by_session(target_sid)
+                        if tool_results:
+                            req_json["messages"] = native_tool_context.inject_tool_results_into_history(
+                                req_json["messages"], target_sid, tool_results
+                            )
+                    except Exception as e:
+                        logger.warning(f"[tool-context] Failed to inject history: {e}")
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,

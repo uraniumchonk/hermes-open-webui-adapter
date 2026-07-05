@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
+import native_tool_context
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ async def handle_completions_request(
     支援：
     - 測試模式（直接回傳預先寫好的樣本）
     - 串流模式（SSE + enhance-v2 轉換）
+    - native_passthrough 模式（完全透傳 + SQLite 存儲 + 歷史注入）
     - 非串流模式（直接透傳）
     """
     # 🔍 臨時 DEBUG：記錄請求結構（確認 Open WebUI 發送什麼欄位）
@@ -145,6 +147,10 @@ async def handle_completions_request(
         completion_id = f"chatcmpl-{int(time.time()*1000)}"
         created_ts = int(time.time())
 
+        # ✅ Native Passthrough Mode: 使用新的 transform_stream (組件1+2+3)
+        from main import TOOL_MODE as MAIN_TOOL_MODE
+        use_native = MAIN_TOOL_MODE == "native_passthrough"
+
         async def generate():
             upstream_resp = None
             try:
@@ -154,7 +160,8 @@ async def handle_completions_request(
                 logger.info(
                     f"[port={upstream_port}] Proxied chat completions, "
                     f"upstream status={upstream_resp.status}, "
-                    f"strip_details={strip_details} (UA: {user_agent[:50]})"
+                    f"strip_details={strip_details} (UA: {user_agent[:50]}), "
+                    f"native_passthrough={use_native}"
                 )
                 
                 # ✅ Session Isolation: update cached session ID from upstream response
@@ -165,11 +172,21 @@ async def handle_completions_request(
                         update_session_id(req_json.get("messages", []), new_sid)
                         logger.info(f"[session] Updated cache: {hermes_sid[:8]}... → {new_sid[:8]}...")
                 
-                async for chunk in transform_stream(
-                    upstream_resp.content, model, completion_id, created_ts,
-                    upstream_port, strip_details, hermes_sid,
-                ):
-                    yield chunk
+                # ✅ Native Passthrough: 使用新的 transform_stream with SQLite
+                if use_native:
+                    db = native_tool_context.get_tool_context_db()
+                    async for chunk in native_tool_context.native_passthrough_transform_stream(
+                        upstream_resp.content, model, completion_id, created_ts,
+                        upstream_port, hermes_sid, db, capture_notifications=True,
+                    ):
+                        yield chunk
+                else:
+                    # Standard enhance-v2 mode
+                    async for chunk in transform_stream(
+                        upstream_resp.content, model, completion_id, created_ts,
+                        upstream_port, strip_details, hermes_sid,
+                    ):
+                        yield chunk
             except asyncio.CancelledError:
                 logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
                 if upstream_resp is not None:
