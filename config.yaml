@@ -16,6 +16,11 @@ bind_port: 9099
 # enhance     : Filter done=false + inject completion tags with label
 # passthrough : Pass through <details> tags directly (safest)
 # strip       : Remove <details> and replace with plain text
+# native_passthrough : NEW — 完全透傳 + SQLite 存儲 + 歷史注入 (4 Components)
+#   - 組件1: 不修改任何 SSE data
+#   - 組件2: 捕獲 hermes.tool.progress → 顯示 "執行 terminal"
+#   - 組件3: SQLite 存儲完整 tool results (key: session_id + message_id)
+#   - 組件4: Session Marker 檢測 → 注入完整 results 到歷史訊息
 tool_mode: "enhance-v2"
 
 # ── Upstream Routing ───────────────────────────────────────
