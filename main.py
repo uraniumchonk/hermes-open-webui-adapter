@@ -958,8 +958,8 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         
         result_len = len(result)
         
-        # 圖片相關欄位清單
-        image_keys = {"image_url", "image_path", "path", "screenshot_path"}
+        # 圖片相關欄位清單（排除通用的 path，只保留明確的圖片欄位）
+        image_keys = {"image_url", "image_path", "screenshot_path"}
         
         # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
         has_image_arg = arguments is not None and image_keys & set(arguments.keys())
