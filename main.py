@@ -919,6 +919,15 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
+    # ── 確保 arguments 是 dict（hermes.tool.progress 可能傳入 JSON 字串）─
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            arguments = None
+    elif not isinstance(arguments, dict):
+        arguments = None
+    
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
     # <summary> 內容留空以節省上下文（arguments 已包含完整資訊）
@@ -953,7 +962,7 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         image_keys = {"image_url", "image_path", "path", "screenshot_path"}
         
         # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
-        has_image_arg = arguments and image_keys & set(arguments.keys())
+        has_image_arg = arguments is not None and image_keys & set(arguments.keys())
         is_large_result = result_len > 10240
         
         if has_image_arg and is_large_result:
