@@ -297,8 +297,14 @@ def sanitize_request_messages(
                 break
 
         if last_user_idx is not None:
-            # Append template to existing user message
-            messages[last_user_idx]["content"] += "\n\n" + template
+            content = messages[last_user_idx]["content"]
+            # Handle both string and list content formats
+            if isinstance(content, list):
+                # For list content, append as a new text part
+                messages[last_user_idx]["content"] = content + [{"type": "text", "text": template}]
+            else:
+                # For string content, append with separator
+                messages[last_user_idx]["content"] = content + "\n\n" + template
             logger.debug(f"[tool_hint] Appended hint from {hint_file} to last user message (index {last_user_idx})")
         else:
             # No user message found; create a new one at the end
@@ -909,16 +915,14 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
+    - **多模態處理**：偵測 _multimodal 信封包，保留 base64 圖片為 JSON
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
-    # <summary> 包含工具名稱 + emoji（供視覺渲染）
-    emoji = get_tool_emoji(tool_name)
-    display_name = label if label else tool_name
-    safe_display = html.escape(display_name)
-    inner = f"\n<summary>✅ {emoji} {safe_display}</summary>"
+    # <summary> 內容留空以節省上下文（arguments 已包含完整資訊）
+    inner = "\n<summary></summary>"
     
     # <arguments> 標籤：包含 tool_name + 完整參數（讓模型能識別工具）
     if arguments:
@@ -938,9 +942,34 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     
     if result:
-        # result 放在標籤內，用 html.escape 避免 XSS
-        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        inner += f"\n<result>{html.escape(truncated)}</result>"
+        # ── 多模態處理：偵測 _multimodal 信封包 ──
+        # 嘗試解析 Python dict 字串（Hermes 回傳的格式是 {'_multimodal': True, ...}）
+        multimodal_result = None
+        if "_multimodal" in result:
+            try:
+                # 嘗試標準 JSON 解析
+                parsed = json.loads(result)
+                if isinstance(parsed, dict) and parsed.get("_multimodal") is True:
+                    multimodal_result = parsed
+            except json.JSONDecodeError:
+                # Hermes 回傳的是 Python dict 字串（單引號），嘗試 ast.literal_eval
+                try:
+                    import ast
+                    parsed = ast.literal_eval(result)
+                    if isinstance(parsed, dict) and parsed.get("_multimodal") is True:
+                        multimodal_result = parsed
+                except Exception:
+                    pass
+        
+        if multimodal_result:
+            # 多模態信封包：替換成簡短提示，避免 base64 污染上下文
+            # 模型已經在當輪"看到"圖片了，下一輪不需要再塞幾MB的base64
+            # 如果模型需要再看圖片，會自己重新調用 vision_analyze
+            inner += f"\n<result>圖片已從上下文移除。想要再看圖片請再調用一次視覺工具即可。</result>"
+        else:
+            # 一般結果：用 html.escape 避免 XSS
+            truncated = result[:5000] + ("..." if len(result) > 5000 else "")
+            inner += f"\n<result>{html.escape(truncated)}</result>"
     
     return f'<details {attrs}>{inner}\n</details>'
 
@@ -1041,14 +1070,26 @@ class ToolCallBuffer:
         # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments}
         self.active_tools: Dict[str, dict] = {}
     
-    def on_tool_running(self, tc_id: str, payload: dict) -> None:
-        """工具開始執行，記錄狀態（不發送 running 卡片）。"""
+    def on_tool_running(self, tc_id: str, payload: dict,
+                        completion_id: str, created: int, model: str) -> List[bytes]:
+        """工具開始執行，記錄狀態並立即發送 running 通知以保持 stream 活躍。"""
+        tool_name = payload.get("tool", "unknown")
+        emoji = payload.get("emoji", get_tool_emoji(tool_name))
+        
         self.active_tools[tc_id] = {
-            "tool": payload.get("tool", "unknown"),
-            "emoji": payload.get("emoji", ""),
-            "label": payload.get("label", payload.get("tool", "unknown")),
+            "tool": tool_name,
+            "emoji": emoji,
+            "label": payload.get("label", tool_name),
             "arguments": payload.get("arguments", {}),
         }
+        
+        # ✅ 發送空 chunk 保持 SSE stream 活躍（防止 Open WebUI idle timeout）
+        chunks = []
+        chunks.append(b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}  \n\n' % (
+            completion_id.encode(), created, model.encode()
+        ))
+        logging.info(f"[enhance-v2] Tool running: {tool_name} (sent keepalive chunk)")
+        return chunks
     
     def on_tool_completed(self, tc_id: str, payload: dict, 
                           completion_id: str, created: int, model: str) -> List[bytes]:
@@ -1164,6 +1205,9 @@ async def transform_stream(
     initial_wait_heartbeat = time.monotonic()
     initial_wait_interval = 0.5  # 初始等待階段每 0.5 秒發送心跳
     
+    # ✅ 預建心跳 chunk 模板（避免每次重複格式化）
+    _heartbeat_chunk_tpl = b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    
     # 主循環
     while True:
         # ✅ 防火牆優化：在等待第一塊內容時使用更短的心跳間隔
@@ -1172,18 +1216,18 @@ async def transform_stream(
         # 心跳檢查
         elapsed = time.monotonic() - last_heartbeat
         if elapsed >= current_heartbeat_interval:
+            heartbeat_count += 1
+            last_heartbeat = time.monotonic()
+            tool_just_completed = False
+            
+            # ✅ 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
+            # SSE comment (:) 不被某些客戶端計入 idle timer，導致斷線
+            yield _heartbeat_chunk_tpl % (
+                completion_id.encode(), created, model.encode()
+            )
+            
             if not first_content_sent:
-                # 還在等待第一塊內容，發送 SSE comment 保持連接活躍
-                heartbeat_count += 1
-                yield b': keepalive-waiting-first-chunk\n\n'
-                last_heartbeat = time.monotonic()
                 logger.debug(f"[firewall-optimization] Sent keepalive while waiting for first chunk (count={heartbeat_count})")
-            elif elapsed >= heartbeat_interval:
-                # 正常心跳（第一個 content 之後）
-                heartbeat_count += 1
-                yield b': keepalive\n\n'
-                last_heartbeat = time.monotonic()
-                tool_just_completed = False
 
         # 非阻塞讀取 — 使用 asyncio.wait_for 確保不會永久阻塞
         try:
@@ -1285,7 +1329,9 @@ async def transform_stream(
                     # ── enhance-v2 模式 ──
                     if TOOL_MODE == "enhance-v2" and v2_buffer:
                         if status == "running":
-                            v2_buffer.on_tool_running(tc_id, parsed_json)
+                            chunks = v2_buffer.on_tool_running(tc_id, parsed_json, completion_id, created, model)
+                            for chunk in chunks:
+                                yield chunk
                         elif status == "completed":
                             # 立即輸出標準格式（不緩衝，直接返回 chunks）
                             chunks = v2_buffer.on_tool_completed(
@@ -1296,8 +1342,7 @@ async def transform_stream(
                             # Tool completed 後立即發送多個 nudge（不阻塞）
                             # 確保 Open WebUI 的 idle timer 被重置
                             for i in range(3):
-                                yield b': keepalive-post-tool\n\n'
-                                yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
+                                yield _heartbeat_chunk_tpl % (
                                     completion_id.encode(), created, model.encode()
                                 )
                             # 發送可見的 thinking chunk，讓 Open WebUI 知道還在處理
@@ -1326,7 +1371,7 @@ async def transform_stream(
                             label = parsed_json.get("label", tool)
                             yield _build_content_chunk(
                                 f'<details type="tool_calls" done="false" id="{tc_id}" name="{html.escape(tool)}">\n'
-                                f'<summary>{emoji} Running... {html.escape(label)}</summary>\n'
+                                f'<summary></summary>\n'
                                 f'</details>\n'
                             )
                     elif status == "completed":
