@@ -1506,13 +1506,14 @@ async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        # read_bufsize: session_search 等工具可能回傳超大 SSE frame (>200KB)
+        # read_bufsize: vision_analyze 等視覺工具的 result 包含 base64 圖片
+        # SSE frame 可能超過 1MB（圖片大小 + JSON 包裝）
         # aiohttp 的 StreamReader._high_water = read_bufsize * 2
         # readline() 的 max_size 預設為 _high_water
-        # 設為 512KB 使 _high_water = 1MB，足以容納最大的 tool result
+        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 tool result（含 base64 圖片）
         _http_session = aiohttp.ClientSession(
             timeout=timeout,
-            read_bufsize=524288,
+            read_bufsize=4194304,  # 4MB
         )
     return _http_session
 
