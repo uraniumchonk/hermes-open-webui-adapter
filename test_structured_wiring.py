@@ -1,8 +1,7 @@
-"""Wiring tests: main.sanitize_request_messages structured/flat branches + responses helper."""
+"""Wiring tests: structured-only sanitize + responses helper."""
 
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 
@@ -10,6 +9,7 @@ sys.path.insert(0, "/home/thomas2018/hermes_tool_filter")
 
 import main as M
 from responses_handler import build_previous_tool_context
+import tool_history_format as THF
 
 
 DETAILS = (
@@ -21,6 +21,24 @@ DETAILS = (
 )
 
 
+class TestNoFlatExports(unittest.TestCase):
+    def test_flat_helpers_removed(self):
+        for name in (
+            "flatten_json",
+            "format_tool_history_block",
+            "format_tool_history_legacy",
+            "sanitize_message_content",
+            "_format_args_flat",
+            "_format_result_flat",
+        ):
+            self.assertFalse(hasattr(THF, name), name)
+
+    def test_config_always_structured(self):
+        enabled, max_len, fmt = THF._get_sanitization_config({})
+        self.assertTrue(enabled)
+        self.assertEqual(fmt, "structured")
+
+
 class TestSanitizeWiring(unittest.TestCase):
     def setUp(self):
         self._old = dict(M.CONFIG)
@@ -29,11 +47,12 @@ class TestSanitizeWiring(unittest.TestCase):
         M.CONFIG.clear()
         M.CONFIG.update(self._old)
 
-    def test_structured_expands_and_skips_hint(self):
+    def test_structured_expands_and_no_hint(self):
         M.CONFIG["enable_history_sanitization"] = True
-        M.CONFIG["tool_history_format"] = "structured"
         M.CONFIG["sanitization_result_max_length"] = 20000
+        # leftover config keys must be ignored
         M.CONFIG["tool_usage_hint_file"] = "tool_hint.txt"
+        M.CONFIG["tool_history_format"] = "flat"
 
         msgs = [
             {"role": "user", "content": "查 uptime"},
@@ -43,35 +62,25 @@ class TestSanitizeWiring(unittest.TestCase):
         out = M.sanitize_request_messages([dict(m) for m in msgs])
         roles = [m["role"] for m in out]
         self.assertIn("tool", roles)
-        # last user should NOT get tool_hint appended
         last_user = [m for m in out if m["role"] == "user"][-1]
         self.assertEqual(last_user["content"], "繼續")
+        blob = str(out)
+        self.assertNotIn("START_PREV_ACTION", blob)
         self.assertNotIn("<tool_call>", last_user["content"])
-        self.assertNotIn("START_PREV_ACTION", last_user["content"])
 
-        # pairing
         for i, m in enumerate(out):
             if m.get("role") == "tool":
                 self.assertEqual(out[i - 1]["role"], "assistant")
                 self.assertEqual(out[i - 1]["tool_calls"][0]["id"], m["tool_call_id"])
 
-    def test_flat_still_inline_and_hint(self):
-        M.CONFIG["enable_history_sanitization"] = True
-        M.CONFIG["tool_history_format"] = "flat"
-        M.CONFIG["sanitization_result_max_length"] = 20000
-        M.CONFIG["tool_usage_hint_file"] = "tool_hint.txt"
-
+    def test_disabled_passthrough(self):
+        M.CONFIG["enable_history_sanitization"] = False
         msgs = [
-            {"role": "user", "content": "查 uptime"},
             {"role": "assistant", "content": f"好\n{DETAILS}\n完成"},
         ]
         out = M.sanitize_request_messages([dict(m) for m in msgs])
-        self.assertFalse(any(m.get("role") == "tool" for m in out))
-        asst = next(m for m in out if m["role"] == "assistant")
-        self.assertIn("[START_PREV_ACTION]", asst["content"])
-        # hint appended to last user
-        user = next(m for m in out if m["role"] == "user")
-        self.assertIn("<tool_call>", user["content"])
+        self.assertEqual(len(out), 1)
+        self.assertIn("<details", out[0]["content"])
 
 
 class TestResponsesBuildContext(unittest.TestCase):
@@ -89,28 +98,18 @@ class TestResponsesBuildContext(unittest.TestCase):
                 "output": "晴天",
             },
         ]
-        payload, kind = build_previous_tool_context(items, fmt="structured", max_result_length=100)
+        payload, kind = build_previous_tool_context(items, max_result_length=100)
         self.assertEqual(kind, "messages")
         self.assertEqual(len(payload), 2)
         self.assertEqual(payload[0]["tool_calls"][0]["id"], "call_abc")
         self.assertEqual(payload[1]["tool_call_id"], "call_abc")
         self.assertEqual(payload[1]["content"], "晴天")
 
-    def test_flat_text_blocks(self):
-        items = [
-            {
-                "type": "function_call",
-                "call_id": "c1",
-                "id": "c1",
-                "name": "terminal",
-                "arguments": '{"command":"ls"}',
-            },
-            {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
-        ]
-        payload, kind = build_previous_tool_context(items, fmt="flat", max_result_length=100)
-        self.assertEqual(kind, "text_blocks")
-        self.assertTrue(payload[0].startswith("[START_PREV_ACTION]"))
-        self.assertIn("terminal", payload[0])
+    def test_no_fmt_kwarg(self):
+        # API no longer accepts fmt=
+        import inspect
+        sig = inspect.signature(build_previous_tool_context)
+        self.assertNotIn("fmt", sig.parameters)
 
 
 if __name__ == "__main__":

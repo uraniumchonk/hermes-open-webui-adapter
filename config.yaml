@@ -44,24 +44,11 @@ upstreams:
 auto_split_threshold: 0
 
 # ── History Sanitization (Anti-pollution) ──────────────────
-# Before forwarding requests, convert <details type="tool_calls"> tags
-# in assistant content to a safe format, breaking the pollution feedback loop.
+# Convert Open WebUI <details type="tool_calls"> history into
+# OpenAI-native assistant.tool_calls + role=tool messages.
 enable_history_sanitization: true
 # Result truncation length (adds "..." if exceeded)
 sanitization_result_max_length: 20000
-# History format:
-#   structured — OpenAI native tool role messages (recommended, no pollution)
-#   flat       — [START_PREV_ACTION] k:v format (prevents JSON pollution)
-#   legacy     — natural language description (legacy)
-tool_history_format: "structured"
-
-# ── Tool Usage Hint ────────────────────────────────────────
-# Append a tool usage hint at the end of the last user message
-# to prevent model attention dilution.
-#
-# This reads the content from a file (relative to this config file).
-# Leave empty or set to "" to disable.
-tool_usage_hint_file: "tool_hint.txt"
 
 # ── Conversation Compression ───────────────────────────────
 # When X-Hermes-Session-Id is present, Hermes Gateway loads full
