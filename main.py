@@ -246,9 +246,9 @@ def _strip_details_from_content(frame: str) -> str:
 # 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length, tool_history_format
 #
 # tool_history_format:
-#   legacy — 自然語言描述（舊版）
-#   flat   — [START_PREV_ACTION] k:v 格式（新版，防止 JSON 污染）
-#   → 實作在 tool_history_format.py 中
+#   structured — OpenAI native tool role messages（推薦，結構層消污染，見 tool_history_structured.py）
+#   flat       — [START_PREV_ACTION] k:v 格式（inline 文字替換，見 tool_history_format.py）
+#   legacy     — 自然語言描述（舊版）
 
 
 def sanitize_request_messages(
@@ -260,8 +260,11 @@ def sanitize_request_messages(
 
     Configurable via config.yaml's enable_history_sanitization toggle.
 
-    **Deterministic random**: each message uses its own content hash as seed,
-    ensuring consistent sanitization results for the same request (vLLM KV cache friendly).
+    Formats:
+      - structured: split <details> into assistant.tool_calls + role=tool messages
+        (skips tool_hint injection — model understands tool role natively)
+      - flat/legacy: inline text replacement + tool_hint injection
+        (deterministic seed per message content for KV-cache friendliness)
     """
     if not messages:
         return messages
@@ -270,6 +273,12 @@ def sanitize_request_messages(
     if not enabled:
         return messages
 
+    # ── structured: OpenAI native tool role ─────────────────
+    if fmt == "structured":
+        from tool_history_structured import sanitize_messages_structured
+        return sanitize_messages_structured(messages, CONFIG)
+
+    # ── flat / legacy: inline text replacement ──────────────
     total_details_cleaned = 0
     messages_cleaned = 0
     for msg in messages:
@@ -291,6 +300,7 @@ def sanitize_request_messages(
         )
 
     # ── Inject tool usage hint from file into the last user message ──
+    # Only for flat/legacy — structured mode returns early above.
     template = ""
     hint_file = CONFIG.get("tool_usage_hint_file", "")
     if hint_file:
