@@ -175,7 +175,7 @@ def segments_to_messages(
     def _flush_trailing_text() -> None:
         nonlocal pending_text
         if pending_text is not None and pending_text.strip():
-            messages.append({"role": "assistant", "content": pending_text.strip()})
+            messages.append({"role": "assistant", "content": pending_text})
         pending_text = None
 
     i = 0
@@ -198,10 +198,10 @@ def segments_to_messages(
         name = _clean_tool_name(info.get("tool_name", "unknown"))
         args_str = _args_to_json_string(info.get("args_obj"))
 
-        content = None
+        content = ""
         if pending_text is not None:
-            stripped = pending_text.strip()
-            content = stripped if stripped else None
+            # 保留原始文字（僅「純空白」時才視為無文字）；規格允許 "" 或 null
+            content = pending_text if pending_text.strip() else ""
             pending_text = None
 
         messages.append(
@@ -245,7 +245,7 @@ def convert_assistant_message(
     if not isinstance(msg, dict):
         return [msg]
 
-    if msg.get("tool_calls"):
+    if "tool_calls" in msg:
         return [msg]
 
     content = msg.get("content")
@@ -278,6 +278,9 @@ def sanitize_messages_structured(
 
     config = config or {}
     _, max_length, _ = _get_sanitization_config(config)
+    if "sanitization_result_max_length" not in config:
+        # API 規格：預設 20000（_get_sanitization_config 的預設是 2000）
+        max_length = 20000
 
     out: list = []
     tools_converted = 0
