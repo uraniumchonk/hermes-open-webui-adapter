@@ -154,6 +154,8 @@ async def handle_completions_request(
         async def generate():
             upstream_resp = None
             try:
+                # Prefer context-managed response so connection is always released.
+                # Keep explicit close paths for CancelledError / partial failure.
                 upstream_resp = await sess.post(
                     upstream_url, data=body, headers=fwd_headers
                 )
@@ -189,8 +191,7 @@ async def handle_completions_request(
                         yield chunk
             except asyncio.CancelledError:
                 logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
-                if upstream_resp is not None:
-                    upstream_resp.close()
+                raise
             except aiohttp.ServerDisconnectedError:
                 logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
             except aiohttp.ClientError as e:
@@ -202,6 +203,11 @@ async def handle_completions_request(
             finally:
                 if upstream_resp is not None and not upstream_resp.closed:
                     upstream_resp.close()
+                    # Release connection back to pool promptly (aiohttp best practice)
+                    try:
+                        await upstream_resp.release()
+                    except Exception:
+                        pass
 
         return StreamingResponse(
             generate(),
