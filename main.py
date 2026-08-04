@@ -903,9 +903,50 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     
     if result:
-        # result 放在標籤內，用 html.escape 避免 XSS
-        truncated = result[:5000] + ("..." if len(result) > 5000 else "")
-        inner += f"\n<result>{html.escape(truncated)}</result>"
+        # ── 多模態處理：偵測 _multimodal 信封包 ──
+        #
+        # 策略：使用字串前置檢查代替完整解析，避免對幾 MB 的 base64 數據
+        # 執行 json.loads / ast.literal_eval 導致效能問題或卡死。
+        #
+        # Hermes 回傳的 _multimodal 信封包格式：
+        #   {"_multimodal": True, "content": [...], "text_summary": "...", "meta": {...}}
+        #
+        # 只要 result 包含 "_multimodal" 且長度超過閾值（>10KB），
+        # 就判定為多模態信封包並直接替換成短提示。
+        
+        result_len = len(result)
+        multimodal_detected = False
+        
+        if result_len > 10240:
+            # 超大結果（>10KB）：只檢查前 512 字元是否包含 "_multimodal"
+            # 這足夠判斷是否為多模態信封包，且避免解析幾 MB 的 base64
+            if "_multimodal" in result[:512]:
+                multimodal_detected = True
+        elif "_multimodal" in result:
+            # 小結果：嘗試完整解析確認
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict) and parsed.get("_multimodal") is True:
+                    multimodal_detected = True
+            except (json.JSONDecodeError, ValueError):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(result)
+                    if isinstance(parsed, dict) and parsed.get("_multimodal") is True:
+                        multimodal_detected = True
+                except Exception:
+                    # 解析失敗但包含 "_multimodal" 字串 → 保守判定為多模態
+                    multimodal_detected = True
+        
+        if multimodal_detected:
+            # 多模態信封包：替換成簡短提示，避免 base64 污染上下文
+            # 模型已經在當輪"看到"圖片了，下一輪不需要再塞幾MB的base64
+            # 如果模型需要再看圖片，會自己重新調用 vision_analyze
+            inner += f"\n<result>圖片已從上下文移除（原始大小 {result_len/1024:.1f}KB）。想要再看圖片請再調用一次視覺工具即可。</result>"
+        else:
+            # 一般結果：用 html.escape 避免 XSS
+            truncated = result[:5000] + ("..." if len(result) > 5000 else "")
+            inner += f"\n<result>{html.escape(truncated)}</result>"
     
     return f'<details {attrs}>{inner}\n</details>'
 
