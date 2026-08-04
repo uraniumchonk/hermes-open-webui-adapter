@@ -874,8 +874,18 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
+    - **多模態處理**：基於 arguments 中的圖片欄位判斷，替換 base64 為簡短提示
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
+    
+    # ── 確保 arguments 是 dict（hermes.tool.progress 可能傳入 JSON 字串）─
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            arguments = None
+    elif not isinstance(arguments, dict):
+        arguments = None
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
@@ -903,13 +913,10 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     
     if result:
-        # ── 多模態處理：偵測 _multimodal 信封包 ──
+        # ── 多模態處理：基於 arguments 判斷是否為視覺工具 ──
         #
-        # 策略：使用字串前置檢查代替完整解析，避免對幾 MB 的 base64 數據
-        # 執行 json.loads / ast.literal_eval 導致效能問題或卡死。
-        #
-        # Hermes 回傳的 _multimodal 信封包格式：
-        #   {"_multimodal": True, "content": [...], "text_summary": "...", "meta": {...}}
+        # 優雅策略：檢查 arguments 中是否包含圖片相關欄位（image_url, image_path 等），
+        # 而非硬編碼工具名稱清單。這樣未來新增視覺工具時不需要修改此處。
         #
         # 注意：result 可能是 dict（直接從 hermes.tool.progress 事件來）
         # 或 str（已序列化的 JSON）。兩種都需處理。
@@ -917,60 +924,32 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         # 第一步：將 dict 轉為 str，並計算原始大小
         result_str = ""  # 初始化，避免 Pyright 未綁定警告
         result_len = 0
-        multimodal_detected = False
         
         if isinstance(result, dict):
-            # dict 格式：直接檢查 _multimodal key
-            if result.get("_multimodal") is True:
-                # 計算原始大小：序列化後的大小
-                try:
-                    result_str = json.dumps(result, ensure_ascii=False)
-                    result_len = len(result_str)
-                except (TypeError, ValueError):
-                    result_len = 0
-                multimodal_detected = True
-            else:
-                # 非多模態 dict：序列化後處理
-                try:
-                    result_str = json.dumps(result, ensure_ascii=False)
-                except (TypeError, ValueError):
-                    result_str = str(result)
-                result_len = len(result_str)
-                multimodal_detected = False
+            # dict 格式：序列化後計算大小
+            try:
+                result_str = json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError):
+                result_str = str(result)
+            result_len = len(result_str)
         else:
-            # str 格式：使用字串前置檢查
+            # str 格式：直接使用
             result_str = str(result) if not isinstance(result, str) else result
             result_len = len(result_str)
-            multimodal_detected = False
-            
-            if result_len > 10240:
-                # 超大結果（>10KB）：只檢查前 512 字元是否包含 "_multimodal"
-                if "_multimodal" in result_str[:512]:
-                    multimodal_detected = True
-            elif "_multimodal" in result_str:
-                # 小結果：嘗試完整解析確認
-                try:
-                    parsed = json.loads(result_str)
-                    if isinstance(parsed, dict) and parsed.get("_multimodal") is True:
-                        multimodal_detected = True
-                except (json.JSONDecodeError, ValueError):
-                    try:
-                        import ast
-                        parsed = ast.literal_eval(result_str)
-                        if isinstance(parsed, dict) and parsed.get("_multimodal") is True:
-                            multimodal_detected = True
-                    except Exception:
-                        # 解析失敗但包含 "_multimodal" 字串 → 保守判定為多模態
-                        multimodal_detected = True
         
-        if multimodal_detected:
-            # 多模態信封包：替換成簡短提示，避免 base64 污染上下文
+        # 圖片相關欄位清單
+        image_keys = {"image_url", "image_path", "path", "screenshot_path"}
+        
+        # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
+        has_image_arg = arguments is not None and image_keys & set(arguments.keys())
+        is_large_result = result_len > 10240
+        
+        if has_image_arg and is_large_result:
+            # 視覺工具的大結果：直接替換成簡短提示
             # 模型已經在當輪"看到"圖片了，下一輪不需要再塞幾MB的base64
-            # 如果模型需要再看圖片，會自己重新調用 vision_analyze
             inner += f"\n<result>圖片已從上下文移除（原始大小 {result_len/1024:.1f}KB）。想要再看圖片請再調用一次視覺工具即可。</result>"
         else:
             # 一般結果：用 html.escape 避免 XSS
-            # result_str 在上方所有分支都已定義
             truncated = result_str[:5000] + ("..." if result_len > 5000 else "")
             inner += f"\n<result>{html.escape(truncated)}</result>"
     
