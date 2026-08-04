@@ -37,13 +37,6 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
 import tool_history_format
-from tool_history_format import (
-    flatten_json,
-    format_tool_history_block,
-    _format_args_flat,
-    _format_result_flat,
-    sanitize_message_content,
-)
 from comp_mode import compress_tool_results
 import native_tool_context
 try:
@@ -243,12 +236,8 @@ def _strip_details_from_content(frame: str) -> str:
 # 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
 # 把 <details type="tool_calls"> 區塊轉換為安全的格式。
 #
-# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length, tool_history_format
-#
-# tool_history_format:
-#   structured — OpenAI native tool role messages（推薦，結構層消污染，見 tool_history_structured.py）
-#   flat       — [START_PREV_ACTION] k:v 格式（inline 文字替換，見 tool_history_format.py）
-#   legacy     — 自然語言描述（舊版）
+# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length
+# 只支援 structured 格式（OpenAI native tool role messages）
 
 
 def sanitize_request_messages(
@@ -258,78 +247,17 @@ def sanitize_request_messages(
     Scan and sanitize all messages in the request to prevent <details> pollution.
     Only processes assistant role content.
 
-    Configurable via config.yaml's enable_history_sanitization toggle.
-
-    Formats:
-      - structured: split <details> into assistant.tool_calls + role=tool messages
-        (skips tool_hint injection — model understands tool role natively)
-      - flat/legacy: inline text replacement + tool_hint injection
-        (deterministic seed per message content for KV-cache friendliness)
+    Always uses structured format (OpenAI native tool role messages).
     """
     if not messages:
         return messages
 
-    enabled, max_length, fmt = tool_history_format._get_sanitization_config(CONFIG)
+    enabled = tool_history_format._get_sanitization_config(CONFIG)[0]
     if not enabled:
         return messages
 
-    # ── structured: OpenAI native tool role ─────────────────
-    if fmt == "structured":
-        from tool_history_structured import sanitize_messages_structured
-        return sanitize_messages_structured(messages, CONFIG)
-
-    # ── flat / legacy: inline text replacement ──────────────
-    total_details_cleaned = 0
-    messages_cleaned = 0
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("content"):
-            original = msg["content"]
-            seed = hash(original) & 0xFFFFFFFF
-            sanitized, count = sanitize_message_content(
-                original, seed=seed, max_result_length=max_length, fmt=fmt
-            )
-            msg["content"] = sanitized
-            if count > 0:
-                messages_cleaned += 1
-                total_details_cleaned += count
-
-    if total_details_cleaned > 0:
-        logger.info(
-            f"[sanitization] Replaced {total_details_cleaned} <details> tag(s) "
-            f"across {messages_cleaned} message(s) from {len(messages)} total messages"
-        )
-
-    # ── Inject tool usage hint from file into the last user message ──
-    # Only for flat/legacy — structured mode returns early above.
-    template = ""
-    hint_file = CONFIG.get("tool_usage_hint_file", "")
-    if hint_file:
-        hint_path = CONFIG_PATH.parent / hint_file
-        try:
-            with open(hint_path, "r", encoding="utf-8") as f:
-                template = f.read().strip()
-        except Exception as e:
-            logger.warning(f"[tool_hint] Failed to read hint file {hint_path}: {e}")
-
-    if template:
-        # Find the last user message with non-empty content
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if msg.get("role") == "user" and msg.get("content"):
-                last_user_idx = i
-                break
-
-        if last_user_idx is not None:
-            # Append template to existing user message
-            messages[last_user_idx]["content"] += "\n\n" + template
-            logger.debug(f"[tool_hint] Appended hint from {hint_file} to last user message (index {last_user_idx})")
-        else:
-            # No user message found; create a new one at the end
-            messages.append({"role": "user", "content": template})
-            logger.debug(f"[tool_hint] Appended new user message with hint from {hint_file}")
-
-    return messages
+    from tool_history_structured import sanitize_messages_structured
+    return sanitize_messages_structured(messages, CONFIG)
 
 
 # ── Client-Side [comp] Compression ─────────────────────────

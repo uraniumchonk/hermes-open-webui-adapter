@@ -18,7 +18,7 @@ from tool_history_format import _extract_tool_info, _get_sanitization_config
 
 logger = logging.getLogger(__name__)
 
-# 與 tool_history_format.sanitize_message_content 對齊的三種 details 模式。
+# 與舊 sanitize 對齊的三種 details 模式（type=tool_calls / 仿冒 tag / catch-all）
 # 注意：原始 pattern1 為 `type=tool_calls`（無引號），對 Open WebUI 實際輸出
 # `type="tool_calls"`（帶引號）不匹配，會落到 pattern2/3（兩者都要求 <arguments>）。
 # 這裡放寬為「可選引號 + 可選空白」，讓帶引號 type 且缺少 <arguments> 的區塊
