@@ -50,9 +50,10 @@ enable_history_sanitization: true
 # Result truncation length (adds "..." if exceeded)
 sanitization_result_max_length: 20000
 # History format:
-#   flat   — [START_PREV_ACTION] k:v format (recommended, prevents JSON pollution)
-#   legacy — natural language description (legacy)
-tool_history_format: "flat"
+#   structured — OpenAI native tool role messages (recommended, no pollution)
+#   flat       — [START_PREV_ACTION] k:v format (prevents JSON pollution)
+#   legacy     — natural language description (legacy)
+tool_history_format: "structured"
 
 # ── Tool Usage Hint ────────────────────────────────────────
 # Append a tool usage hint at the end of the last user message
