@@ -8,7 +8,7 @@
 # See README.md for detailed documentation.
 
 # ── Server ─────────────────────────────────────────────────
-bind_host: "127.0.0.1"  # Localhost only, prevents external access
+bind_host: "0.0.0.0"  # Bind to all interfaces for remote access from Open WebUI
 bind_port: 9099
 
 # ── Tool Display Mode ──────────────────────────────────────
@@ -27,26 +27,21 @@ tool_mode: "enhance-v2"
 # Route table: path prefix → upstream Hermes Gateway address
 # Format: "port": "http://address:port"
 #
-# Default Hermes profiles (run `hermes profiles list` to see yours):
-#   30000: General chat
-#   30001: Code development expert
-#   30002: Data & research
-#   30003: Trading & markets
-#
-# You can add or remove freely — just match your Gateway setup!
-# If omitted, defaults to 30000-30003.
+# Profiles on this machine:
+#   30001 → coder profile (qwen-27b)
+#   30002 → coder-master profile (xai grok-4.5)
+#   30005 → family profile
 upstreams:
-  "30000": "http://127.0.0.1:30000"
   "30001": "http://127.0.0.1:30001"
   "30002": "http://127.0.0.1:30002"
   "30003": "http://127.0.0.1:30003"
+  "30004": "http://127.0.0.1:30004"
+  "30005": "http://127.0.0.1:30005"
 
 # ── Auto Split ─────────────────────────────────────────────
 # Auto-split threshold (characters), 0 to disable
 # Note: Conduit APP does not support session.split events
-############ experimental, may unable to work as expected. #################
 auto_split_threshold: 0
-############ experimental, may unable to work as expected. #################
 
 # ── History Sanitization (Anti-pollution) ──────────────────
 # Before forwarding requests, convert <details type="tool_calls"> tags

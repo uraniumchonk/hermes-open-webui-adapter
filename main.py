@@ -53,8 +53,11 @@ except ImportError:
     HAS_YAML = False
 
 # ── Logging ───────────────────────────────────────────────
+# Production default INFO. Set TOOL_FILTER_LOG_LEVEL=DEBUG for deep tracing.
+# DEBUG on a long-lived SSE proxy can retain huge format args and flood journald.
+_LOG_LEVEL = getattr(logging, os.environ.get("TOOL_FILTER_LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=_LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("tool-filter")
@@ -103,15 +106,25 @@ BIND_HOST = CONFIG.get("bind_host", "0.0.0.0")
 BIND_PORT = CONFIG.get("bind_port", 9099)
 
 # Port routing table: path prefix -> upstream base URL
-PORT_MAP: Dict[str, str] = {
+# 優先使用 config.yaml 的 upstreams，fallback 到硬編碼預設值
+_DEFAULT_PORT_MAP: Dict[str, str] = {
     "30000": "http://127.0.0.1:30000",
     "30001": "http://127.0.0.1:30001",
     "30002": "http://127.0.0.1:30002",
     "30003": "http://127.0.0.1:30003",
 }
 
+# 從 config.yaml 載入 upstreams（如果有的話）
+_config_upstreams = CONFIG.get("upstreams", {})
+if _config_upstreams:
+    PORT_MAP: Dict[str, str] = dict(_DEFAULT_PORT_MAP)
+    PORT_MAP.update(_config_upstreams)
+    logger.info(f"PORT_MAP loaded from config.yaml: {PORT_MAP}")
+else:
+    PORT_MAP = _DEFAULT_PORT_MAP
+
 # Default upstream if no port prefix matched
-DEFAULT_UPSTREAM = PORT_MAP["30000"]
+DEFAULT_UPSTREAM = PORT_MAP.get("30000", "http://127.0.0.1:30000")
 
 # ── Emoji Mapping ─────────────────────────────────────────
 
@@ -613,6 +626,19 @@ _session_cache: Dict[str, str] = {}
 # Use a dict instead of a single global to avoid race conditions between requests.
 _pending_session_markers: dict = {}
 
+# 防洩漏：session 指紋快取長期運行會無限增長，加上限並丟棄最舊的。
+_MAX_SESSION_CACHE = 5000
+_MAX_PENDING_MARKERS = 1000
+
+
+def _bounded_put(cache: dict, key: str, value, max_size: int) -> None:
+    """有序 dict 的 bounded insert：超過上限時丟棄最舊的 10%。"""
+    cache[key] = value
+    if len(cache) > max_size:
+        drop = list(cache.keys())[: max(1, len(cache) // 10)]
+        for k in drop:
+            cache.pop(k, None)
+
 
 def _session_isolation_enabled() -> bool:
     """Check if session isolation (marker mode) is enabled."""
@@ -815,11 +841,11 @@ def get_or_create_session_id(messages: list) -> str:
 
     # Store in cache keyed by original fingerprint
     original = _strip_timestamp_and_derive(messages)
-    _session_cache[original] = stamped_derived
+    _bounded_put(_session_cache, original, stamped_derived, _MAX_SESSION_CACHE)
 
     # Remember the marker so transform_stream can embed it in the first
     # assistant response.
-    _pending_session_markers[stamped_derived] = (original, timestamp)
+    _bounded_put(_pending_session_markers, stamped_derived, (original, timestamp), _MAX_PENDING_MARKERS)
     logger.info(f"[session] NEW session created: {original} → {stamped_derived}, marker pending")
 
     return stamped_derived
@@ -837,7 +863,7 @@ def update_session_id(messages: list, new_sid: str) -> None:
     """
     original = _strip_timestamp_and_derive(messages)
     if original and new_sid:
-        _session_cache[original] = new_sid
+        _bounded_put(_session_cache, original, new_sid, _MAX_SESSION_CACHE)
 
 
 def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> list:
@@ -1041,14 +1067,31 @@ class ToolCallBuffer:
     def __init__(self):
         # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments}
         self.active_tools: Dict[str, dict] = {}
-    
+        # 防洩漏：gateway 發了 running 但沒發 completed（agent 被打斷/上游斷線）時，
+        # entry 會永久留在 dict。上限 + TTL 確保長期運行不會無限增長。
+        self._max_tools = 500
+        self._ttl_seconds = 600  # 10 分鐘沒完成就當作孤兒清理
+
+    def _prune(self) -> None:
+        """清理過期 entry；超上限時丟棄最舊的。"""
+        now = time.monotonic()
+        stale = [tid for tid, st in self.active_tools.items()
+                 if now - st.get("_started", now) > self._ttl_seconds]
+        for tid in stale:
+            self.active_tools.pop(tid, None)
+        while len(self.active_tools) >= self._max_tools:
+            # dict 保持插入順序，pop 最舊的（在插入前執行，確保永不超過上限）
+            self.active_tools.pop(next(iter(self.active_tools)), None)
+
     def on_tool_running(self, tc_id: str, payload: dict) -> None:
         """工具開始執行，記錄狀態（不發送 running 卡片）。"""
+        self._prune()
         self.active_tools[tc_id] = {
             "tool": payload.get("tool", "unknown"),
             "emoji": payload.get("emoji", ""),
             "label": payload.get("label", payload.get("tool", "unknown")),
             "arguments": payload.get("arguments", {}),
+            "_started": time.monotonic(),
         }
     
     def on_tool_completed(self, tc_id: str, payload: dict, 
@@ -1127,7 +1170,13 @@ async def transform_stream(
 
     # 使用 bytes buffer 避免反覆 decode/encode
     buffer = b""
-    
+    # Hard cap: if upstream framing breaks (no \n\n), buffer must not grow without bound.
+    # 16MB is far above any legitimate single SSE frame (session_search ~235KB historically).
+    MAX_SSE_BUFFER = 16 * 1024 * 1024
+    # Soft RSS guard — log when process RSS exceeds this (does not kill; systemd MemoryMax does).
+    _rss_warn_bytes = 512 * 1024 * 1024
+    _last_rss_check = 0.0
+
     # 自動分割計數器
     accumulated_content = ""
     has_split = False
@@ -1146,6 +1195,31 @@ async def transform_stream(
     
     # ✅ 修復：追蹤是否已發送第一個有內容的 chunk，避免心跳干擾
     first_content_sent = False
+
+    def _maybe_log_rss() -> None:
+        nonlocal _last_rss_check
+        now = time.monotonic()
+        if now - _last_rss_check < 30.0:
+            return
+        _last_rss_check = now
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # VmRSS is in kB
+                        rss_kb = int(line.split()[1])
+                        rss_bytes = rss_kb * 1024
+                        if rss_bytes >= _rss_warn_bytes:
+                            logger.warning(
+                                f"[mem] high RSS={rss_kb} kB buffer_len={len(buffer)} "
+                                f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0} "
+                                f"heartbeat_count={heartbeat_count}"
+                            )
+                        else:
+                            logger.debug(f"[mem] RSS={rss_kb} kB buffer_len={len(buffer)}")
+                        break
+        except Exception:
+            pass
     
     # ✅ 防火牆優化：在開始讀取 upstream 前，先發送初始心跳強制連接建立
     # 學校防火牆/代理可能會緩衝小數據包，我們用多層策略確保連接不被卡住
@@ -1214,6 +1288,19 @@ async def transform_stream(
             break
 
         buffer += line
+        if len(buffer) > MAX_SSE_BUFFER:
+            logger.error(
+                f"[enhance-v2] SSE buffer exceeded {MAX_SSE_BUFFER} bytes "
+                f"(len={len(buffer)}); aborting stream to prevent host OOM. "
+                f"Likely broken upstream framing (missing \\n\\n)."
+            )
+            yield (
+                b'data: {"error":{"message":"SSE buffer overflow in tool filter",'
+                b'"type":"proxy_error","code":"sse_buffer_overflow"}}\n\n'
+            )
+            break
+
+        _maybe_log_rss()
 
         # Process complete SSE frames (terminated by \n\n)
         while b"\n\n" in buffer:
@@ -1455,6 +1542,47 @@ async def transform_stream(
 _http_session: Optional[aiohttp.ClientSession] = None
 
 
+# ── Memory Self-Protection ────────────────────────────────
+# 歷史教訓：Open WebUI 帶大量 tool 結果的對話歷史請求可以輕鬆吃掉數百 MB
+# （body 讀入 → json 解析 → sanitize 多份拷貝 → 重新序列化）。
+# MemoryMax=2G 只計 RSS 不計 swap-out，無限 swap thrashing 會讓進程凍結。
+# 這裡在請求入口主動檢查 RSS：逼近上限時立刻拒接 + gc，讓 Open WebUI 重試，
+# 而不是讓整個進程被 swap 拖死。systemd MemorySwapMax=256M 是最後防線。
+
+_MEM_GUARD_BYTES = 1300 * 1024 * 1024  # 1.3GB，留 700MB 給 MemoryMax=2G 緩衝
+MAX_REQUEST_BODY = 128 * 1024 * 1024   # 128MB 請求體上限（防超大歷史）
+_mem_guard_last_gc = 0.0
+
+
+def _rss_bytes() -> int:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _mem_guard_reject() -> bool:
+    """
+    記憶體壓力檢查。回傳 True 表示應該拒接請求（503）。
+    超過閾值時先 gc.collect() 一次，仍超過才拒接。
+    """
+    global _mem_guard_last_gc
+    if _rss_bytes() < _MEM_GUARD_BYTES:
+        return False
+    now = time.monotonic()
+    if now - _mem_guard_last_gc > 5.0:
+        _mem_guard_last_gc = now
+        import gc
+        collected = gc.collect()
+        logger.warning(f"[mem-guard] RSS exceeded {_MEM_GUARD_BYTES//(1024*1024)}MB, "
+                       f"gc.collect() freed {collected} objects")
+    return _rss_bytes() > _MEM_GUARD_BYTES
+
+
 async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
@@ -1513,7 +1641,31 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
     original_path = f"/{port_prefix}/{rest}"
     upstream_url = resolve_upstream(original_path)
 
+    # ── Memory self-protection: reject under pressure before reading body ──
+    if _mem_guard_reject():
+        return JSONResponse(
+            content={"error": {"message": "Proxy under memory pressure, retry later",
+                               "type": "proxy_error", "code": "memory_pressure"}},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
+    # ── Request body cap: refuse pathological request bodies ──
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
+
     body = await request.body()
+    if len(body) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
 
     # Build forwarded headers — include Hermes session headers for stateful mode
     fwd_headers = {}
@@ -1596,7 +1748,29 @@ async def proxy_default(request: Request, rest: str):
     original_path = f"/{rest}"
     upstream_url = resolve_upstream(original_path)
 
+    # ── Memory self-protection + body cap (same as proxy_with_transform) ──
+    if _mem_guard_reject():
+        return JSONResponse(
+            content={"error": {"message": "Proxy under memory pressure, retry later",
+                               "type": "proxy_error", "code": "memory_pressure"}},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
+
     body = await request.body()
+    if len(body) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
 
     # Build forwarded headers — include Hermes session headers for stateful mode
     fwd_headers = {}

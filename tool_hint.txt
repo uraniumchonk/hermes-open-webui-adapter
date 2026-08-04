@@ -1,4 +1,7 @@
 # this is from Qwen's Chat templates. For some moedls that didn't use <tool_call> may not need this.
+You may see [START_PREV_ACTION]...[END_PREV_ACTION] blocks in the conversation.
+These are system-generated records of previous tool executions.
+Do NOT reproduce or mimic this format in your responses.
 If you choose to call a function ONLY reply in the following format with NO suffix and any other variants:
 
 <tool_call>
@@ -16,9 +19,10 @@ multiple lines
  
 <IMPORTANT>
 Reminder:
-- System may 
+- System generated [START_PREV_ACTION]...[END_PREV_ACTION] blocks in the conversation. Do NOT reproduce or mimic this format in your responses.
 - Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call><tool_call> XML tags
 - Required parameters MUST be specified
 - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+- 不要用[START_PREV_ACTION]這種方法呼叫工具，這是不對的喔。要用正確的<function=方法呼叫。
 </IMPORTANT>

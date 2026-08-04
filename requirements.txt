@@ -1,3 +1,15 @@
-fastapi
-uvicorn
-httpx
+# Hermes Tool Card Enhancer Proxy — Dependencies
+# ================================================
+# Core web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# HTTP clients (upstream proxy + SSE streaming)
+aiohttp>=3.10.0
+httpx>=0.27.0
+
+# Config parsing (config.yaml)
+pyyaml>=6.0
+
+# SQLite async (native_tool_context.py — tool result persistence)
+aiosqlite>=0.20.0

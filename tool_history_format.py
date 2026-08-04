@@ -290,6 +290,14 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
     import html as _html
     import json as _json
 
+    # 防災難：模型模仿的 <details> tag 可能超大（無上限的 result）。
+    # regex + html.unescape + json.loads 對巨大字串會吃爆記憶體。
+    # 截斷後處理：保留前半段（name/arguments 通常在 tag 開頭），
+    # result 部分截斷到上限即可，損失可接受。
+    MAX_TAG_PROCESS_LEN = 512 * 1024  # 512KB
+    if len(tag) > MAX_TAG_PROCESS_LEN:
+        tag = tag[:MAX_TAG_PROCESS_LEN] + "</details>"
+
     name_match = _re.search(r'name=([^ >]+)', tag, flags=_re.IGNORECASE)
     tool_name = _html.unescape(name_match.group(1)) if name_match else "unknown"
 
@@ -390,6 +398,11 @@ def sanitize_message_content(content: str | None, seed: int = 0, max_result_leng
     import re as _re
 
     if not content:
+        return (content, 0)
+
+    # 快速路徑：絕大多數訊息不含 <details>，直接返回，
+    # 避免 3 個 regex 全量掃描 + 多次字串複製（大訊息時省下大量記憶體與 CPU）。
+    if "<details" not in content:
         return (content, 0)
 
     total_replacements = 0
