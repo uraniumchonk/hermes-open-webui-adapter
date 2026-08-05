@@ -49,11 +49,28 @@ except ImportError:
 # Production default INFO. Set TOOL_FILTER_LOG_LEVEL=DEBUG for deep tracing.
 # DEBUG on a long-lived SSE proxy can retain huge format args and flood journald.
 _LOG_LEVEL = getattr(logging, os.environ.get("TOOL_FILTER_LOG_LEVEL", "INFO").upper(), logging.INFO)
+
+# ── 雙重日誌：console + file ──
+# 將關鍵錯誤和除錯資訊寫入 .log 文件，不依賴 systemd journal
+LOG_FILE = Path(__file__).parent / "hermes_tool_filter.log"
+
+# Console handler (systemd journal)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(_LOG_LEVEL)
+console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+# File handler (persistent log for debugging)
+file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)  # 文件記錄所有 DEBUG 級別
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+
+# Root logger
 logging.basicConfig(
-    level=_LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG,
+    handlers=[console_handler, file_handler],
 )
 logger = logging.getLogger("tool-filter")
+logger.setLevel(logging.DEBUG)
 
 # ── Configuration ──────────────────────────────────────────
 
@@ -946,6 +963,20 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         has_image_arg = arguments is not None and image_keys & set(arguments.keys())
         is_large_result = result_len > 10240
         
+        # DEBUG: 記錄 arguments 狀態以便排查
+        if is_large_result and not has_image_arg:
+            logger.warning(
+                f"[multimodal-debug] Large result ({result_len} bytes) but has_image_arg=False! "
+                f"arguments type={type(arguments).__name__}, keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
+                f"tool_name={tool_name}"
+            )
+        elif is_large_result and has_image_arg:
+            logger.info(
+                f"[multimodal-debug] Large result ({result_len} bytes) detected as multimodal! "
+                f"arguments keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
+                f"tool_name={tool_name}"
+            )
+        
         if has_image_arg and is_large_result:
             # 視覺工具的大結果：直接替換成簡短提示
             # 模型已經在當輪"看到"圖片了，下一輪不需要再塞幾MB的base64
@@ -1255,6 +1286,12 @@ async def transform_stream(
             line = await asyncio.wait_for(reader.readline(), timeout=1.0)
         except asyncio.TimeoutError:
             # 超時了，繼續循環，下次心跳會發送
+            # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
+            if not first_content_sent and len(buffer) > 0:
+                logger.warning(
+                    f"[readline-debug] TIMEOUT but buffer_len={len(buffer)}, "
+                    f"buffer_preview={buffer[:200]!r}, first_content_sent={first_content_sent}"
+                )
             continue
         except Exception as e:
             # readline() 可能丟出 exception（例如 client 斷開連線）
@@ -1264,6 +1301,14 @@ async def transform_stream(
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
             raise
+
+        # DEBUG: 記錄所有讀取的原始行（前 100 行）
+        if heartbeat_count < 100:
+            line_preview = line[:100] if line else b""
+            logger.debug(
+                f"[readline-debug] READ line_len={len(line)}, preview={line_preview!r}, "
+                f"buffer_len={len(buffer)}, first_content={first_content_sent}"
+            )
 
         # Empty line means end of connection — LOG THIS!
         if not line:
