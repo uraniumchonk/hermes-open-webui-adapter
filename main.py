@@ -937,8 +937,10 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
             result_str = str(result) if not isinstance(result, str) else result
             result_len = len(result_str)
         
-        # 圖片相關欄位清單
-        image_keys = {"image_url", "image_path", "path", "screenshot_path"}
+        # 圖片相關欄位清單（包含單數/複數形式）
+        image_keys = {"image_url", "image_urls", "image_path", "image_paths", 
+                      "path", "paths", "screenshot_path", "screenshot_paths",
+                      "images", "image"}
         
         # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
         has_image_arg = arguments is not None and image_keys & set(arguments.keys())
