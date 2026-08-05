@@ -174,21 +174,43 @@ async def handle_completions_request(
                         update_session_id(req_json.get("messages", []), new_sid)
                         logger.info(f"[session] Updated cache: {hermes_sid[:8]}... → {new_sid[:8]}...")
                 
-                # ✅ Native Passthrough: 使用新的 transform_stream with SQLite
-                if use_native:
-                    db = native_tool_context.get_tool_context_db()
-                    async for chunk in native_tool_context.native_passthrough_transform_stream(
-                        upstream_resp.content, model, completion_id, created_ts,
-                        upstream_port, hermes_sid, db, capture_notifications=True,
-                    ):
-                        yield chunk
-                else:
-                    # Standard enhance-v2 mode
-                    async for chunk in transform_stream(
-                        upstream_resp.content, model, completion_id, created_ts,
-                        upstream_port, strip_details, hermes_sid,
-                    ):
-                        yield chunk
+                # ✅ 關鍵修復：使用 queue 解耦讀取和寫入，避免 backpressure
+                # 當下游客戶端讀取慢時，yield 會阻塞，但讀取任務在背景運行
+                import asyncio
+                queue = asyncio.Queue(maxsize=1000)  # 限制記憶體使用
+                read_task = None
+                
+                async def reader_task():
+                    """背景任務：持續從 upstream 讀取並轉換"""
+                    try:
+                        if use_native:
+                            db = native_tool_context.get_tool_context_db()
+                            async for chunk in native_tool_context.native_passthrough_transform_stream(
+                                upstream_resp.content, model, completion_id, created_ts,
+                                upstream_port, hermes_sid, db, capture_notifications=True,
+                            ):
+                                await queue.put(chunk)
+                        else:
+                            async for chunk in transform_stream(
+                                upstream_resp.content, model, completion_id, created_ts,
+                                upstream_port, strip_details, hermes_sid,
+                            ):
+                                await queue.put(chunk)
+                        # 標記完成
+                        await queue.put(None)
+                    except Exception as e:
+                        logger.error(f"[queue-reader] Error: {type(e).__name__}: {e}")
+                        await queue.put(None)
+                
+                # 啟動背景讀取任務
+                read_task = asyncio.create_task(reader_task())
+                
+                # 從 queue 讀取並 yield - 這不會阻塞 upstream 讀取
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:  # 完成標記
+                        break
+                    yield chunk
             except asyncio.CancelledError:
                 logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
                 raise

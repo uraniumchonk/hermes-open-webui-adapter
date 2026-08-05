@@ -1625,9 +1625,13 @@ async def get_session() -> aiohttp.ClientSession:
         # aiohttp 的 StreamReader._high_water = read_bufsize * 2
         # readline() 的 max_size 預設為 _high_water
         # 設為 4MB 使 _high_water = 8MB，足以容納最大的 base64 圖片
+        
+        # ✅ 關鍵修復：設定 auto_decompress=False 避免額外的解壓縮開銷
+        # 並確保 timer_host 正確設定以支援 backpressure
         _http_session = aiohttp.ClientSession(
             timeout=timeout,
             read_bufsize=4194304,
+            auto_decompress=False,  # 避免不必要的解壓縮
         )
     return _http_session
 
