@@ -1223,6 +1223,11 @@ async def transform_stream(
     initial_wait_heartbeat = time.monotonic()
     initial_wait_interval = 0.5  # 初始等待階段每 0.5 秒發送心跳
     
+    # ✅ 預建心跳 chunk 模板（避免每次重複格式化）
+    # 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
+    # SSE comment (:) 不被某些客戶端計入 idle timer，導致斷線
+    _heartbeat_chunk_tpl = b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}  \n\n'
+    
     # 主循環
     while True:
         # ✅ 防火牆優化：在等待第一塊內容時使用更短的心跳間隔
@@ -1231,18 +1236,17 @@ async def transform_stream(
         # 心跳檢查
         elapsed = time.monotonic() - last_heartbeat
         if elapsed >= current_heartbeat_interval:
+            heartbeat_count += 1
+            last_heartbeat = time.monotonic()
+            tool_just_completed = False
+            
+            # ✅ 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
+            yield _heartbeat_chunk_tpl % (
+                completion_id.encode(), created, model.encode()
+            )
+            
             if not first_content_sent:
-                # 還在等待第一塊內容，發送 SSE comment 保持連接活躍
-                heartbeat_count += 1
-                yield b': keepalive-waiting-first-chunk\n\n'
-                last_heartbeat = time.monotonic()
                 logger.debug(f"[firewall-optimization] Sent keepalive while waiting for first chunk (count={heartbeat_count})")
-            elif elapsed >= heartbeat_interval:
-                # 正常心跳（第一個 content 之後）
-                heartbeat_count += 1
-                yield b': keepalive\n\n'
-                last_heartbeat = time.monotonic()
-                tool_just_completed = False
 
         # 非阻塞讀取 — 使用 asyncio.wait_for 確保不會永久阻塞
         try:
@@ -1368,8 +1372,7 @@ async def transform_stream(
                             # Tool completed 後立即發送多個 nudge（不阻塞）
                             # 確保 Open WebUI 的 idle timer 被重置
                             for i in range(3):
-                                yield b': keepalive-post-tool\n\n'
-                                yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n' % (
+                                yield _heartbeat_chunk_tpl % (
                                     completion_id.encode(), created, model.encode()
                                 )
                             # 發送可見的 thinking chunk，讓 Open WebUI 知道還在處理
@@ -1571,13 +1574,13 @@ async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        # read_bufsize: session_search 等工具可能回傳超大 SSE frame (>200KB)
+        # read_bufsize: vision_analyze 回傳的 base64 圖片可達 3-4MB
         # aiohttp 的 StreamReader._high_water = read_bufsize * 2
         # readline() 的 max_size 預設為 _high_water
-        # 設為 512KB 使 _high_water = 1MB，足以容納最大的 tool result
+        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 base64 圖片
         _http_session = aiohttp.ClientSession(
             timeout=timeout,
-            read_bufsize=524288,
+            read_bufsize=4194304,
         )
     return _http_session
 
