@@ -1,550 +1,251 @@
-# Hermes Tool Filter v2.0.0
+# Hermes Tool Filter
 
-**Transparent SSE proxy that makes Hermes tool calls render correctly in any client**
+Transparent SSE proxy for Hermes Gateway **Chat Completions** (`/v1/chat/completions`).
+Renders tool cards in Open WebUI and feeds tool history back to the model without pollution.
 
-<p align="center">
-  English · <a href="README.zh-TW.md">繁體中文</a>
-</p>
+English · [繁體中文](README.zh-TW.md)
 
-<p align="center">
-  <a href="https://github.com/fastapi/fastapi"><img src="https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Version-2.0.0-brightgreen?style=flat-square"></a>
-</p>
-
-> **Solves**: Hermes Gateway tool cards not rendering in Open WebUI / Conduit APP, and tool results being lost from conversation context — causing model amnesia.
+> Chat Completions only. `/v1/responses` is out of scope.
 
 ---
 
-## 🌟 Highlights
+## Download
 
-- ⚡ **enhance-v2 mode** — Real-time streaming + complete `<details>` child-element format, fully compatible with OpenWebUI
-- 🏢 **Multi-profile routing** — One proxy for multiple Gateway profiles (Chatting / Coder / Analyst / Trader)
-- 🧹 **History sanitization** — Anti-pollution: converts `<details>` tags in conversation history to natural language (19 templates), preventing the model from mimicking HTML output
-- 📡 **Dual handler** — Separate handlers for `/v1/chat/completions` and `/v1/responses`, with automatic tool-result injection for stateful Responses API
-- 🔧 **One-click patch** — Includes auto-apply patch + verification script for Hermes API Server
-- 📦 **Zero state** — No database, config-driven via `config.yaml`
+Repo: https://github.com/uraniumchonk/hermes-open-webui-adapter
 
----
+| 你要什麼 | 抓哪個 | 下載 / clone |
+|----------|--------|----------------|
+| **現在（structured only）** flat 已刪 | 分支 `main` 或 `dev-0.10+` | [ZIP main](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/main.zip) · [ZIP dev-0.10+](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/dev-0.10+.zip) |
+| **還要 flat**（可切 `structured` / `flat`） | 分支 **`flat-history`**（= `877fdb7`，刪 flat 前最後狀態；凍結，不再演進） | [ZIP flat-history](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/flat-history.zip) · [瀏覽分支](https://github.com/uraniumchonk/hermes-open-webui-adapter/tree/flat-history) |
 
-## Table of Contents
+同一點也打了 tag `v2.0.0-dual-history`（內容同 `flat-history`）：
+[ZIP tag](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/tags/v2.0.0-dual-history.zip)
 
-- [The Problem: Tool Context Loss](#the-problem-tool-context-loss)
-- [The Solution](#the-solution)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [How It Works](#how-it-works)
-- [Features](#features)
-- [History Sanitization (Anti-Pollution)](#history-sanitization-anti-pollution)
-- [Responses API Support](#responses-api-support)
-- [Systemd Service](#systemd-service)
-- [🔧 Hermes API Server Patch Guide](#-hermes-api-server-patch-guide)
-- [Troubleshooting](#troubleshooting)
-- [Technical Details](#technical-details)
+```bash
+# 現在（structured only）
+git clone -b main https://github.com/uraniumchonk/hermes-open-webui-adapter.git
 
----
-
-## The Problem: Tool Context Loss in Open WebUI
-
-When using **Hermes Agent as a server-side tool executor** through Open WebUI, the model experiences **complete amnesia** — it forgets tool execution results after the tool loop finishes. The model cannot reference previous tool outputs, leading to confused behavior and errors.
-
-### Evidence: Token Count Discrepancy
-
-When a tool loop runs, the prompt_tokens during the loop increases significantly (tool results are included internally). However, when the user sends a new message after the tool loop completes, the prompt_tokens drops back to near the original count — proving tool results were **not** persisted in the conversation history.
-
-**Example:**
-
-| Step | Description | prompt_tokens |
-|------|-------------|---------------|
-| 1 | Initial message | ~18,301 |
-| 2 | Tool loop (internal) | ~21,240 (+2,939) |
-| 3 | New message (after tool loop) | ~18,698 |
-
-- **Expected at step 3**: ~21,240+ tokens (tool results in history)
-- **Actual at step 3**: ~18,698 — tool results were **NOT** in the conversation history
-
-This proves Open WebUI reconstructed the conversation **without tool results**, causing the model to lose all context from tool execution.
-
-### Root Cause: A Broken Chain
-
-```
-Hermes Gateway API Server
-  │
-  │ ✗ Problem 1: Never emits standard OpenAI tool_calls delta
-  │             Only sends custom hermes.tool.progress SSE events
-  │ ✗ Problem 2: completed event does NOT include the tool result
-  │             (function_result exists but is never added to payload)
-  │
-  ▼
-hermes_tool_filter
-  │
-  │ ✗ Problem 3: enhance-v2 mode was unimplemented (fell back to passthrough)
-  │ ✗ Problem 4: Even enhance mode couldn't get results (due to Problem 2)
-  │             final_result = parsed_json.get("result", "") ← always empty
-  │
-  ▼
-Open WebUI
-  │
-  │ ✗ Problem 5: Receives assistant message with only final text
-  │             Tool information never enters conversation history
-  │ ✗ Problem 6: Unpaired tool_use/tool_result messages are discarded
-  │
-  ▼
-Next request
-  │
-  │ ✗ Problem 7: Open WebUI sends back messages WITHOUT tool results
-  │             Model has zero visibility into previous tool execution
-  │
-  ▼
-🧠💥 Model amnesia!
+# 需要 flat
+git clone -b flat-history https://github.com/uraniumchonk/hermes-open-webui-adapter.git
+cd hermes-open-webui-adapter
+# config.yaml → tool_history_format: "flat"   # 或 "structured"
 ```
 
-### Detailed Breakdown
-
-**Layer 1 — Hermes Gateway API Server** (`gateway/platforms/api_server.py`):
-
-The API server runs a full agent loop internally (correctly maintaining conversation history with tool results). However, its SSE output has two critical gaps:
-
-1. **No standard `tool_calls` delta**: It doesn't emit `delta.tool_calls` or `role: "tool"` messages — only custom `hermes.tool.progress` events.
-2. **Missing result in completed event**: The `_on_tool_complete` callback receives `function_result` but never includes it:
-   ```python
-   ("__tool_progress__", {
-       "tool": function_name,
-       "toolCallId": tool_call_id,
-       "status": "completed",       # ← no "result" field!
-   })
-   ```
-
-**Layer 2 — hermes_tool_filter** (`main.py`):
-
-Configured as `enhance-v2` but code only checked `TOOL_MODE == "enhance"`, so it was effectively passthrough. Even in enhance mode, `result` was always empty.
-
-**Layer 3 — Open WebUI**:
-
-Receives an assistant message with only the final response text. Without standard tool messages in the stream, nothing gets stored. When the user sends a new message, the reconstructed history has no tool context.
-
-**✅ Verification: Hermes Gateway internally is correct.** Hermes' internal KV cache confirms tool messages and results are properly maintained during the agent loop — the issue is purely in the SSE output pipeline.
-
-The issue is in the **SSE transformation pipeline**, not in Hermes itself.
+`61a58dc` 起 main runtime 只留 structured；現在碼寫 `flat` 會 warning 後 fallback。
 
 ---
 
-## The Solution
+## Problem
 
-Hermes Tool Filter bridges the gap by converting Hermes' custom SSE format into a format Open WebUI can parse, render, and persist.
-
-**enhance-v2 mode** (default, recommended):
-
-```html
-<!-- After enhance-v2 transformation: -->
-<details type="tool_calls" done="true" name="terminal">
-<summary>✅ 💻 echo hello</summary>
-<arguments>{"tool_name": "terminal", "command": "echo hello"}</arguments>
-<result>{"output": "hello", "exit_code": 0, "error": null}</result>
-</details>
-```
-
-- `<summary>` — Tool name + emoji for visual identification
-- `<arguments>` — Full JSON with `tool_name` + parameters (model can identify the tool)
-- `<result>` — Tool execution output
-
-**enhance mode**: Filters intermediate states, injects `done="true"` tag on completion.
-
-**passthrough mode**: Direct passthrough for Hermes-compatible clients.
-
-**strip mode**: Removes `<details>`, replaces with plain Markdown (legacy).
+Hermes runs a full tool loop internally, but SSE only emits `hermes.tool.progress`.
+Open WebUI stores tools as HTML `<details>` inside assistant text. Next turn that HTML
+is sent back as “assistant output” → model amnesia or mimicry.
 
 ---
 
 ## Architecture
 
 ```
-User Browser
-    │
-    ▼
-Open WebUI (30010)
-    │ POST http://127.0.0.1:9099/30001/v1/chat/completions
-    │ POST http://127.0.0.1:9099/30001/v1/responses
-    ▼
-hermes_tool_filter (9099)
-    │ completions_handler.py  ← /v1/chat/completions (enhance-v2 + sanitization)
-    │ responses_handler.py    ← /v1/responses (tool injection + SSE passthrough)
-    │ Routes: /30001/v1/* → http://127.0.0.1:30001/v1/*
-    ▼
-Hermes Gateway API Server (30001)
-    │ aiohttp-based, OpenAI-compatible endpoint
-    │ Runs full agent loop with tool execution
-    ▼
-vLLM (backend)
+Open WebUI  →  hermes_tool_filter :9099  →  Hermes Gateway :3000x  →  model
+                 enhance-v2 out
+                 history sanitize in
 ```
 
-### Request Flow
-
-1. **Open WebUI** → `hermes_tool_filter` (port 9099)
-2. **Proxy** → **Hermes Gateway** (port 30000+)
-3. **Gateway** executes tool loop (full history maintained internally)
-4. **Gateway** → SSE stream → **Proxy**
-5. **Proxy** transforms format → **Open WebUI**
-6. **Open WebUI** stores to local database
-7. User sends new message → history reconstructed with tool context
-
-### Dual Handler Design
-
-The proxy uses two separate handlers for different API formats:
-
-| Handler | Path | Features |
-|---------|------|----------|
-| `completions_handler.py` | `/v1/chat/completions` | enhance-v2 SSE transform, history sanitization |
-| `responses_handler.py` | `/v1/responses` | Tool-result injection, SSE passthrough/convert |
+Open WebUI Base URL: `http://127.0.0.1:9099/<port>/v1`
 
 ---
 
-## Quick Start
+## Quick start
 
 ```bash
-git clone https://github.com/uraniumchonk/hermes-open-webui-adapter.git
-cd hermes-open-webui-adapter
 pip install -r requirements.txt
+# edit upstreams in config.yaml
+cd /path/to/hermes-agent
+git apply /path/to/hermes_tool_filter/patches/api_server_chat_completions_all.patch
+git apply /path/to/hermes_tool_filter/patches/prompt_builder_api_server_hint.patch
+# restart gateway, then:
 python main.py
 ```
 
-Service starts on `http://0.0.0.0:9099`
+---
 
-Set Open WebUI's API Base URL to:
+## 兩個歷史範本（History templates）
 
+Open WebUI 存的是 `<details type="tool_calls">`。轉發給 Gateway 前，filter 必須改寫。
+**只有兩種寫法**——config 鍵 `tool_history_format`：
+
+### 範本 1 — `structured`（native tool role，推薦 / 目前 runtime）
+
+拆成真正的 OpenAI messages。模型經 `chat_template` 看到的是 `<|im_start|>tool`，
+不是「assistant 自己講了一段怪文字」。
+
+**需要 Hermes patch**：`api_server_chat_completions_all.patch`（保留 `role=tool` + `tool_calls`）。
+
+```json
+[
+  {
+    "role": "assistant",
+    "content": "讓我查一下。",
+    "tool_calls": [{
+      "id": "call_htf_a1b2",
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "arguments": "{\"query\": \"BTC price\"}"
+      }
+    }]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_htf_a1b2",
+    "name": "web_search",
+    "content": "{\"price\": 64000}"
+  },
+  {
+    "role": "assistant",
+    "content": "現在大約 64000。"
+  }
+]
 ```
-http://127.0.0.1:9099/30000/v1
+
+```yaml
+tool_history_format: "structured"
+enable_history_sanitization: true
+sanitization_result_max_length: 20000
 ```
+
+### 範本 2 — `flat`（塞進同一條 assistant content，舊 workaround）
+
+不拆 role，把結果改寫後**仍放在 assistant 文字裡**，外加 hint 叫模型別模仿。
+不需 tool-role patch，但結構資訊丟失，長對話仍可能污染。
+
+**現在的 main 已沒有 flat runtime**（`61a58dc` 刪除）。  
+要用 flat → 分支 **[flat-history](https://github.com/uraniumchonk/hermes-open-webui-adapter/tree/flat-history)**  
+（[ZIP](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/flat-history.zip)，= `877fdb7`）。
+
+```text
+讓我查一下。
+
+[START_PREV_ACTION]
+[ACTION_TYPE]
+web_search
+[ACTION_ARG]
+query: BTC price
+[RESULT]
+price: 64000
+[END_PREV_ACTION]
+
+現在大約 64000。
+```
+
+```yaml
+tool_history_format: "flat"
+enable_history_sanitization: true
+sanitization_result_max_length: 20000
+tool_usage_hint_file: "tool_hint.txt"   # flat 才需要
+```
+
+| | structured | flat |
+|--|------------|------|
+| 模型看到的 role | `assistant` + `tool` | 只有 `assistant` 長文 |
+| 污染 / 模仿 | 結構層隔開 | 靠 hint，仍可能學 |
+| Gateway patch | **必裝** tool-role + result | 只要 SSE result 即可 |
+| 現況 | **唯一 runtime 路徑** | git 歷史（≤877fdb7） |
+
+出站（Gateway→UI）兩邊相同：enhance-v2 注入 `<details>` tool card。差別只在**下一輪入站**怎麼還原歷史。
 
 ---
 
-## Configuration
+## Config（需改在上）
 
-Edit `config.yaml`:
-
-- **tool_mode** — `enhance-v2` (default, recommended) / `enhance` / `passthrough` / `strip`
-- **auto_split_threshold** — Stream auto-split threshold (characters, `0` = disabled)
-- **bind_host / bind_port** — Listen address and port
-- **upstreams** — Flexible routing table (see below)
-
-Environment variables override config.yaml (`TOOL_MODE`, `BIND_PORT`, `BIND_HOST`, `AUTO_SPLIT_THRESHOLD`).
-
-### Upstream Routing (Configurable)
-
-Routing is fully configurable via `config.yaml` — no code changes needed to add or remove profiles:
+穩定對照：`git show 877fdb7:config.yaml`
 
 ```yaml
+# 必改
 upstreams:
-  "30000": "http://127.0.0.1:30000"
   "30001": "http://127.0.0.1:30001"
   "30002": "http://127.0.0.1:30002"
-  "30003": "http://127.0.0.1:30003"
+  "30005": "http://127.0.0.1:30005"
+
+# 常用 — 選一個歷史範本（見上）
+tool_history_format: "structured"
+enable_history_sanitization: true
+sanitization_result_max_length: 20000
+tool_mode: "enhance-v2"
+
+# 很少改
+bind_host: "0.0.0.0"
+bind_port: 9099
+auto_split_threshold: 0
+compression_mode: "disabled"
+session_isolation_mode: "disabled"
 ```
 
-Each key is a path prefix, each value is the upstream Hermes Gateway URL. Common examples:
+完整註解版：`config.yaml` / `config-zh.yaml`。
 
-- `30000` → General-purpose chat
-- `30001` → Code specialist
-- `30002` → Data & research
-- `30003` → Trading & markets
+Env：`TOOL_MODE` `BIND_PORT` `BIND_HOST` `AUTO_SPLIT_THRESHOLD`。
 
-To view your actual profiles: `hermes profiles list`. Simply add or remove entries in `config.yaml` to match your setup. If `upstreams` is omitted, the four defaults above are used automatically.
+Gateway `.env`：`API_SERVER_ENABLED=true`、`API_SERVER_PORT` 對上 upstreams key、`API_SERVER_KEY=...`。
 
-### Hermes Gateway Configuration
+---
 
-The proxy routes to Hermes Gateway instances. Each Gateway profile has its own `.env` file — location depends on how Hermes was installed:
+## Hermes patches
 
-```
-/opt/hermes/profiles/<PROFILE_NAME>/.env     # System-wide install
-~/.hermes/profiles/<PROFILE_NAME>/.env       # User-level install
-```
+全部在 `patches/`（只這兩份）：
 
-For example, a profile named `chatting` would be at `/opt/hermes/profiles/chatting/.env` or `~/.hermes/profiles/chatting/.env`. Key settings:
+| Patch | 用途 |
+|-------|------|
+| `api_server_chat_completions_all.patch` | SSE `arguments`+`result`；Chat Completions 保留 tool role |
+| `prompt_builder_api_server_hint.patch` | API server 允許 Markdown |
 
 ```bash
-# Enable the API server
-API_SERVER_ENABLED=true
+cd ~/.hermes/hermes-agent
+git apply /path/to/hermes_tool_filter/patches/api_server_chat_completions_all.patch
+git apply /path/to/hermes_tool_filter/patches/prompt_builder_api_server_hint.patch
 
-# Gateway port — must match the port in your upstreams config
-API_SERVER_PORT=30000
-
-# API key — used to authenticate requests
-API_SERVER_KEY=sk_YOUR_CUSTOM_KEY
+grep -c '"result": result_str' gateway/platforms/api_server.py       # >0
+grep -c 'OpenAI-native tool result' gateway/platforms/api_server.py  # >0
+grep -c 'Markdown is allowed' agent/prompt_builder.py                # >0
 ```
 
-> **Important:** The `API_SERVER_PORT` value must correspond to a port entry in your `upstreams` config. For example, if `API_SERVER_PORT=30001`, your upstreams must include `"30001": "http://127.0.0.1:30001"`.
-
-When Open WebUI connects, set the API Base URL to `http://127.0.0.1:9099/<PORT>/v1` and the API key to the Gateway's `API_SERVER_KEY`.
+`hermes update` 後重套。行號飄了就從 working tree 重匯 diff 蓋掉 patch 檔。
 
 ---
 
-## How It Works
-
-1. Client sends request to proxy (Port 9099)
-2. Proxy forwards to the corresponding Hermes Gateway based on path
-3. Gateway returns SSE stream (with `hermes.tool.progress` events)
-4. Proxy parses and transforms to standard `<details>` format in real-time
-5. Returns clean stream to client
-
----
-
-## Features
-
-- 🔄 **Format conversion** — Hermes custom format → standard client-renderable format
-- 🎛️ **Four processing modes** — enhance-v2 (default), enhance, passthrough, strip
-- 🏢 **Multi-tenant routing** — One proxy, multiple Gateway profiles
-- 🧹 **History sanitization** — 19 natural language templates across 5 tool categories, deterministic randomness for vLLM KV cache
-- 📡 **Dual handler** — Separate handlers for Chat Completions and Responses API
-- 💉 **Tool-result injection** — Automatic injection for stateful Responses API (dual-path: native + proxy)
-- 📋 **Complete tool info** — Tool name, arguments, and results (child element format)
-- ⚙️ **Config-driven** — Centralized management, no code changes needed
-
----
-
-## History Sanitization (Anti-Pollution)
-
-**Problem:** The `<details>` tags injected by enhance-v2 are stored as plain text in Open WebUI's conversation history. On the next request, the model sees these HTML tags in its prompt and starts mimicking them — outputting `<details>`, `<summary>`, `<arguments>`, `<result>` as part of its response. This creates a **pollution feedback loop** that gets worse over time.
-
-**Solution:** Before forwarding requests to the upstream Gateway, the proxy scans all assistant messages and replaces `<details>` blocks with natural language descriptions.
-
-### How It Works
-
-1. Intercept incoming `messages` array
-2. For each `role: "assistant"` message, find `<details type="tool_calls">` blocks
-3. Extract tool name, arguments, and result from the block
-4. Replace the block with a natural language sentence
-5. Forward the cleaned request to the Gateway
-
-### Example
-
-**Before sanitization (polluted):**
-```
-好的喵～讓我查一下喵～
-
-<details type="tool_calls" done="true" name="web_search">
-<summary>✅ 🌐 web_search</summary>
-<arguments>{"tool_name": "web_search", "query": "BTC price today"}</arguments>
-<result>{"data": [{"title": "Bitcoin Price", ...}]}</result>
-</details>
-
-BTC 現在的價格大約是...
-```
-
-**After sanitization (clean):**
-```
-好的喵～讓我查一下喵～
-
-搜尋「BTC price today」後獲得的資訊：{"data": [{"title": "Bitcoin Price", ...}]}
-
-BTC 現在的價格大約是...
-```
-
-### 19 Natural Language Templates
-
-To prevent the model from learning a fixed pattern, sanitization uses **19 different sentence templates** across 5 tool categories. A deterministic random selector (`random.Random(seed + index)`) ensures the same input always produces the same output — critical for **vLLM KV cache hits**.
-
-| Tool Type | Templates | Tools |
-|-----------|-----------|-------|
-| Search | 4 | `web_search`, `brave_web_search`, `search_files`, `session_search` |
-| Trading | 4 | `mcp_trading_get_positions`, `mcp_trading_get_wallet_balance`, ... |
-| File | 3 | `read_file`, `write_file`, `patch` |
-| Code | 3 | `execute_code`, `terminal` |
-| General | 5 | All other tools |
-
-### Configuration
-
-Controlled via `config.yaml`:
-
-```yaml
-enable_history_sanitization: true
-sanitization_result_max_length: 2000
-tool_history_format: "flat"  # "flat" (default) or "legacy"
-```
-
-### Recommended System Prompt Addition
-
-Even with sanitization, add this instruction to your system prompt as an additional layer of defense against model mimicry:
-
-```
-You may see [START_PREV_ACTION]...[END_PREV_ACTION] blocks in the conversation.
-These are system-generated records of previous tool executions.
-Do NOT reproduce or mimic this format in your responses.
-```
-
-This tells the model explicitly that these blocks are system-generated artifacts, not a format it should imitate.
-
----
-
-## Responses API Support
-
-**Problem:** When Open WebUI uses the Responses API in stateful mode (`previous_response_id`), it only carries user messages in the `input` — tool results from the previous turn are lost. The model has no visibility into what tools were executed or what they returned.
-
-**Solution:** The `responses_handler.py` fetches the previous response and injects tool results as text summaries into the current input.
-
-### Dual-Path Protection
-
-- **Path A (native):** `previous_response_id` is preserved so Hermes can retrieve the full `conversation_history` internally (primary mechanism).
-- **Path B (proxy injection):** Tool results are converted to text summaries and prepended to the user message as a fallback.
-
-### Injection Format
-
-```xml
-<tool_results_from_previous_turn>
-[Previous turn] Tool called: web_search(query=BTC price today)
-[Previous turn] Tool result: {"data": [{"title": "Bitcoin Price", ...}]}
-</tool_results_from_previous_turn>
-
-<User's new message here>
-```
-
-### SSE Modes
-
-| Mode | Behavior |
-|------|----------|
-| `passthrough` (default) | Forward Responses SSE events directly |
-| `convert` | Convert Responses SSE → Chat Completions SSE |
-
-### Configuration
-
-```yaml
-responses_sse_mode: "passthrough"  # or "convert"
-```
-
----
-
-## Systemd Service
+## systemd
 
 ```ini
 [Unit]
-Description=Hermes Tool Card Enhancer Proxy
+Description=Hermes Tool Filter
 After=network-online.target
 
 [Service]
 Type=simple
-User=your_user
+User=YOUR_USER
 WorkingDirectory=/path/to/hermes_tool_filter
-ExecStart=/path/to/venv/bin/python main.py
+ExecStart=/path/to/hermes_tool_filter/venv/bin/python main.py
 Restart=always
+MemoryMax=1G
+MemorySwapMax=256M
 
 [Install]
 WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable --now hermes-tool-filter
-```
-
----
-
-## 🔧 Hermes API Server Patch Guide
-
-> **Why is a patch needed?**
->
-> Hermes Gateway's `_on_tool_complete` function doesn't send `arguments` and `result` fields in the `__tool_progress__` completed event, so hermes_tool_filter can't retrieve tool parameters and results to build `<details>` tags.
-
-### Auto-Apply (Recommended)
-
-```bash
-# Check if patch is applied
-grep -c '"result": str(function_result)' /opt/hermes/hermes-agent/gateway/platforms/api_server.py
-
-# If it returns 0, it's not applied. Run:
-cd ~/.hermes/hermes/hermes-agent
-git apply /path/to/hermes_tool_filter/patches/api_server_tool_result.patch 2>/dev/null || \
-  echo "Patch cannot be applied — may already be applied or Hermes version changed"
-```
-
-### Manual Apply
-
-1. **Find `_on_tool_complete` function** (in `hermes-agent/gateway/platforms/api_server.py`, around line 1146)
-
-2. **Add `arguments` and `result` to `progress_data` dict**:
-
-```python
-async def _on_tool_complete(self, tool_call_id, function_name, function_args, function_result):
-    # ... other code ...
-    progress_data = {
-        "type": "__tool_progress__",
-        "event": "completed",
-        "tool_call_id": tool_call_id,
-        "name": function_name,
-        "arguments": function_args or {},          # ← Add this
-        "result": str(function_result) if function_result is not None else "",  # ← Add this
-    }
-```
-
-3. **Restart Hermes Gateway**:
-
-```bash
-# Find and stop old process
-ps aux | grep "hermes.*gateway"
-kill <PID>
-
-# Start new Gateway
-python -m hermes_cli.main --profile chatting gateway run --replace
-```
-
-### Maintenance: After Hermes Update
-
-`hermes update` (git pull/reset) will overwrite manual changes! After each Hermes update:
-
-```bash
-# Method 1: Use patch file
-cd /opt/hermes/hermes-agent
-git apply /path/to/hermes_tool_filter/patches/api_server_tool_result.patch
-
-# Method 2: Manual check
-grep '"result":' /opt/hermes/hermes-agent/gateway/platforms/api_server.py
-# If not found, the patch was overwritten and needs to be re-applied
-```
-
-### Version Compatibility
-
-| Hermes Version | Path | Patch Status | Notes |
-|---------------|------|--------------|-------|
-| v0.16.0+ | `hermes-agent/gateway/platforms/api_server.py` | ✅ 已適配 | Gateway 變為 user service (`hermes gateway install`) |
-| v0.15.x | `gateway/platforms/api_server.py` | ⚠️ 舊路徑 | 需手動更新 patch 路徑 |
-
-**更新日誌：**
-
-- **2026-06-09** — Hermes v0.16.0: 目錄結構從 `/opt/hermes/gateway/` 遷移至 `/opt/hermes/hermes-agent/gateway/`，Gateway 改為 user service。Patch 路徑已更新。
-
-### Verify Patch is Active
-
-```bash
-# Test script
-python3 /path/to/hermes_tool_filter/test_api_server.py
-
-# Expected: completed event includes arguments and result fields
 ```
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Tool cards don't show in Open WebUI | enhance-v2 not active | Verify `tool_mode: "enhance-v2"` in config.yaml |
-| `<details>` tags missing `result` | API Server patch not applied | Run the patch guide above |
-| Tool cards show but result is empty | API Server `result` field missing | Check `grep '"result":'` in api_server.py |
-| Model outputs `<details>` tags | Pollution feedback loop | Check `enable_history_sanitization: true` |
-| Model forgets tool results in Responses API | Stateful mode not injecting | Check `[responses] Injected` in filter logs |
-| Proxy not responding | Service crashed | `journalctl -u hermes-tool-filter` or check logs |
-| Wrong upstream | Wrong route path | Verify routing table matches your Gateway ports |
-| `hermes update` broke things | Patch overwritten by git reset | Re-apply patch after update |
+| 現象 | 處理 |
+|------|------|
+| 沒 tool card | `tool_mode: enhance-v2`；URL 要走 filter port |
+| card 空 result | 重套 api_server patch |
+| structured 下一輪失憶 | patch 沒保留 tool role；`grep OpenAI-native tool result` |
+| 模型學 `<details>` / `START_PREV_ACTION` | 用 structured；別回 flat 又不加 hint |
+| update 後壞掉 | 兩份 patch 重套 + 重啟 gateway/filter |
 
 ---
 
-## Technical Details
+## License
 
-- **Dependencies** — FastAPI, aiohttp, PyYAML
-- **Architecture** — Single file, no external database, stateless
-- **Deployment** — systemd or run directly
-
----
-
-<p align="center">
-  <sub>MIT License</sub>
-</p>
+MIT

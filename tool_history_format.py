@@ -18,11 +18,19 @@ logger = logging.getLogger(__name__)
 def _get_sanitization_config(config: dict) -> tuple:
     """Get sanitization config, return (enabled, max_result_length, format).
 
-    Format is always "structured" — flat/legacy options removed.
+    Runtime only implements structured (native tool role).
+    flat/legacy remain documented in README / git ≤877fdb7.
     """
     enabled = config.get("enable_history_sanitization", True)
-    max_length = config.get("sanitization_result_max_length", 2000)
-    return bool(enabled), int(max_length), "structured"
+    max_length = config.get("sanitization_result_max_length", 20000)
+    fmt = str(config.get("tool_history_format", "structured") or "structured").strip().lower()
+    if fmt not in ("structured", "flat", "legacy"):
+        logger.warning(
+            "[history] unknown tool_history_format=%r — falling back to structured",
+            fmt,
+        )
+        fmt = "structured"
+    return bool(enabled), int(max_length), fmt
 
 
 def _extract_tool_info(tag: str, max_result_length: int) -> dict:
