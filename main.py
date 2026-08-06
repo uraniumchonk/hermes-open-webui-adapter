@@ -49,11 +49,28 @@ except ImportError:
 # Production default INFO. Set TOOL_FILTER_LOG_LEVEL=DEBUG for deep tracing.
 # DEBUG on a long-lived SSE proxy can retain huge format args and flood journald.
 _LOG_LEVEL = getattr(logging, os.environ.get("TOOL_FILTER_LOG_LEVEL", "INFO").upper(), logging.INFO)
+
+# ── 雙重日誌：console + file ──
+# 將關鍵錯誤和除錯資訊寫入 .log 文件，不依賴 systemd journal
+LOG_FILE = Path(__file__).parent / "hermes_tool_filter.log"
+
+# Console handler (systemd journal)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(_LOG_LEVEL)
+console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+# File handler (persistent log for debugging)
+file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)  # 文件記錄所有 DEBUG 級別
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+
+# Root logger
 logging.basicConfig(
-    level=_LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG,
+    handlers=[console_handler, file_handler],
 )
 logger = logging.getLogger("tool-filter")
+logger.setLevel(logging.DEBUG)
 
 # ── Configuration ──────────────────────────────────────────
 
@@ -889,11 +906,8 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
-    # <summary> 包含工具名稱 + emoji（供視覺渲染）
-    emoji = get_tool_emoji(tool_name)
-    display_name = label if label else tool_name
-    safe_display = html.escape(display_name)
-    inner = f"\n<summary>✅ {emoji} {safe_display}</summary>"
+    # <summary> 內容留空以節省上下文（arguments 已包含完整資訊）
+    inner = "\n<summary></summary>"
     
     # <arguments> 標籤：包含 tool_name + 完整參數（讓模型能識別工具）
     if arguments:
@@ -937,12 +951,28 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
             result_str = str(result) if not isinstance(result, str) else result
             result_len = len(result_str)
         
-        # 圖片相關欄位清單
-        image_keys = {"image_url", "image_path", "screenshot_path"}
+        # 圖片相關欄位清單（包含單數/複數形式）
+        image_keys = {"image_url", "image_urls", "image_path", "image_paths", 
+                      "path", "paths", "screenshot_path", "screenshot_paths",
+                      "images", "image"}
         
         # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
         has_image_arg = arguments is not None and image_keys & set(arguments.keys())
         is_large_result = result_len > 10240
+        
+        # DEBUG: 記錄 arguments 狀態以便排查
+        if is_large_result and not has_image_arg:
+            logger.warning(
+                f"[multimodal-debug] Large result ({result_len} bytes) but has_image_arg=False! "
+                f"arguments type={type(arguments).__name__}, keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
+                f"tool_name={tool_name}"
+            )
+        elif is_large_result and has_image_arg:
+            logger.info(
+                f"[multimodal-debug] Large result ({result_len} bytes) detected as multimodal! "
+                f"arguments keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
+                f"tool_name={tool_name}"
+            )
         
         if has_image_arg and is_large_result:
             # 視覺工具的大結果：直接替換成簡短提示
@@ -1236,6 +1266,8 @@ async def transform_stream(
     initial_wait_interval = 0.5  # 初始等待階段每 0.5 秒發送心跳
     
     # ✅ 預建心跳 chunk 模板（避免每次重複格式化）
+    # 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
+    # SSE comment (:) 不被某些客戶端計入 idle timer，導致斷線
     _heartbeat_chunk_tpl = b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}  \n\n'
     
     # 主循環
@@ -1251,7 +1283,6 @@ async def transform_stream(
             tool_just_completed = False
             
             # ✅ 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
-            # SSE comment (:) 不被某些客戶端計入 idle timer，導致斷線
             yield _heartbeat_chunk_tpl % (
                 completion_id.encode(), created, model.encode()
             )
@@ -1264,6 +1295,12 @@ async def transform_stream(
             line = await asyncio.wait_for(reader.readline(), timeout=1.0)
         except asyncio.TimeoutError:
             # 超時了，繼續循環，下次心跳會發送
+            # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
+            if not first_content_sent and len(buffer) > 0:
+                logger.warning(
+                    f"[readline-debug] TIMEOUT but buffer_len={len(buffer)}, "
+                    f"buffer_preview={buffer[:200]!r}, first_content_sent={first_content_sent}"
+                )
             continue
         except Exception as e:
             # readline() 可能丟出 exception（例如 client 斷開連線）
@@ -1273,6 +1310,14 @@ async def transform_stream(
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
             raise
+
+        # DEBUG: 記錄所有讀取的原始行（前 100 行）
+        if heartbeat_count < 100:
+            line_preview = line[:100] if line else b""
+            logger.debug(
+                f"[readline-debug] READ line_len={len(line)}, preview={line_preview!r}, "
+                f"buffer_len={len(buffer)}, first_content={first_content_sent}"
+            )
 
         # Empty line means end of connection — LOG THIS!
         if not line:
@@ -1414,7 +1459,7 @@ async def transform_stream(
                             label = parsed_json.get("label", tool)
                             yield _build_content_chunk(
                                 f'<details type="tool_calls" done="false" id="{tc_id}" name="{html.escape(tool)}">\n'
-                                f'<summary>{emoji} Running... {html.escape(label)}</summary>\n'
+                                f'<summary></summary>\n'
                                 f'</details>\n'
                             )
                     elif status == "completed":
@@ -1587,13 +1632,17 @@ async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        # read_bufsize: vision_analyze 等工具可能回傳超大 SSE frame (base64 圖片 >1MB)
+        # read_bufsize: vision_analyze 回傳的 base64 圖片可達 3-4MB
         # aiohttp 的 StreamReader._high_water = read_bufsize * 2
         # readline() 的 max_size 預設為 _high_water
-        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 vision_analyze result
+        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 base64 圖片
+        
+        # ✅ 關鍵修復：設定 auto_decompress=False 避免額外的解壓縮開銷
+        # 並確保 timer_host 正確設定以支援 backpressure
         _http_session = aiohttp.ClientSession(
             timeout=timeout,
             read_bufsize=4194304,
+            auto_decompress=False,  # 避免不必要的解壓縮
         )
     return _http_session
 
