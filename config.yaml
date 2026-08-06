@@ -8,7 +8,7 @@
 # See README.md for detailed documentation.
 
 # ── Server ─────────────────────────────────────────────────
-bind_host: "127.0.0.1"  # Localhost only, prevents external access
+bind_host: "0.0.0.0"  # Bind to all interfaces for remote access from Open WebUI
 bind_port: 9099
 
 # ── Tool Display Mode ──────────────────────────────────────
@@ -16,51 +16,39 @@ bind_port: 9099
 # enhance     : Filter done=false + inject completion tags with label
 # passthrough : Pass through <details> tags directly (safest)
 # strip       : Remove <details> and replace with plain text
+# native_passthrough : NEW — 完全透傳 + SQLite 存儲 + 歷史注入 (4 Components)
+#   - 組件1: 不修改任何 SSE data
+#   - 組件2: 捕獲 hermes.tool.progress → 顯示 "執行 terminal"
+#   - 組件3: SQLite 存儲完整 tool results (key: session_id + message_id)
+#   - 組件4: Session Marker 檢測 → 注入完整 results 到歷史訊息
 tool_mode: "enhance-v2"
 
 # ── Upstream Routing ───────────────────────────────────────
 # Route table: path prefix → upstream Hermes Gateway address
 # Format: "port": "http://address:port"
 #
-# Default Hermes profiles (run `hermes profiles list` to see yours):
-#   30000: General chat
-#   30001: Code development expert
-#   30002: Data & research
-#   30003: Trading & markets
-#
-# You can add or remove freely — just match your Gateway setup!
-# If omitted, defaults to 30000-30003.
+# Profiles on this machine:
+#   30001 → coder profile (qwen-27b)
+#   30002 → coder-master profile (xai grok-4.5)
+#   30005 → family profile
 upstreams:
-  "30000": "http://127.0.0.1:30000"
   "30001": "http://127.0.0.1:30001"
   "30002": "http://127.0.0.1:30002"
   "30003": "http://127.0.0.1:30003"
+  "30004": "http://127.0.0.1:30004"
+  "30005": "http://127.0.0.1:30005"
 
 # ── Auto Split ─────────────────────────────────────────────
 # Auto-split threshold (characters), 0 to disable
 # Note: Conduit APP does not support session.split events
-############ experimental, may unable to work as expected. #################
 auto_split_threshold: 0
-############ experimental, may unable to work as expected. #################
 
 # ── History Sanitization (Anti-pollution) ──────────────────
-# Before forwarding requests, convert <details type="tool_calls"> tags
-# in assistant content to a safe format, breaking the pollution feedback loop.
+# Convert Open WebUI <details type="tool_calls"> history into
+# OpenAI-native assistant.tool_calls + role=tool messages.
 enable_history_sanitization: true
 # Result truncation length (adds "..." if exceeded)
 sanitization_result_max_length: 20000
-# History format:
-#   flat   — [START_PREV_ACTION] k:v format (recommended, prevents JSON pollution)
-#   legacy — natural language description (legacy)
-tool_history_format: "flat"
-
-# ── Tool Usage Hint ────────────────────────────────────────
-# Append a tool usage hint at the end of the last user message
-# to prevent model attention dilution.
-#
-# This reads the content from a file (relative to this config file).
-# Leave empty or set to "" to disable.
-tool_usage_hint_file: "tool_hint.txt"
 
 # ── Conversation Compression ───────────────────────────────
 # When X-Hermes-Session-Id is present, Hermes Gateway loads full
