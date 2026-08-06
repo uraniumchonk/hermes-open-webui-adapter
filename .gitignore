@@ -11,3 +11,7 @@ venv/
 *.pid
 .env
 .webui_secret_key
+hermes_tool_filter.log
+tool_context.db
+*.db
+.DS_Store
