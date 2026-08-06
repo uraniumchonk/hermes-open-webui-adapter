@@ -15,3 +15,8 @@ hermes_tool_filter.log
 tool_context.db
 *.db
 .DS_Store
+
+# local tests — not shipped
+test_*.py
+test_*.sh
+tests/
