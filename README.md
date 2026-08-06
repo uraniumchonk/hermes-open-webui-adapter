@@ -37,8 +37,8 @@ Open WebUI stores something like this (simplified):
 }
 ```
 
-Before the filter, that whole string is what the model sees again.  
-After the filter, history is rewritten. **Two templates:**
+Without the filter, the model sees that whole string again.  
+With the filter, history is rewritten. **Two templates:**
 
 ### `structured` — native tool roles (current `main`)
 
@@ -69,8 +69,6 @@ After the filter, history is rewritten. **Two templates:**
 ]
 ```
 
-Needs Hermes patch so Gateway keeps `role=tool` + `tool_calls`.
-
 ### `flat` — still one assistant string (legacy branch)
 
 ```json
@@ -79,8 +77,6 @@ Needs Hermes patch so Gateway keeps `role=tool` + `tool_calls`.
   "content": "Let me check.\n\n[START_PREV_ACTION]\n[ACTION_TYPE]\nweb_search\n[ACTION_ARG]\nquery: BTC price\n[RESULT]\nprice: 64000\n[END_PREV_ACTION]\n\nAbout 64000."
 }
 ```
-
-No tool-role patch required; relies on a hint so the model does not imitate the block.
 
 | | `structured` | `flat` |
 |--|--------------|--------|
@@ -104,8 +100,6 @@ git clone -b main https://github.com/uraniumchonk/hermes-open-webui-adapter.git
 # or: git clone -b flat-history ...
 ```
 
-Tag `v2.0.0-dual-history` == `flat-history` (== commit `877fdb7`).
-
 ---
 
 ## Setup
@@ -113,23 +107,8 @@ Tag `v2.0.0-dual-history` == `flat-history` (== commit `877fdb7`).
 ```bash
 pip install -r requirements.txt
 # edit upstreams in config.yaml
-
-cd /path/to/hermes-agent
-git apply /path/to/patches/api_server_chat_completions_all.patch
-git apply /path/to/patches/prompt_builder_api_server_hint.patch
-# restart gateway
-
 python main.py
 ```
-
-**Patches** (`patches/`):
-
-- `api_server_chat_completions_all.patch` — SSE `arguments`/`result` + keep tool roles  
-- `prompt_builder_api_server_hint.patch` — allow Markdown on api_server  
-
-Re-apply after every `hermes update`.
-
-**Minimal config:**
 
 ```yaml
 upstreams:
@@ -138,10 +117,19 @@ upstreams:
 tool_mode: "enhance-v2"
 enable_history_sanitization: true
 sanitization_result_max_length: 20000
-# main always uses structured; flat only on flat-history branch
 ```
 
-Gateway `.env`: `API_SERVER_ENABLED=true`, `API_SERVER_PORT` matches upstream key, `API_SERVER_KEY=...`.
+Gateway `.env`: `API_SERVER_ENABLED=true`, `API_SERVER_PORT` matches the upstream key, `API_SERVER_KEY=...`.
+
+### Optional: local Hermes patches
+
+The proxy works without modifying Hermes.  
+`patches/` holds **optional personal patches** used on some setups for a better experience
+(e.g. richer tool-progress payloads, allowing Markdown on api_server, keeping
+`role=tool` through Chat Completions). They are **not required** to run this project.
+
+If you use them, re-apply after `hermes update`. Line numbers drift — treat the
+files as references, not guaranteed clean applies on every Hermes version.
 
 ---
 

@@ -67,8 +67,6 @@ Open WebUI 存下來大致是這樣（簡化）：
 ]
 ```
 
-需要 Hermes patch，Gateway 才會保留 `role=tool` 與 `tool_calls`。
-
 ### `flat` — 仍塞同一條 assistant（舊分支）
 
 ```json
@@ -77,8 +75,6 @@ Open WebUI 存下來大致是這樣（簡化）：
   "content": "讓我查一下。\n\n[START_PREV_ACTION]\n[ACTION_TYPE]\nweb_search\n[ACTION_ARG]\nquery: BTC price\n[RESULT]\nprice: 64000\n[END_PREV_ACTION]\n\n大約 64000。"
 }
 ```
-
-不用 tool-role patch；靠 hint 防止模型模仿這段格式。
 
 | | `structured` | `flat` |
 |--|--------------|--------|
@@ -102,8 +98,6 @@ git clone -b main https://github.com/uraniumchonk/hermes-open-webui-adapter.git
 # 或：git clone -b flat-history ...
 ```
 
-tag `v2.0.0-dual-history` 與 `flat-history` 相同（= `877fdb7`）。
-
 ---
 
 ## 安裝
@@ -111,23 +105,8 @@ tag `v2.0.0-dual-history` 與 `flat-history` 相同（= `877fdb7`）。
 ```bash
 pip install -r requirements.txt
 # 改 config.yaml 的 upstreams
-
-cd /path/to/hermes-agent
-git apply /path/to/patches/api_server_chat_completions_all.patch
-git apply /path/to/patches/prompt_builder_api_server_hint.patch
-# 重啟 gateway
-
 python main.py
 ```
-
-**Patch**（`patches/`）：
-
-- `api_server_chat_completions_all.patch` — SSE 帶 `arguments`/`result`，並保留 tool role  
-- `prompt_builder_api_server_hint.patch` — api_server 允許 Markdown  
-
-每次 `hermes update` 後重套。
-
-**最小 config：**
 
 ```yaml
 upstreams:
@@ -136,10 +115,17 @@ upstreams:
 tool_mode: "enhance-v2"
 enable_history_sanitization: true
 sanitization_result_max_length: 20000
-# main 固定 structured；flat 只在 flat-history 分支
 ```
 
 Gateway `.env`：`API_SERVER_ENABLED=true`，`API_SERVER_PORT` 對上 upstream key，`API_SERVER_KEY=...`。
+
+### 可選：本機 Hermes patch
+
+不改 Hermes 也能跑這個 proxy。  
+`patches/` 裡是**可選的自用 patch**（例如 tool-progress 帶更完整欄位、api_server 允許 Markdown、
+Chat Completions 保留 `role=tool`）。**不是專案必要條件。**
+
+若有套用，`hermes update` 後需重套；行號會飄，請當參考用，不保證每版 Hermes 都能 clean apply。
 
 ---
 
