@@ -146,6 +146,11 @@ except (OSError, ValueError):
 _health_dump_interval = 30  # seconds
 _health_dump_task = None
 
+# ── RSS watchdog 閾值（2026-08-07 新增）──
+# stale stream 曾吃到 3.2G RSS + 1G swap；3GB 主動退出，比 systemd
+# MemoryMax=4G 硬殺更早，避免 swap thrashing。Restart=always 會重啟。
+_RSS_WATCHDOG_BYTES = 3 * 1024 * 1024 * 1024  # 3GB
+
 
 async def _health_dump_loop():
     """Periodic health dump task — runs in background."""
@@ -160,6 +165,26 @@ async def _health_dump_loop():
                     if line.startswith("VmRSS:"):
                         rss_kb = int(line.split()[1])
                         break
+            
+            # ── RSS watchdog：超過上限直接自殺讓 systemd 重啟 ──
+            # 歷史教訓（2026-08-07）：stale stream 20 分鐘吃到 3.2G RSS +
+            # 1G swap，swap thrashing 會拖垮整台機器（先前 1.4TB 讀取事件）。
+            # 與其等 systemd MemoryMax=4G 硬殺，不如在 3G 就主動退出——
+            # Restart=always 會拉起來，Open WebUI 重試即可。
+            if rss_kb * 1024 >= _RSS_WATCHDOG_BYTES:
+                logger.critical(
+                    f"[rss-watchdog] RSS={rss_kb}kB >= 3GB limit. "
+                    f"Self-terminating to prevent swap thrashing. "
+                    f"threads={threading.active_count()} "
+                    f"asyncio-tasks={len(asyncio.all_tasks())}"
+                )
+                # flush log 後退出（exit code 1 → systemd Restart=always 重啟）
+                for handler in logger.handlers:
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+                os._exit(1)
             
             # Count active streams (approximate via open file descriptors to 127.0.0.1)
             task_count = len(asyncio.all_tasks()) if asyncio.get_event_loop().is_running() else 0
@@ -1475,6 +1500,16 @@ async def transform_stream(
     _readline_count = 0
     _last_buffer_dump = time.monotonic()
     
+    # ── Stale stream protection ──
+    # 歷史教訓（2026-08-07）：Hermes gateway 在 relay finalization 異常後可能
+    # 「活著但啞巴」——socket 不關、數據不送、[DONE] 不發。filter 若只等 EOF
+    # 會無限 READLINE TIMEOUT 循環（實測 20 分鐘吃 3.2G RAM）。
+    # 這裡追蹤最後一次收到 upstream 數據的時間，超時即強制結束 stream。
+    _last_data_time = time.monotonic()
+    # 120 秒完全無數據 → 判定 upstream 死亡（thinking/長工具執行期間
+    # progress 事件會持續進來，正常 stream 不會靜默超過 2 分鐘）
+    STALE_STREAM_TIMEOUT = 120.0
+    
     while True:
         # ✅ 防火牆優化：在等待第一塊內容時使用更短的心跳間隔
         current_heartbeat_interval = initial_wait_interval if not first_content_sent else heartbeat_interval
@@ -1510,6 +1545,28 @@ async def transform_stream(
             # 超時了，繼續循環，下次心跳會發送
             # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
             _read_elapsed = time.monotonic() - _read_start
+            
+            # ── Stale stream protection ──
+            # upstream 長時間完全無數據 → 判定 gateway 已「啞巴」死亡
+            # （relay finalization 異常 / gateway 重啟後舊連線失效）。
+            # 強制結束 stream，避免無限 READLINE TIMEOUT 循環吃爆記憶體。
+            stale_for = time.monotonic() - _last_data_time
+            if stale_for > STALE_STREAM_TIMEOUT:
+                logger.error(
+                    f"[enhance-v2] STALE STREAM: no upstream data for "
+                    f"{stale_for:.0f}s (> {STALE_STREAM_TIMEOUT:.0f}s), "
+                    f"stream_age={time.monotonic() - _stream_start:.1f}s "
+                    f"readline_count={_readline_count} done={done_received} "
+                    f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}. "
+                    f"Force-ending stream to free memory."
+                )
+                # 通知下游 stream 結束（避免 Open WebUI 一直轉圈）
+                yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' % (
+                    completion_id.encode(), created, model.encode()
+                )
+                yield b'data: [DONE]\n\n'
+                break
+            
             if not first_content_sent and len(buffer) > 0:
                 logger.warning(
                     f"[readline-debug] TIMEOUT but buffer_len={len(buffer)}, "
@@ -1525,7 +1582,8 @@ async def transform_stream(
                     f"stream_age={now - _stream_start:.1f}s readline_count={_readline_count} "
                     f"buffer_len={len(buffer)} heartbeat={heartbeat_count} "
                     f"first_content={first_content_sent} done={done_received} "
-                    f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
+                    f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0} "
+                    f"stale={time.monotonic() - _last_data_time:.0f}s"
                 )
             continue
         except LineTooLong as e:
@@ -1572,6 +1630,9 @@ async def transform_stream(
                 f"[readline-debug] READ line_len={len(line)}, preview={line_preview!r}, "
                 f"buffer_len={len(buffer)}, first_content={first_content_sent}"
             )
+
+        # ✅ 收到任何 upstream 數據即更新 stale 計時器
+        _last_data_time = time.monotonic()
 
         # Empty line means end of connection — LOG THIS!
         if not line:
