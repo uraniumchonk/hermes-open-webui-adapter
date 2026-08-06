@@ -24,7 +24,11 @@ import logging
 import os
 import random
 import re
+import signal
+import sys
+import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, AsyncGenerator, List
@@ -71,6 +75,106 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tool-filter")
 logger.setLevel(logging.DEBUG)
+
+# ── Crash Debug: SIGUSR2 thread dump ────────────────────────
+# 當 process 卡死時，發送 SIGUSR2 會立刻 dump 所有執行緒堆疊到 log 檔案。
+# 用法: kill -USR2 <pid>
+# 這是在 D state 時唯一能拿到現場資料的方法（D state 下 Python 回調可能跑不起來）。
+
+def _thread_dump_handler(signum, frame):
+    """SIGUSR2 handler: dump all thread stacks to log file."""
+    dump_lines = ["=" * 80, "CRASH DUMP triggered by SIGUSR2 at", time.strftime("%Y-%m-%d %H:%M:%S"), "=" * 80]
+    
+    # 1. Process status
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if any(line.startswith(k) for k in ["Name", "State", "Threads", "VmRSS", "VmSize", "VmPeak", "voluntary", "involuntary"]):
+                    dump_lines.append(line.rstrip())
+    except Exception as e:
+        dump_lines.append(f"[ERROR reading /proc/self/status] {e}")
+    
+    # 2. Thread stacks
+    dump_lines.append("")
+    dump_lines.append(f"--- {threading.active_count()} active threads ---")
+    frames = sys._current_frames()
+    for tid, frame in frames.items():
+        t = None
+        for t in threading.enumerate():
+            if t.ident == tid:
+                break
+        tname = t.name if t else f"tid={tid}"
+        dump_lines.append(f"\n### Thread: {tname} (tid={tid}) ###")
+        stack = traceback.format_stack(frame)
+        dump_lines.extend(stack)
+    
+    # 3. asyncio task info
+    try:
+        loop = asyncio.get_event_loop()
+        tasks = asyncio.all_tasks(loop)
+        dump_lines.append(f"\n--- asyncio tasks: {len(tasks)} ---")
+        for task in list(tasks)[:20]:  # 最多 20 個
+            dump_lines.append(f"  Task: {task.get_name() if hasattr(task, 'get_name') else repr(task)}")
+            if task.done():
+                dump_lines.append(f"    Status: DONE")
+            else:
+                dump_lines.append(f"    Status: {'CANCELLED' if task.cancelled() else 'PENDING/RUNNING'}")
+    except Exception as e:
+        dump_lines.append(f"[ERROR reading asyncio tasks] {e}")
+    
+    dump_text = "\n".join(dump_lines)
+    # 直接寫檔案（不經過 logging，因為 D state 下 logging 可能也卡住）
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(dump_text + "\n")
+    except Exception:
+        pass
+
+
+# Register SIGUSR2 handler (only in main thread)
+try:
+    signal.signal(signal.SIGUSR2, _thread_dump_handler)
+except (OSError, ValueError):
+    pass  # Not main thread or signal unavailable
+
+
+# ── Crash Debug: Periodic health dump ──────────────────────
+# 背景任務：每 30 秒 dump 一次關鍵指標到 log 檔案。
+# 包含：RSS、buffer size、active tools、asyncio tasks、thread count。
+
+_health_dump_interval = 30  # seconds
+_health_dump_task = None
+
+
+async def _health_dump_loop():
+    """Periodic health dump task — runs in background."""
+    global _health_dump_task
+    _health_dump_task = asyncio.current_task()
+    while True:
+        await asyncio.sleep(_health_dump_interval)
+        try:
+            rss_kb = 0
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        break
+            
+            # Count active streams (approximate via open file descriptors to 127.0.0.1)
+            task_count = len(asyncio.all_tasks()) if asyncio.get_event_loop().is_running() else 0
+            
+            logger.info(
+                f"[health-dump] RSS={rss_kb}kB threads={threading.active_count()} "
+                f"asyncio-tasks={task_count}"
+            )
+        except Exception as e:
+            logger.warning(f"[health-dump] error: {e}")
+
+
+async def start_health_dump():
+    """Start the periodic health dump background task."""
+    asyncio.create_task(_health_dump_loop())
+    logger.info(f"[health-dump] Started periodic dump every {_health_dump_interval}s")
 
 # ── Configuration ──────────────────────────────────────────
 
@@ -264,14 +368,23 @@ def sanitize_request_messages(
     Scan and sanitize all messages in the request to prevent <details> pollution.
     Only processes assistant role content.
 
-    Always uses structured format (OpenAI native tool role messages).
+    Runtime path: structured only (OpenAI native tool role).
+    flat/legacy were removed in 61a58dc — see git ≤877fdb7 + README templates.
     """
     if not messages:
         return messages
 
-    enabled = tool_history_format._get_sanitization_config(CONFIG)[0]
+    enabled, _max_len, fmt = tool_history_format._get_sanitization_config(CONFIG)
     if not enabled:
         return messages
+
+    if fmt != "structured":
+        # Do not silently pretend flat still works.
+        logger.warning(
+            "[history] tool_history_format=%r is not in runtime "
+            "(removed 61a58dc; restore from git ≤877fdb7). Using structured.",
+            fmt,
+        )
 
     from tool_history_structured import sanitize_messages_structured
     return sanitize_messages_structured(messages, CONFIG)
@@ -449,10 +562,15 @@ def compress_tool_results(messages: list, config: dict) -> tuple[list, bool]:
       return an auto-reply directly without forwarding to the LLM.
     - is_comp_only=False means normal compression (still forward to LLM).
     """
+    _perf_t0 = time.monotonic()
     if not _comp_mode_enabled(config):
+        _elapsed = (time.monotonic() - _perf_t0) * 1000
+        logger.debug(f"[perf] compress_tool_results SKIPPED (comp_mode disabled) {_elapsed:.1f}ms")
         return (messages, False)
     
     if not messages:
+        _elapsed = (time.monotonic() - _perf_t0) * 1000
+        logger.debug(f"[perf] compress_tool_results SKIPPED (empty messages) {_elapsed:.1f}ms")
         return (messages, False)
     
     max_length = config.get("comp_result_max_length", 100)
@@ -544,6 +662,8 @@ def compress_tool_results(messages: list, config: dict) -> tuple[list, bool]:
         f"across {last_user_idx} message(s), marker inserted at index {last_user_idx}"
     )
     
+    _elapsed = (time.monotonic() - _perf_t0) * 1000
+    logger.info(f"[perf] compress_tool_results DONE in {_elapsed:.1f}ms (messages={len(messages)}, compressed={total_compressed})")
     return (messages, is_comp_only)
 
 
@@ -831,14 +951,21 @@ def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> 
 
     Returns the compressed messages list.
     """
+    _perf_t0 = time.monotonic()
     if not messages:
+        _elapsed = (time.monotonic() - _perf_t0) * 1000
+        logger.debug(f"[perf] compress_request_messages SKIPPED (empty) {_elapsed:.1f}ms")
         return messages
 
     mode = config.get("compression_mode", "server-side")
     if mode != "server-side" or not hermes_sid:
+        _elapsed = (time.monotonic() - _perf_t0) * 1000
+        logger.debug(f"[perf] compress_request_messages SKIPPED (mode={mode}, sid={'yes' if hermes_sid else 'no'}) {_elapsed:.1f}ms")
         return messages
 
     if len(messages) <= 2:
+        _elapsed = (time.monotonic() - _perf_t0) * 1000
+        logger.debug(f"[perf] compress_request_messages SKIPPED (len<=2) {_elapsed:.1f}ms")
         return messages
 
     system_msgs = [m for m in messages if m.get("role") == "system"]
@@ -864,7 +991,8 @@ def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> 
         f"→ {len(compressed)} messages ({compressed_size} chars) "
         f"via server-side session history (session={hermes_sid[:8]}...)"
     )
-
+    _elapsed = (time.monotonic() - _perf_t0) * 1000
+    logger.info(f"[perf] compress_request_messages DONE in {_elapsed:.1f}ms (msgs {original_count}->{len(compressed)}, chars {original_size}->{compressed_size})")
     return compressed
 
 
@@ -1100,6 +1228,7 @@ class ToolCallBuffer:
     def on_tool_running(self, tc_id: str, payload: dict,
                         completion_id: str, created: int, model: str) -> List[bytes]:
         """工具開始執行，記錄狀態並立即發送 running 通知以保持 stream 活躍。"""
+        _t0 = time.monotonic()
         self._prune()
         tool_name = payload.get("tool", "unknown")
         emoji = payload.get("emoji", get_tool_emoji(tool_name))
@@ -1117,15 +1246,17 @@ class ToolCallBuffer:
         chunks.append(b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}  \n\n' % (
             completion_id.encode(), created, model.encode()
         ))
-        logging.info(f"[enhance-v2] Tool running: {tool_name} (sent keepalive chunk)")
+        _elapsed = (time.monotonic() - _t0) * 1000
+        logging.info(f"[perf] on_tool_running {tool_name} tc_id={tc_id[:8]}... active={len(self.active_tools)} {_elapsed:.1f}ms")
         return chunks
     
-    def on_tool_completed(self, tc_id: str, payload: dict, 
+    def on_tool_completed(self, tc_id: str, payload: dict,
                           completion_id: str, created: int, model: str) -> List[bytes]:
         """
         工具完成 → 只注入 <details type="tool_calls" done="true"> 到 content stream。
         這樣 Open WebUI 會正確渲染 tool card，並把 result 存進歷史訊息。
         """
+        _t0 = time.monotonic()
         try:
             state = self.active_tools.pop(tc_id, {})
             state["result"] = payload.get("result", "")
@@ -1146,7 +1277,11 @@ class ToolCallBuffer:
             # 整個 <details> 在一個 chunk 中發出，避免被分割
             chunks.append(_build_content_chunk(f"\n\n{details}\n"))
             
-            logging.info(f"[enhance-v2] Tool completed: {tool_name} (result_len={len(result)}, chunks={len(chunks)})")
+            _elapsed = (time.monotonic() - _t0) * 1000
+            logging.info(
+                f"[perf] on_tool_completed {tool_name} tc_id={tc_id[:8]}... "
+                f"result_len={len(result)} active={len(self.active_tools)} {_elapsed:.1f}ms"
+            )
             return chunks
         except Exception as e:
             logging.error(f"[enhance-v2] on_tool_completed ERROR: {e} for tc_id={tc_id}")
@@ -1271,6 +1406,10 @@ async def transform_stream(
     _heartbeat_chunk_tpl = b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}  \n\n'
     
     # 主循環
+    _stream_start = time.monotonic()
+    _readline_count = 0
+    _last_buffer_dump = time.monotonic()
+    
     while True:
         # ✅ 防火牆優化：在等待第一塊內容時使用更短的心跳間隔
         current_heartbeat_interval = initial_wait_interval if not first_content_sent else heartbeat_interval
@@ -1290,16 +1429,31 @@ async def transform_stream(
             if not first_content_sent:
                 logger.debug(f"[firewall-optimization] Sent keepalive while waiting for first chunk (count={heartbeat_count})")
 
-        # 非阻塞讀取 — 使用 asyncio.wait_for 確保不會永久阻塞
+        # ── Crash Debug: timed readline ──
+        _readline_count += 1
+        _read_start = time.monotonic()
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=1.0)
         except asyncio.TimeoutError:
             # 超時了，繼續循環，下次心跳會發送
             # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
+            _read_elapsed = time.monotonic() - _read_start
             if not first_content_sent and len(buffer) > 0:
                 logger.warning(
                     f"[readline-debug] TIMEOUT but buffer_len={len(buffer)}, "
                     f"buffer_preview={buffer[:200]!r}, first_content_sent={first_content_sent}"
+                )
+            
+            # ── Crash Debug: periodic buffer state dump ──
+            now = time.monotonic()
+            if now - _last_buffer_dump > 10.0:
+                _last_buffer_dump = now
+                logger.warning(
+                    f"[crash-debug] READLINE TIMEOUT after {_read_elapsed:.2f}s | "
+                    f"stream_age={now - _stream_start:.1f}s readline_count={_readline_count} "
+                    f"buffer_len={len(buffer)} heartbeat={heartbeat_count} "
+                    f"first_content={first_content_sent} done={done_received} "
+                    f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
                 )
             continue
         except Exception as e:
@@ -1322,12 +1476,15 @@ async def transform_stream(
         # Empty line means end of connection — LOG THIS!
         if not line:
             elapsed = time.monotonic() - last_heartbeat
+            stream_age = time.monotonic() - _stream_start
             logger.info(
                 f"[enhance-v2] Upstream EOF detected! "
+                f"stream_age={stream_age:.1f}s readline_count={_readline_count} "
                 f"last_heartbeat={elapsed:.1f}s ago, "
                 f"done_received={done_received}, "
                 f"buffer_len={len(buffer)}, "
-                f"tool_just_completed={tool_just_completed}"
+                f"tool_just_completed={tool_just_completed}, "
+                f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
             )
             break
 
@@ -1580,6 +1737,14 @@ async def transform_stream(
         cleaned = buffer.decode("utf-8", errors="replace").rstrip("\r\n")
         if cleaned:
             yield (cleaned + "\n\n").encode("utf-8")
+    
+    # ── Crash Debug: stream completion summary ──
+    stream_age = time.monotonic() - _stream_start
+    logger.info(
+        f"[crash-debug] STREAM COMPLETE stream_age={stream_age:.1f}s "
+        f"readline_count={_readline_count} heartbeat={heartbeat_count} "
+        f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
+    )
 
 
 # ── Shared aiohttp session ────────────────────────────────
@@ -1686,6 +1851,18 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
     - /{port}/v1/chat/completions → CompletionsHandler (enhance-v2)
     - Other paths → passthrough
     """
+    # ── Crash Debug: request entry tracking ──
+    req_id = f"{port_prefix}/{rest[:50]}"
+    start_time = time.monotonic()
+    logger.info(f"[req-trace] ENTER {request.method} /{port_prefix}/{rest[:80]} req_id={req_id}")
+
+    # ── Performance Metrics: stage timers ──
+    _perf_stages: Dict[str, float] = {}
+    _perf_body_size = 0
+    _perf_msg_count = 0
+    _perf_msg_chars = 0
+    _perf_start = time.monotonic()
+
     upstream_port = port_prefix
     original_path = f"/{port_prefix}/{rest}"
     upstream_url = resolve_upstream(original_path)
@@ -1724,19 +1901,42 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
             fwd_headers[hn] = hv
 
     # Parse request body
+    _perf_body_time = (time.monotonic() - _perf_start) * 1000
+    _perf_stages["body_read"] = _perf_body_time
     try:
         req_json = json.loads(body) if body else {}
     except json.JSONDecodeError:
         req_json = {}
 
+    _perf_body_size = len(body)
+    if "messages" in req_json and isinstance(req_json["messages"], list):
+        _perf_msg_count = len(req_json["messages"])
+        _perf_msg_chars = sum(len(str(m.get("content", ""))) for m in req_json["messages"])
+
     sess = await get_session()
 
     # ── Route to appropriate handler ──
     if "/v1/responses" in original_path:
-        return await handle_responses_request(
+        logger.info(
+            f"[perf] REQ body={_perf_body_size}B msgs={_perf_msg_count} chars={_perf_msg_chars} "
+            f"body_read={_perf_body_time:.1f}ms req_id={req_id}"
+        )
+        logger.info(f"[req-trace] ROUTE to responses_handler req_id={req_id}")
+        result = await handle_responses_request(
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
+        _elapsed = time.monotonic() - start_time
+        logger.info(
+            f"[perf] EXIT responses req_id={req_id} TOTAL={_elapsed:.1f}s "
+            f"body={_perf_body_size}B msgs={_perf_msg_count}"
+        )
+        return result
     elif "/v1/chat/completions" in original_path:
+        logger.info(
+            f"[perf] REQ body={_perf_body_size}B msgs={_perf_msg_count} chars={_perf_msg_chars} "
+            f"body_read={_perf_body_time:.1f}ms req_id={req_id}"
+        )
+        logger.info(f"[req-trace] ROUTE to completions_handler req_id={req_id}")
         # ✅ Session Isolation: derive/inject session ID if marker mode is enabled
         hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
         if "messages" in req_json and isinstance(req_json["messages"], list):
@@ -1778,14 +1978,27 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
                     except Exception as e:
                         logger.warning(f"[tool-context] Failed to inject history: {e}")
         
-        return await handle_completions_request(
+        result = await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
             hermes_sid,
         )
+        _elapsed = time.monotonic() - start_time
+        logger.info(
+            f"[perf] EXIT completions req_id={req_id} TOTAL={_elapsed:.1f}s "
+            f"body={_perf_body_size}B msgs={_perf_msg_count} chars={_perf_msg_chars}"
+        )
+        return result
     else:
         # Passthrough for other endpoints (/v1/models, etc.)
-        return await _passthrough(request, upstream_url, fwd_headers, body, sess)
+        logger.info(f"[req-trace] ROUTE to passthrough req_id={req_id}")
+        result = await _passthrough(request, upstream_url, fwd_headers, body, sess)
+        _elapsed = time.monotonic() - start_time
+        logger.info(
+            f"[perf] EXIT passthrough req_id={req_id} TOTAL={_elapsed:.1f}s "
+            f"body={_perf_body_size}B"
+        )
+        return result
 
 
 @APP.api_route("/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -1923,6 +2136,13 @@ async def health():
     }
 
 
+# ── Start background health dump task ──
+@APP.on_event("startup")
+async def _on_startup():
+    """Start background tasks when the server starts."""
+    await start_health_dump()
+
+
 # ── Main ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1935,4 +2155,6 @@ if __name__ == "__main__":
         logger.info(f"  /{port}/v1/*  ->  {url}/v1/*")
     logger.info(f"Default upstream: {DEFAULT_UPSTREAM}")
     logger.info("=" * 60)
+    logger.info(f"Crash debug: SIGUSR2 handler registered (kill -USR2 <pid> for thread dump)")
+    logger.info(f"Crash debug: Periodic health dump enabled (every {_health_dump_interval}s)")
     uvicorn.run(APP, host=BIND_HOST, port=BIND_PORT, log_level="info")

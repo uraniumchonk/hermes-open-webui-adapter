@@ -1,0 +1,117 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index a756134d..898bd5b4 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -3907,9 +3907,15 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
+         system_prompt = None
+-        conversation_messages: List[Dict[str, str]] = []
++        # Any — assistant may carry tool_calls; tool messages carry tool_call_id.
++        # Dropping those fields (old code only kept role+content for user/assistant)
++        # silently destroyed OpenAI-native tool history from hermes_tool_filter
++        # structured conversion, so the model only saw plain assistant prose.
++        conversation_messages: List[Dict[str, Any]] = []
+ 
+         for idx, msg in enumerate(messages):
++            if not isinstance(msg, dict):
++                continue
+             role = msg.get("role", "")
+             raw_content = msg.get("content", "")
+             if role == "system":
+@@ -3920,19 +3926,47 @@ class APIServerAdapter(BasePlatformAdapter):
+                     system_prompt = content
+                 else:
+                     system_prompt = system_prompt + "\n" + content
++            elif role == "tool":
++                # OpenAI-native tool result. Must survive into agent history so
++                # chat_template renders <|im_start|>tool ... special tokens.
++                # Content may be empty string; still keep the row for pairing.
++                entry: Dict[str, Any] = {
++                    "role": "tool",
++                    "content": _normalize_chat_content(raw_content)
++                    if raw_content is not None
++                    else "",
++                }
++                tcid = msg.get("tool_call_id")
++                if tcid:
++                    entry["tool_call_id"] = str(tcid)
++                if msg.get("name"):
++                    entry["name"] = str(msg["name"])
++                conversation_messages.append(entry)
+             elif role in {"user", "assistant"}:
+                 try:
+                     content = _normalize_multimodal_content(raw_content)
+                 except ValueError as exc:
+                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
+-                conversation_messages.append({"role": role, "content": content})
+-
+-        # Extract the last user message as the primary input
++                entry = {"role": role, "content": content}
++                # Preserve assistant.tool_calls (structured history from
++                # hermes_tool_filter). Without this the tool results have no
++                # matching call declaration and get stripped later.
++                if role == "assistant" and msg.get("tool_calls"):
++                    entry["tool_calls"] = msg["tool_calls"]
++                conversation_messages.append(entry)
++
++        # Last USER message is the primary input — not merely messages[-1],
++        # because a malformed client could end on assistant/tool.
+         user_message: Any = ""
+-        history = []
+-        if conversation_messages:
+-            user_message = conversation_messages[-1].get("content", "")
+-            history = conversation_messages[:-1]
++        history: List[Dict[str, Any]] = []
++        last_user_idx = None
++        for i in range(len(conversation_messages) - 1, -1, -1):
++            if conversation_messages[i].get("role") == "user":
++                last_user_idx = i
++                break
++        if last_user_idx is not None:
++            user_message = conversation_messages[last_user_idx].get("content", "")
++            history = conversation_messages[:last_user_idx]
+ 
+         if not _content_has_visible_payload(user_message):
+             return web.json_response(
+@@ -4077,6 +4111,9 @@ class APIServerAdapter(BasePlatformAdapter):
+                     "label": label,
+                     "toolCallId": tool_call_id,
+                     "status": "running",
++                    # hermes_tool_filter enhance-v2 needs args on running so
++                    # completed can still build <arguments> if needed.
++                    "arguments": function_args or {},
+                 }))
+ 
+             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+@@ -4085,14 +4122,30 @@ class APIServerAdapter(BasePlatformAdapter):
+                 Dropped if the start was filtered (internal tool, missing
+                 id, or never seen) so clients never get an orphaned
+                 ``completed`` they can't correlate to a prior ``running``.
++
++                Must include arguments + result: hermes_tool_filter injects
++                <details><arguments>/<result> from these fields. Without
++                them Open WebUI history stores empty tool cards and
++                structured tool-role conversion has nothing to feed the model.
+                 """
+                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
+                     return
+                 _started_tool_call_ids.discard(tool_call_id)
++                if function_result is None:
++                    result_str = ""
++                elif isinstance(function_result, str):
++                    result_str = function_result
++                else:
++                    try:
++                        result_str = json.dumps(function_result, ensure_ascii=False)
++                    except (TypeError, ValueError):
++                        result_str = str(function_result)
+                 _stream_q.put_threadsafe(("__tool_progress__", {
+                     "tool": function_name,
+                     "toolCallId": tool_call_id,
+                     "status": "completed",
++                    "arguments": function_args or {},
++                    "result": result_str,
+                 }))
+ 
+             # Start agent in background.  agent_ref is a mutable container

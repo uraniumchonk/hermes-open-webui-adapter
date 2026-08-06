@@ -1,75 +1,47 @@
 # ═══════════════════════════════════════════════════════════
-# Hermes Tool Card Enhancer Proxy — Configuration
+# Hermes Tool Filter — Configuration
 # ═══════════════════════════════════════════════════════════
-#
-# Environment variables can override these settings:
-# TOOL_MODE, BIND_PORT, BIND_HOST, AUTO_SPLIT_THRESHOLD
-#
-# See README.md for detailed documentation.
+# 需要改的在上；預設 / 很少動的在下。
+# Env 可覆寫：TOOL_MODE, BIND_PORT, BIND_HOST, AUTO_SPLIT_THRESHOLD
+# 穩定參考：git 877fdb7（structured 上線後、flat 刪除前的完整 config）
 
-# ── Server ─────────────────────────────────────────────────
-bind_host: "0.0.0.0"  # Bind to all interfaces for remote access from Open WebUI
-bind_port: 9099
-
-# ── Tool Display Mode ──────────────────────────────────────
-# enhance-v2  : Recommended — real-time streaming + <details> sub-tags (OpenWebUI compatible)
-# enhance     : Filter done=false + inject completion tags with label
-# passthrough : Pass through <details> tags directly (safest)
-# strip       : Remove <details> and replace with plain text
-# native_passthrough : NEW — 完全透傳 + SQLite 存儲 + 歷史注入 (4 Components)
-#   - 組件1: 不修改任何 SSE data
-#   - 組件2: 捕獲 hermes.tool.progress → 顯示 "執行 terminal"
-#   - 組件3: SQLite 存儲完整 tool results (key: session_id + message_id)
-#   - 組件4: Session Marker 檢測 → 注入完整 results 到歷史訊息
-tool_mode: "enhance-v2"
-
-# ── Upstream Routing ───────────────────────────────────────
-# Route table: path prefix → upstream Hermes Gateway address
-# Format: "port": "http://address:port"
-#
-# Profiles on this machine:
-#   30001 → coder profile (qwen-27b)
-#   30002 → coder-master profile (xai grok-4.5)
-#   30005 → family profile
+# ── 必改 ──────────────────────────────────────────────────
+# path prefix → 本機 Hermes Gateway
+# Open WebUI Base URL：http://<host>:9099/<port>/v1
 upstreams:
-  "30001": "http://127.0.0.1:30001"
-  "30002": "http://127.0.0.1:30002"
-  "30003": "http://127.0.0.1:30003"
-  "30004": "http://127.0.0.1:30004"
-  "30005": "http://127.0.0.1:30005"
+  "30001": "http://127.0.0.1:30001"   # coder
+  "30002": "http://127.0.0.1:30002"   # coder-master
+  "30003": "http://127.0.0.1:30003"   # analyst
+  "30004": "http://127.0.0.1:30004"   # trader
+  "30005": "http://127.0.0.1:30005"   # family
 
-# ── Auto Split ─────────────────────────────────────────────
-# Auto-split threshold (characters), 0 to disable
-# Note: Conduit APP does not support session.split events
-auto_split_threshold: 0
+# ── 常用：工具歷史怎麼餵回模型（兩個範本二選一）──────────
+# 把 Open WebUI 存下的 <details type="tool_calls"> 轉成模型可讀歷史。
+#
+# structured（目前 runtime 唯一路徑，推薦）
+#   → 拆成 OpenAI native assistant.tool_calls + role=tool
+#   → 需 api_server_chat_completions_all.patch（否則 Gateway 會丟 tool role）
+#
+# flat（舊 workaround，已從 runtime 移除；見 git ≤877fdb7）
+#   → 仍塞回同一條 assistant content，包成 [START_PREV_ACTION]...[END_PREV_ACTION]
+#   → 不需 tool-role patch，但要 tool_hint 防模型模仿；長對話仍可能污染
+#
+# 詳見 README「兩個歷史範本」。
+tool_history_format: "structured"
 
-# ── History Sanitization (Anti-pollution) ──────────────────
-# Convert Open WebUI <details type="tool_calls"> history into
-# OpenAI-native assistant.tool_calls + role=tool messages.
 enable_history_sanitization: true
-# Result truncation length (adds "..." if exceeded)
 sanitization_result_max_length: 20000
 
-# ── Conversation Compression ───────────────────────────────
-# When X-Hermes-Session-Id is present, Hermes Gateway loads full
-# conversation history from its state.db, making the messages array
-# in the request redundant. This feature reduces the request size
-# by keeping only the system prompt + last user message.
-#
-# Modes:
-#   server-side  — Rely on Hermes Gateway's server-side history (requires
-#                  X-Hermes-Session-Id header). Most efficient, ~90%+ reduction.
-#   disabled     — Send full message history (current behavior).
-compression_mode: "disabled"
+# enhance-v2 = 即時串流 + <details> tool card（Open WebUI）
+tool_mode: "enhance-v2"
 
-# ── Session Isolation (Collision Prevention) ────────────────
-# When two conversations start with identical first messages, they would
-# collide on the same session ID. This feature prevents that by injecting
-# a unique timestamp and tracking sessions via markers in assistant responses.
-#
-# Modes:
-#   disabled  — No isolation (default, relies on X-Hermes-Session-Id header)
-#   marker    — Inject timestamp into first user message + embed session
-#                marker in assistant response as a visible code block.
-#                Recommended when Open WebUI does NOT send X-Hermes-Session-Id.
-session_isolation_mode: "disabled"
+# ── 預設 / 很少改 ─────────────────────────────────────────
+bind_host: "0.0.0.0"
+bind_port: 9099
+auto_split_threshold: 0          # 0=關；Conduit 不支援 session.split
+compression_mode: "disabled"     # server-side | disabled
+session_isolation_mode: "disabled"  # marker | disabled
+comp_mode: "disabled"            # 訊息含 [comp] 時壓縮舊 tool 文字
+
+# flat 時代用的 hint 檔（structured 不需要；保留鍵名僅供對照舊文件）
+# tool_usage_hint_file: "tool_hint.txt"
