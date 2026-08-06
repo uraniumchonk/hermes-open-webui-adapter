@@ -27,8 +27,91 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
-# Import from tool_history_format module for format consistency
-from tool_history_format import format_tool_history_block, flatten_json
+
+def build_previous_tool_context(
+    output_items: list,
+    max_result_length: int = 2000,
+) -> tuple[list, str]:
+    """
+    從上一輪 Responses output items 建立工具歷史 context。
+
+    只支援 structured 格式（OpenAI native tool role messages）。
+
+    Returns:
+        (payload, kind) — kind is always "messages"
+    """
+    pending_calls: dict[str, dict] = {}
+    pairs: list[tuple[dict, str]] = []  # (function_call_item, output_str)
+    orphan_outputs: list[str] = []
+
+    for item in output_items or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = item.get("id") or item.get("call_id") or ""
+            if call_id:
+                pending_calls[call_id] = item
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id") or ""
+            output = item.get("output") or ""
+            if call_id and call_id in pending_calls:
+                pairs.append((pending_calls.pop(call_id), output))
+            elif output:
+                orphan_outputs.append(output)
+
+    # remaining calls without output
+    for call_id, fc in pending_calls.items():
+        pairs.append((fc, ""))
+
+    messages: list[dict] = []
+    for fc, output in pairs:
+        call_id = fc.get("id") or fc.get("call_id") or f"call_htf_prev_{len(messages)}"
+        name = fc.get("name") or "unknown"
+        args_raw = fc.get("arguments") or "{}"
+        if not isinstance(args_raw, str):
+            try:
+                args_raw = json.dumps(args_raw, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args_raw = "{}"
+        out = output if isinstance(output, str) else str(output)
+        if len(out) > max_result_length:
+            out = out[:max_result_length] + "..."
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args_raw},
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": out,
+        })
+    for output in orphan_outputs:
+        out = output if isinstance(output, str) else str(output)
+        if len(out) > max_result_length:
+            out = out[:max_result_length] + "..."
+        cid = f"call_htf_orphan_{len(messages)}"
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": cid,
+                "type": "function",
+                "function": {"name": "unknown", "arguments": "{}"},
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": cid,
+            "content": out,
+        })
+    return messages, "messages"
+
 
 
 # ── Format Conversion: Responses ↔ Chat Completions ───────
@@ -252,24 +335,14 @@ async def _inject_previous_tool_results(
     config: dict,
 ) -> Optional[bytes]:
     """
-    當請求帶有 previous_response_id 時，取得上一輪的 response 並將其
-    tool results 以文字摘要形式注入到 user message 中。
-    
-    問題：
-    Open WebUI 在 stateful 模式下只把 user messages 帶到 input 中，
-    而 Hermes API Server 的 input parser / conversation_history parser
-    都無法完整保留 tool_calls / tool_call_id 等非標準欄位。
-    
-    方案（雙路徑）：
-    路徑 A — native conversation_history：保留 previous_response_id，
-    Hermes 內部從 _response_store 取出完整 history（含工具訊息），
-    這是主要機制。
-    
-    路徑 B — text summary injection（本函數）：
-    將工具結果轉為文字摘要，注入到 input 中作為 context，
-    提供雙重保險。
-    
-    返回新的 body bytes，如果不需要修改則返回 None。
+    當請求帶有 previous_response_id 時，取得上一輪 response 的 tool results，
+    以 OpenAI native tool role messages 注入 input list。
+
+    路徑 A — native conversation_history：保留 previous_response_id（主要機制）。
+    路徑 B — 本函數：list input 插入 assistant.tool_calls + role=tool；
+              string input 無法承載 tool role，跳過 injection。
+
+    返回新的 body bytes；不需要修改則返回 None。
     """
     prev_id = req_json.get("previous_response_id")
     if not prev_id:
@@ -290,121 +363,50 @@ async def _inject_previous_tool_results(
             if not output_items:
                 output_items = prev_resp.get("response", {}).get("output", [])
             
-            # 配對 function_call + function_call_output，產生 [START_PREV_ACTION] 區塊
-            fmt = config.get("tool_history_format", "flat")
-            max_result_length = config.get("sanitization_result_max_length", 2000)
-            
-            # 先收集所有 function_call 和 function_call_output
-            pending_calls: dict[str, dict] = {}  # call_id -> function_call item
-            tool_blocks: list[str] = []
-            
-            for item in output_items:
-                item_type = item.get("type")
-                if item_type == "function_call":
-                    call_id = item.get("id", item.get("call_id", ""))
-                    pending_calls[call_id] = item
-                elif item_type == "function_call_output":
-                    call_id = item.get("call_id", "")
-                    output = item.get("output", "")
-                    
-                    if call_id and call_id in pending_calls:
-                        fc = pending_calls[call_id]
-                        name = fc.get("name", "unknown")
-                        try:
-                            args = json.loads(fc.get("arguments", "{}"))
-                        except (json.JSONDecodeError, TypeError):
-                            args = None
-                        
-                        block = format_tool_history_block(
-                            tool_name=name,
-                            args=args,
-                            result_raw=output,
-                            max_result_length=max_result_length,
-                        )
-                        tool_blocks.append(block)
-                    elif output:
-                        # 沒有配對的 output，直接用一般格式
-                        if fmt == "flat":
-                            if len(output) > max_result_length:
-                                output = output[:max_result_length] + "..."
-                            block = (
-                                f"[START_PREV_ACTION]\n"
-                                f"[ACTION_TYPE]\nunknown\n"
-                                f"[ACTION_ARG]\n(none)\n"
-                                f"[RESULT]\n{output}\n"
-                                f"[END_PREV_ACTION]"
-                            )
-                        else:
-                            block = f"[Previous turn] Tool result: {output}"
-                        tool_blocks.append(block)
-            
-            # 處理有 call 但沒有 output 的
-            for call_id, fc in pending_calls.items():
-                name = fc.get("name", "unknown")
-                try:
-                    args = json.loads(fc.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    args = None
-                
-                block = format_tool_history_block(
-                    tool_name=name,
-                    args=args,
-                    result_raw="",
-                    max_result_length=max_result_length,
-                )
-                tool_blocks.append(block)
-            
-            if not tool_blocks:
+            max_result_length = int(config.get("sanitization_result_max_length", 2000))
+
+            payload, kind = build_previous_tool_context(
+                output_items, max_result_length=max_result_length
+            )
+            if not payload:
                 logger.debug(f"[responses] No tool items to summarize from {prev_id}")
                 return None
-            
-            summary_text = "\n\n".join(tool_blocks)
-            
-            # 注入到 input 的 user message 前面
+
             current_input = req_json.get("input", "")
-            
-            if fmt == "flat":
-                context_block = f"{summary_text}\n\n"
-            else:
-                context_block = (
-                    "<tool_results_from_previous_turn>\n"
-                    f"{summary_text}\n"
-                    "</tool_results_from_previous_turn>\n\n"
-                )
-            
-            if isinstance(current_input, str):
-                new_input = context_block + current_input
-            elif isinstance(current_input, list):
-                # 找到 user message 並在前面插入
-                new_input = []
+
+            # structured + list input → insert native tool role messages
+            if isinstance(current_input, list):
+                new_input: list = []
                 injected = False
                 for item in current_input:
-                    if not injected and isinstance(item, dict) and item.get("role") == "user":
-                        orig_content = item.get("content", "")
-                        new_item = dict(item)
-                        new_item["content"] = context_block + orig_content
-                        new_input.append(new_item)
+                    if (
+                        not injected
+                        and isinstance(item, dict)
+                        and item.get("role") == "user"
+                    ):
+                        new_input.extend(payload)
+                        new_input.append(item)
                         injected = True
                     else:
                         new_input.append(item)
                 if not injected:
-                    new_input = [{"role": "user", "content": context_block}] + new_input
-                current_input = new_input
-            else:
+                    new_input = list(payload) + list(current_input)
+                req_json["input"] = new_input
+                new_body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
+                n_tools = sum(1 for m in payload if m.get("role") == "tool")
+                logger.info(
+                    f"[responses] Injected {n_tools} structured tool message(s) "
+                    f"from {prev_id} into input list (path B: structured)"
+                )
+                return new_body
+
+            # String input: cannot carry tool role messages, skip injection
+            if isinstance(current_input, str):
+                logger.info(
+                    f"[responses] Skipping tool injection for string input "
+                    f"from {prev_id} (string cannot carry tool role messages)"
+                )
                 return None
-            
-            req_json["input"] = current_input
-            new_body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
-            
-            logger.info(
-                f"[responses] Injected {len(tool_blocks)} tool-result blocks "
-                f"from {prev_id} into input (path B: text injection, format={fmt})"
-            )
-            logger.debug(
-                f"[responses] Injected text:\n{context_block[:500]}"
-            )
-            
-            return new_body
             
     except Exception as e:
         logger.warning(f"[responses] Failed to inject previous tool results: {e}")

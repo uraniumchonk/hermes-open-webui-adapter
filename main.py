@@ -37,14 +37,8 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
 import tool_history_format
-from tool_history_format import (
-    flatten_json,
-    format_tool_history_block,
-    _format_args_flat,
-    _format_result_flat,
-    sanitize_message_content,
-)
 from comp_mode import compress_tool_results
+import native_tool_context
 try:
     import yaml
     HAS_YAML = True
@@ -52,11 +46,31 @@ except ImportError:
     HAS_YAML = False
 
 # ── Logging ───────────────────────────────────────────────
+# Production default INFO. Set TOOL_FILTER_LOG_LEVEL=DEBUG for deep tracing.
+# DEBUG on a long-lived SSE proxy can retain huge format args and flood journald.
+_LOG_LEVEL = getattr(logging, os.environ.get("TOOL_FILTER_LOG_LEVEL", "INFO").upper(), logging.INFO)
+
+# ── 雙重日誌：console + file ──
+# 將關鍵錯誤和除錯資訊寫入 .log 文件，不依賴 systemd journal
+LOG_FILE = Path(__file__).parent / "hermes_tool_filter.log"
+
+# Console handler (systemd journal)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(_LOG_LEVEL)
+console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+# File handler (persistent log for debugging)
+file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)  # 文件記錄所有 DEBUG 級別
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+
+# Root logger
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[console_handler, file_handler],
 )
 logger = logging.getLogger("tool-filter")
+logger.setLevel(logging.DEBUG)
 
 # ── Configuration ──────────────────────────────────────────
 
@@ -102,15 +116,25 @@ BIND_HOST = CONFIG.get("bind_host", "0.0.0.0")
 BIND_PORT = CONFIG.get("bind_port", 9099)
 
 # Port routing table: path prefix -> upstream base URL
-PORT_MAP: Dict[str, str] = {
+# 優先使用 config.yaml 的 upstreams，fallback 到硬編碼預設值
+_DEFAULT_PORT_MAP: Dict[str, str] = {
     "30000": "http://127.0.0.1:30000",
     "30001": "http://127.0.0.1:30001",
     "30002": "http://127.0.0.1:30002",
     "30003": "http://127.0.0.1:30003",
 }
 
+# 從 config.yaml 載入 upstreams（如果有的話）
+_config_upstreams = CONFIG.get("upstreams", {})
+if _config_upstreams:
+    PORT_MAP: Dict[str, str] = dict(_DEFAULT_PORT_MAP)
+    PORT_MAP.update(_config_upstreams)
+    logger.info(f"PORT_MAP loaded from config.yaml: {PORT_MAP}")
+else:
+    PORT_MAP = _DEFAULT_PORT_MAP
+
 # Default upstream if no port prefix matched
-DEFAULT_UPSTREAM = PORT_MAP["30000"]
+DEFAULT_UPSTREAM = PORT_MAP.get("30000", "http://127.0.0.1:30000")
 
 # ── Emoji Mapping ─────────────────────────────────────────
 
@@ -229,12 +253,8 @@ def _strip_details_from_content(frame: str) -> str:
 # 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
 # 把 <details type="tool_calls"> 區塊轉換為安全的格式。
 #
-# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length, tool_history_format
-#
-# tool_history_format:
-#   legacy — 自然語言描述（舊版）
-#   flat   — [START_PREV_ACTION] k:v 格式（新版，防止 JSON 污染）
-#   → 實作在 tool_history_format.py 中
+# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length
+# 只支援 structured 格式（OpenAI native tool role messages）
 
 
 def sanitize_request_messages(
@@ -244,74 +264,17 @@ def sanitize_request_messages(
     Scan and sanitize all messages in the request to prevent <details> pollution.
     Only processes assistant role content.
 
-    Configurable via config.yaml's enable_history_sanitization toggle.
-
-    **Deterministic random**: each message uses its own content hash as seed,
-    ensuring consistent sanitization results for the same request (vLLM KV cache friendly).
+    Always uses structured format (OpenAI native tool role messages).
     """
     if not messages:
         return messages
 
-    enabled, max_length, fmt = tool_history_format._get_sanitization_config(CONFIG)
+    enabled = tool_history_format._get_sanitization_config(CONFIG)[0]
     if not enabled:
         return messages
 
-    total_details_cleaned = 0
-    messages_cleaned = 0
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("content"):
-            original = msg["content"]
-            seed = hash(original) & 0xFFFFFFFF
-            sanitized, count = sanitize_message_content(
-                original, seed=seed, max_result_length=max_length, fmt=fmt
-            )
-            msg["content"] = sanitized
-            if count > 0:
-                messages_cleaned += 1
-                total_details_cleaned += count
-
-    if total_details_cleaned > 0:
-        logger.info(
-            f"[sanitization] Replaced {total_details_cleaned} <details> tag(s) "
-            f"across {messages_cleaned} message(s) from {len(messages)} total messages"
-        )
-
-    # ── Inject tool usage hint from file into the last user message ──
-    template = ""
-    hint_file = CONFIG.get("tool_usage_hint_file", "")
-    if hint_file:
-        hint_path = CONFIG_PATH.parent / hint_file
-        try:
-            with open(hint_path, "r", encoding="utf-8") as f:
-                template = f.read().strip()
-        except Exception as e:
-            logger.warning(f"[tool_hint] Failed to read hint file {hint_path}: {e}")
-
-    if template:
-        # Find the last user message with non-empty content
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if msg.get("role") == "user" and msg.get("content"):
-                last_user_idx = i
-                break
-
-        if last_user_idx is not None:
-            content = messages[last_user_idx]["content"]
-            # Handle both string and list content formats
-            if isinstance(content, list):
-                # For list content, append as a new text part
-                messages[last_user_idx]["content"] = content + [{"type": "text", "text": template}]
-            else:
-                # For string content, append with separator
-                messages[last_user_idx]["content"] = content + "\n\n" + template
-            logger.debug(f"[tool_hint] Appended hint from {hint_file} to last user message (index {last_user_idx})")
-        else:
-            # No user message found; create a new one at the end
-            messages.append({"role": "user", "content": template})
-            logger.debug(f"[tool_hint] Appended new user message with hint from {hint_file}")
-
-    return messages
+    from tool_history_structured import sanitize_messages_structured
+    return sanitize_messages_structured(messages, CONFIG)
 
 
 # ── Client-Side [comp] Compression ─────────────────────────
@@ -618,6 +581,19 @@ _session_cache: Dict[str, str] = {}
 # Use a dict instead of a single global to avoid race conditions between requests.
 _pending_session_markers: dict = {}
 
+# 防洩漏：session 指紋快取長期運行會無限增長，加上限並丟棄最舊的。
+_MAX_SESSION_CACHE = 5000
+_MAX_PENDING_MARKERS = 1000
+
+
+def _bounded_put(cache: dict, key: str, value, max_size: int) -> None:
+    """有序 dict 的 bounded insert：超過上限時丟棄最舊的 10%。"""
+    cache[key] = value
+    if len(cache) > max_size:
+        drop = list(cache.keys())[: max(1, len(cache) // 10)]
+        for k in drop:
+            cache.pop(k, None)
+
 
 def _session_isolation_enabled() -> bool:
     """Check if session isolation (marker mode) is enabled."""
@@ -820,11 +796,11 @@ def get_or_create_session_id(messages: list) -> str:
 
     # Store in cache keyed by original fingerprint
     original = _strip_timestamp_and_derive(messages)
-    _session_cache[original] = stamped_derived
+    _bounded_put(_session_cache, original, stamped_derived, _MAX_SESSION_CACHE)
 
     # Remember the marker so transform_stream can embed it in the first
     # assistant response.
-    _pending_session_markers[stamped_derived] = (original, timestamp)
+    _bounded_put(_pending_session_markers, stamped_derived, (original, timestamp), _MAX_PENDING_MARKERS)
     logger.info(f"[session] NEW session created: {original} → {stamped_derived}, marker pending")
 
     return stamped_derived
@@ -842,7 +818,7 @@ def update_session_id(messages: list, new_sid: str) -> None:
     """
     original = _strip_timestamp_and_derive(messages)
     if original and new_sid:
-        _session_cache[original] = new_sid
+        _bounded_put(_session_cache, original, new_sid, _MAX_SESSION_CACHE)
 
 
 def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> list:
@@ -915,7 +891,7 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
-    - **多模態處理**：偵測 _multimodal 信封包，保留 base64 圖片為 JSON
+    - **多模態處理**：基於 arguments 中的圖片欄位判斷，替換 base64 為簡短提示
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
@@ -952,18 +928,51 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     
     if result:
         # ── 多模態處理：基於 arguments 判斷是否為視覺工具 ──
-        # 
+        #
         # 優雅策略：檢查 arguments 中是否包含圖片相關欄位（image_url, image_path 等），
         # 而非硬編碼工具名稱清單。這樣未來新增視覺工具時不需要修改此處。
+        #
+        # 注意：result 可能是 dict（直接從 hermes.tool.progress 事件來）
+        # 或 str（已序列化的 JSON）。兩種都需處理。
         
-        result_len = len(result)
+        # 第一步：將 dict 轉為 str，並計算原始大小
+        result_str = ""  # 初始化，避免 Pyright 未綁定警告
+        result_len = 0
         
-        # 圖片相關欄位清單（排除通用的 path，只保留明確的圖片欄位）
-        image_keys = {"image_url", "image_path", "screenshot_path"}
+        if isinstance(result, dict):
+            # dict 格式：序列化後計算大小
+            try:
+                result_str = json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError):
+                result_str = str(result)
+            result_len = len(result_str)
+        else:
+            # str 格式：直接使用
+            result_str = str(result) if not isinstance(result, str) else result
+            result_len = len(result_str)
+        
+        # 圖片相關欄位清單（包含單數/複數形式）
+        image_keys = {"image_url", "image_urls", "image_path", "image_paths", 
+                      "path", "paths", "screenshot_path", "screenshot_paths",
+                      "images", "image"}
         
         # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
         has_image_arg = arguments is not None and image_keys & set(arguments.keys())
         is_large_result = result_len > 10240
+        
+        # DEBUG: 記錄 arguments 狀態以便排查
+        if is_large_result and not has_image_arg:
+            logger.warning(
+                f"[multimodal-debug] Large result ({result_len} bytes) but has_image_arg=False! "
+                f"arguments type={type(arguments).__name__}, keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
+                f"tool_name={tool_name}"
+            )
+        elif is_large_result and has_image_arg:
+            logger.info(
+                f"[multimodal-debug] Large result ({result_len} bytes) detected as multimodal! "
+                f"arguments keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
+                f"tool_name={tool_name}"
+            )
         
         if has_image_arg and is_large_result:
             # 視覺工具的大結果：直接替換成簡短提示
@@ -971,7 +980,7 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
             inner += f"\n<result>圖片已從上下文移除（原始大小 {result_len/1024:.1f}KB）。想要再看圖片請再調用一次視覺工具即可。</result>"
         else:
             # 一般結果：用 html.escape 避免 XSS
-            truncated = result[:5000] + ("..." if len(result) > 5000 else "")
+            truncated = result_str[:5000] + ("..." if result_len > 5000 else "")
             inner += f"\n<result>{html.escape(truncated)}</result>"
     
     return f'<details {attrs}>{inner}\n</details>'
@@ -1072,18 +1081,31 @@ class ToolCallBuffer:
     def __init__(self):
         # 追蹤正在執行的工具: tc_id -> {tool, emoji, label, arguments}
         self.active_tools: Dict[str, dict] = {}
-    
-    def on_tool_running(self, tc_id: str, payload: dict,
-                        completion_id: str, created: int, model: str) -> List[bytes]:
-        """工具開始執行，記錄狀態並立即發送 running 通知以保持 stream 活躍。"""
-        tool_name = payload.get("tool", "unknown")
-        emoji = payload.get("emoji", get_tool_emoji(tool_name))
-        
+        # 防洩漏：gateway 發了 running 但沒發 completed（agent 被打斷/上游斷線）時，
+        # entry 會永久留在 dict。上限 + TTL 確保長期運行不會無限增長。
+        self._max_tools = 500
+        self._ttl_seconds = 600  # 10 分鐘沒完成就當作孤兒清理
+
+    def _prune(self) -> None:
+        """清理過期 entry；超上限時丟棄最舊的。"""
+        now = time.monotonic()
+        stale = [tid for tid, st in self.active_tools.items()
+                 if now - st.get("_started", now) > self._ttl_seconds]
+        for tid in stale:
+            self.active_tools.pop(tid, None)
+        while len(self.active_tools) >= self._max_tools:
+            # dict 保持插入順序，pop 最舊的（在插入前執行，確保永不超過上限）
+            self.active_tools.pop(next(iter(self.active_tools)), None)
+
+    def on_tool_running(self, tc_id: str, payload: dict) -> None:
+        """工具開始執行，記錄狀態（不發送 running 卡片）。"""
+        self._prune()
         self.active_tools[tc_id] = {
             "tool": tool_name,
             "emoji": emoji,
             "label": payload.get("label", tool_name),
             "arguments": payload.get("arguments", {}),
+            "_started": time.monotonic(),
         }
         
         # ✅ 發送空 chunk 保持 SSE stream 活躍（防止 Open WebUI idle timeout）
@@ -1170,7 +1192,13 @@ async def transform_stream(
 
     # 使用 bytes buffer 避免反覆 decode/encode
     buffer = b""
-    
+    # Hard cap: if upstream framing breaks (no \n\n), buffer must not grow without bound.
+    # 16MB is far above any legitimate single SSE frame (session_search ~235KB historically).
+    MAX_SSE_BUFFER = 16 * 1024 * 1024
+    # Soft RSS guard — log when process RSS exceeds this (does not kill; systemd MemoryMax does).
+    _rss_warn_bytes = 512 * 1024 * 1024
+    _last_rss_check = 0.0
+
     # 自動分割計數器
     accumulated_content = ""
     has_split = False
@@ -1189,6 +1217,31 @@ async def transform_stream(
     
     # ✅ 修復：追蹤是否已發送第一個有內容的 chunk，避免心跳干擾
     first_content_sent = False
+
+    def _maybe_log_rss() -> None:
+        nonlocal _last_rss_check
+        now = time.monotonic()
+        if now - _last_rss_check < 30.0:
+            return
+        _last_rss_check = now
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # VmRSS is in kB
+                        rss_kb = int(line.split()[1])
+                        rss_bytes = rss_kb * 1024
+                        if rss_bytes >= _rss_warn_bytes:
+                            logger.warning(
+                                f"[mem] high RSS={rss_kb} kB buffer_len={len(buffer)} "
+                                f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0} "
+                                f"heartbeat_count={heartbeat_count}"
+                            )
+                        else:
+                            logger.debug(f"[mem] RSS={rss_kb} kB buffer_len={len(buffer)}")
+                        break
+        except Exception:
+            pass
     
     # ✅ 防火牆優化：在開始讀取 upstream 前，先發送初始心跳強制連接建立
     # 學校防火牆/代理可能會緩衝小數據包，我們用多層策略確保連接不被卡住
@@ -1209,7 +1262,9 @@ async def transform_stream(
     initial_wait_interval = 0.5  # 初始等待階段每 0.5 秒發送心跳
     
     # ✅ 預建心跳 chunk 模板（避免每次重複格式化）
-    _heartbeat_chunk_tpl = b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    # 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
+    # SSE comment (:) 不被某些客戶端計入 idle timer，導致斷線
+    _heartbeat_chunk_tpl = b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}  \n\n'
     
     # 主循環
     while True:
@@ -1224,7 +1279,6 @@ async def transform_stream(
             tool_just_completed = False
             
             # ✅ 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
-            # SSE comment (:) 不被某些客戶端計入 idle timer，導致斷線
             yield _heartbeat_chunk_tpl % (
                 completion_id.encode(), created, model.encode()
             )
@@ -1237,6 +1291,12 @@ async def transform_stream(
             line = await asyncio.wait_for(reader.readline(), timeout=1.0)
         except asyncio.TimeoutError:
             # 超時了，繼續循環，下次心跳會發送
+            # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
+            if not first_content_sent and len(buffer) > 0:
+                logger.warning(
+                    f"[readline-debug] TIMEOUT but buffer_len={len(buffer)}, "
+                    f"buffer_preview={buffer[:200]!r}, first_content_sent={first_content_sent}"
+                )
             continue
         except Exception as e:
             # readline() 可能丟出 exception（例如 client 斷開連線）
@@ -1246,6 +1306,14 @@ async def transform_stream(
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
             raise
+
+        # DEBUG: 記錄所有讀取的原始行（前 100 行）
+        if heartbeat_count < 100:
+            line_preview = line[:100] if line else b""
+            logger.debug(
+                f"[readline-debug] READ line_len={len(line)}, preview={line_preview!r}, "
+                f"buffer_len={len(buffer)}, first_content={first_content_sent}"
+            )
 
         # Empty line means end of connection — LOG THIS!
         if not line:
@@ -1260,6 +1328,19 @@ async def transform_stream(
             break
 
         buffer += line
+        if len(buffer) > MAX_SSE_BUFFER:
+            logger.error(
+                f"[enhance-v2] SSE buffer exceeded {MAX_SSE_BUFFER} bytes "
+                f"(len={len(buffer)}); aborting stream to prevent host OOM. "
+                f"Likely broken upstream framing (missing \\n\\n)."
+            )
+            yield (
+                b'data: {"error":{"message":"SSE buffer overflow in tool filter",'
+                b'"type":"proxy_error","code":"sse_buffer_overflow"}}\n\n'
+            )
+            break
+
+        _maybe_log_rss()
 
         # Process complete SSE frames (terminated by \n\n)
         while b"\n\n" in buffer:
@@ -1502,18 +1583,62 @@ async def transform_stream(
 _http_session: Optional[aiohttp.ClientSession] = None
 
 
+# ── Memory Self-Protection ────────────────────────────────
+# 歷史教訓：Open WebUI 帶大量 tool 結果的對話歷史請求可以輕鬆吃掉數百 MB
+# （body 讀入 → json 解析 → sanitize 多份拷貝 → 重新序列化）。
+# MemoryMax=2G 只計 RSS 不計 swap-out，無限 swap thrashing 會讓進程凍結。
+# 這裡在請求入口主動檢查 RSS：逼近上限時立刻拒接 + gc，讓 Open WebUI 重試，
+# 而不是讓整個進程被 swap 拖死。systemd MemorySwapMax=256M 是最後防線。
+
+_MEM_GUARD_BYTES = 1300 * 1024 * 1024  # 1.3GB，留 700MB 給 MemoryMax=2G 緩衝
+MAX_REQUEST_BODY = 128 * 1024 * 1024   # 128MB 請求體上限（防超大歷史）
+_mem_guard_last_gc = 0.0
+
+
+def _rss_bytes() -> int:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _mem_guard_reject() -> bool:
+    """
+    記憶體壓力檢查。回傳 True 表示應該拒接請求（503）。
+    超過閾值時先 gc.collect() 一次，仍超過才拒接。
+    """
+    global _mem_guard_last_gc
+    if _rss_bytes() < _MEM_GUARD_BYTES:
+        return False
+    now = time.monotonic()
+    if now - _mem_guard_last_gc > 5.0:
+        _mem_guard_last_gc = now
+        import gc
+        collected = gc.collect()
+        logger.warning(f"[mem-guard] RSS exceeded {_MEM_GUARD_BYTES//(1024*1024)}MB, "
+                       f"gc.collect() freed {collected} objects")
+    return _rss_bytes() > _MEM_GUARD_BYTES
+
+
 async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        # read_bufsize: vision_analyze 等視覺工具的 result 包含 base64 圖片
-        # SSE frame 可能超過 1MB（圖片大小 + JSON 包裝）
+        # read_bufsize: vision_analyze 回傳的 base64 圖片可達 3-4MB
         # aiohttp 的 StreamReader._high_water = read_bufsize * 2
         # readline() 的 max_size 預設為 _high_water
-        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 tool result（含 base64 圖片）
+        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 base64 圖片
+        
+        # ✅ 關鍵修復：設定 auto_decompress=False 避免額外的解壓縮開銷
+        # 並確保 timer_host 正確設定以支援 backpressure
         _http_session = aiohttp.ClientSession(
             timeout=timeout,
-            read_bufsize=4194304,  # 4MB
+            read_bufsize=4194304,
+            auto_decompress=False,  # 避免不必要的解壓縮
         )
     return _http_session
 
@@ -1561,7 +1686,31 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
     original_path = f"/{port_prefix}/{rest}"
     upstream_url = resolve_upstream(original_path)
 
+    # ── Memory self-protection: reject under pressure before reading body ──
+    if _mem_guard_reject():
+        return JSONResponse(
+            content={"error": {"message": "Proxy under memory pressure, retry later",
+                               "type": "proxy_error", "code": "memory_pressure"}},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
+    # ── Request body cap: refuse pathological request bodies ──
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
+
     body = await request.body()
+    if len(body) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
 
     # Build forwarded headers — include Hermes session headers for stateful mode
     fwd_headers = {}
@@ -1608,6 +1757,23 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
             )
+            
+            # ✅ Component 4: Session Marker Detection & History Injection (Native Tool Context)
+            if TOOL_MODE == "native_passthrough" and hermes_sid:
+                marker_info = native_tool_context.detect_session_marker(req_json["messages"])
+                if marker_info:
+                    detected_sid, ts = marker_info
+                    target_sid = detected_sid if detected_sid == hermes_sid else hermes_sid
+                    try:
+                        db = native_tool_context.get_tool_context_db()
+                        tool_results = await db.get_tool_results_by_session(target_sid)
+                        if tool_results:
+                            req_json["messages"] = native_tool_context.inject_tool_results_into_history(
+                                req_json["messages"], target_sid, tool_results
+                            )
+                    except Exception as e:
+                        logger.warning(f"[tool-context] Failed to inject history: {e}")
+        
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
@@ -1627,7 +1793,29 @@ async def proxy_default(request: Request, rest: str):
     original_path = f"/{rest}"
     upstream_url = resolve_upstream(original_path)
 
+    # ── Memory self-protection + body cap (same as proxy_with_transform) ──
+    if _mem_guard_reject():
+        return JSONResponse(
+            content={"error": {"message": "Proxy under memory pressure, retry later",
+                               "type": "proxy_error", "code": "memory_pressure"}},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
+
     body = await request.body()
+    if len(body) > MAX_REQUEST_BODY:
+        return JSONResponse(
+            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
+                               "type": "proxy_error", "code": "body_too_large"}},
+            status_code=413,
+        )
 
     # Build forwarded headers — include Hermes session headers for stateful mode
     fwd_headers = {}
@@ -1674,6 +1862,22 @@ async def proxy_default(request: Request, rest: str):
             req_json["messages"] = compress_request_messages(
                 req_json["messages"], hermes_sid, CONFIG
             )
+            
+            # ✅ Component 4: Session Marker Detection & History Injection (Native Tool Context)
+            if TOOL_MODE == "native_passthrough" and hermes_sid:
+                marker_info = native_tool_context.detect_session_marker(req_json["messages"])
+                if marker_info:
+                    detected_sid, ts = marker_info
+                    target_sid = detected_sid if detected_sid == hermes_sid else hermes_sid
+                    try:
+                        db = native_tool_context.get_tool_context_db()
+                        tool_results = await db.get_tool_results_by_session(target_sid)
+                        if tool_results:
+                            req_json["messages"] = native_tool_context.inject_tool_results_into_history(
+                                req_json["messages"], target_sid, tool_results
+                            )
+                    except Exception as e:
+                        logger.warning(f"[tool-context] Failed to inject history: {e}")
         return await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,

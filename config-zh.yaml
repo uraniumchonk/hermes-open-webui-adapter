@@ -41,23 +41,10 @@ upstreams:
 auto_split_threshold: 0
 
 # ── History Sanitization (Anti-pollution) ──────────────────
-# 在轉發請求前，將 assistant content 中的 <details type="tool_calls"> 標籤
-# 轉換為安全格式，切斷污染反饋迴圈。
+# 將 Open WebUI 的 <details type="tool_calls"> 歷史轉成
+# OpenAI 原生 assistant.tool_calls + role=tool messages。
 enable_history_sanitization: true
 # 結果截斷字元數（超過此長度會加上 "..."）
-sanitization_result_max_length: 2000
-# 歷史格式：
-#   flat   — [START_PREV_ACTION] k:v 格式（推薦，防止 JSON 污染）
-#   legacy — 自然語言描述（舊版）
-tool_history_format: "legacy"
+sanitization_result_max_length: 20000
 
-# ── Tool Usage Hint (Jinja Template) ───────────────────────
-# 在訊息末尾插入工具調用提示，防止模型注意力稀釋。
-# 這是一個 Jinja2 模板，會被渲染後附加在 user message 的最後。
-# 模板變數：
-#   - tools: 工具列表（每個工具包含 name, description, parameters 等）
-# 
-# 注意：此模板由外部系統（如 Open WebUI 的 Jinja 處理器）渲染，
-# 不是由 hermes_tool_filter 渲染。
-# 留空或設置為 "" 表示不插入任何提示。
-tool_usage_hint_template: ""
+
