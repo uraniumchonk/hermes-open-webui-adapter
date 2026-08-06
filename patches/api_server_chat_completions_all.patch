@@ -1,8 +1,129 @@
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index a756134d..898bd5b4 100644
+index a756134d..b3265c91 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -3907,9 +3907,15 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -206,6 +206,120 @@ def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> by
+     return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
+ 
+ 
++# vision_analyze native fast path returns a multimodal envelope with full
++# base64 pixels. That result still goes into the agent loop for the model, but
++# hermes.tool.progress is only for UI/tool-filter cards — dumping multi-MB
++# base64 there OOMs proxies (readline high_water) and drops Open WebUI.
++_DATA_URL_RE = re.compile(
++    r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{64,}",
++    re.MULTILINE,
++)
++_PROGRESS_RESULT_SOFT_CAP = 32_768
++
++
++def _redact_progress_arguments(function_args: Any) -> Any:
++    """Strip base64 / oversized strings from tool-progress arguments."""
++    args = function_args or {}
++    if isinstance(args, str):
++        try:
++            args = json.loads(args)
++        except (TypeError, ValueError, json.JSONDecodeError):
++            if "data:image" in args or len(args) > 4000:
++                return {"_redacted": True, "note": f"arguments redacted ({len(args)} chars)"}
++            return args
++    if not isinstance(args, dict):
++        return args
++    clean: Dict[str, Any] = {}
++    for key, value in args.items():
++        if isinstance(value, str) and (
++            value.startswith("data:image")
++            or ("base64" in value[:80] and len(value) > 2000)
++            or len(value) > 8000
++        ):
++            clean[key] = f"[redacted {len(value)} chars]"
++        elif isinstance(value, list) and key in {
++            "image_url", "image_urls", "images", "image_paths", "paths",
++        }:
++            clean[key] = f"[redacted list len={len(value)}]"
++        else:
++            clean[key] = value
++    return clean
++
++
++def _redact_progress_result(function_result: Any) -> str:
++    """Serialize tool result for hermes.tool.progress without base64 pixels.
++
++    Full multimodal envelopes stay inside the agent loop; this string is only
++    for SSE consumers (hermes_tool_filter / Open WebUI tool cards).
++    """
++    if function_result is None:
++        return ""
++
++    obj: Any = function_result
++    if isinstance(function_result, str):
++        stripped = function_result.lstrip()
++        looks_multi = (
++            stripped.startswith("{")
++            and (
++                '"_multimodal"' in function_result[:120]
++                or "_multimodal" in function_result[:80]
++                or "data:image" in function_result[:2000]
++            )
++        )
++        if looks_multi:
++            try:
++                obj = json.loads(function_result)
++            except (TypeError, ValueError, json.JSONDecodeError):
++                redacted = _DATA_URL_RE.sub("[base64_image_redacted]", function_result)
++                if len(redacted) > _PROGRESS_RESULT_SOFT_CAP:
++                    return (
++                        redacted[:_PROGRESS_RESULT_SOFT_CAP]
++                        + f"...[truncated from {len(function_result)} chars]"
++                    )
++                return redacted
++        else:
++            if "data:image" in function_result or len(function_result) > 100_000:
++                redacted = _DATA_URL_RE.sub("[base64_image_redacted]", function_result)
++                if len(redacted) > _PROGRESS_RESULT_SOFT_CAP:
++                    return (
++                        redacted[:_PROGRESS_RESULT_SOFT_CAP]
++                        + f"...[truncated from {len(function_result)} chars]"
++                    )
++                return redacted
++            return function_result
++
++    if isinstance(obj, dict) and obj.get("_multimodal"):
++        raw_meta = obj.get("meta")
++        meta: Dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
++        slim_meta: Dict[str, Any] = {}
++        for k in ("image_url", "size_bytes", "native_vision"):
++            if k in meta:
++                slim_meta[k] = meta[k]
++        slim: Dict[str, Any] = {
++            "_multimodal_redacted": True,
++            "text_summary": obj.get("text_summary")
++            or "Image loaded natively (base64 redacted from progress SSE)",
++            "meta": slim_meta,
++        }
++        texts: List[str] = []
++        for part in obj.get("content") or []:
++            if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
++                texts.append(str(part["text"]))
++        if texts:
++            slim["text"] = "\n".join(texts)
++        return json.dumps(slim, ensure_ascii=False)
++
++    try:
++        result_str = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
++    except (TypeError, ValueError):
++        result_str = str(obj)
++    if "data:image" in result_str:
++        result_str = _DATA_URL_RE.sub("[base64_image_redacted]", result_str)
++    if len(result_str) > 100_000:
++        return result_str[:_PROGRESS_RESULT_SOFT_CAP] + f"...[truncated from {len(result_str)} chars]"
++    return result_str
++
++
+ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
+     """Parse a listen port without letting malformed env/config values crash startup."""
+     try:
+@@ -3907,9 +4021,15 @@ class APIServerAdapter(BasePlatformAdapter):
  
          # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
          system_prompt = None
@@ -19,7 +140,7 @@ index a756134d..898bd5b4 100644
              role = msg.get("role", "")
              raw_content = msg.get("content", "")
              if role == "system":
-@@ -3920,19 +3926,47 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3920,19 +4040,47 @@ class APIServerAdapter(BasePlatformAdapter):
                      system_prompt = content
                  else:
                      system_prompt = system_prompt + "\n" + content
@@ -74,17 +195,18 @@ index a756134d..898bd5b4 100644
  
          if not _content_has_visible_payload(user_message):
              return web.json_response(
-@@ -4077,6 +4111,9 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4077,6 +4225,10 @@ class APIServerAdapter(BasePlatformAdapter):
                      "label": label,
                      "toolCallId": tool_call_id,
                      "status": "running",
 +                    # hermes_tool_filter enhance-v2 needs args on running so
 +                    # completed can still build <arguments> if needed.
-+                    "arguments": function_args or {},
++                    # Never put data:image base64 on the wire (multi-MB SSE).
++                    "arguments": _redact_progress_arguments(function_args),
                  }))
  
              def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-@@ -4085,14 +4122,30 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4085,14 +4237,26 @@ class APIServerAdapter(BasePlatformAdapter):
                  Dropped if the start was filtered (internal tool, missing
                  id, or never seen) so clients never get an orphaned
                  ``completed`` they can't correlate to a prior ``running``.
@@ -93,24 +215,20 @@ index a756134d..898bd5b4 100644
 +                <details><arguments>/<result> from these fields. Without
 +                them Open WebUI history stores empty tool cards and
 +                structured tool-role conversion has nothing to feed the model.
++
++                Multimodal / base64 payloads are redacted here — the agent
++                loop still receives the full function_result for the model;
++                progress SSE is UI-only and must stay small.
                  """
                  if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                      return
                  _started_tool_call_ids.discard(tool_call_id)
-+                if function_result is None:
-+                    result_str = ""
-+                elif isinstance(function_result, str):
-+                    result_str = function_result
-+                else:
-+                    try:
-+                        result_str = json.dumps(function_result, ensure_ascii=False)
-+                    except (TypeError, ValueError):
-+                        result_str = str(function_result)
++                result_str = _redact_progress_result(function_result)
                  _stream_q.put_threadsafe(("__tool_progress__", {
                      "tool": function_name,
                      "toolCallId": tool_call_id,
                      "status": "completed",
-+                    "arguments": function_args or {},
++                    "arguments": _redact_progress_arguments(function_args),
 +                    "result": result_str,
                  }))
  

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, AsyncGenerator, List
 
 import aiohttp
+from aiohttp.http_exceptions import LineTooLong
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 
@@ -1010,6 +1011,102 @@ def _encode_detail_attribute(value: Any) -> str:
     return html.escape(json_str, quote=True)
 
 
+# 圖片參數鍵（不含裸 path/paths，避免 read_file 被誤判）
+_IMAGE_ARG_KEYS = {
+    "image_url", "image_urls", "image_path", "image_paths",
+    "screenshot_path", "screenshot_paths", "images", "image",
+}
+_DATA_URL_RE = re.compile(
+    r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{64,}",
+    re.MULTILINE,
+)
+
+
+def _sanitize_progress_arguments(arguments: Any) -> Optional[dict]:
+    """Drop base64 / oversized values from progress arguments before tool cards."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    clean: Dict[str, Any] = {}
+    for key, value in arguments.items():
+        if isinstance(value, str) and (
+            value.startswith("data:image")
+            or ("base64" in value[:80] and len(value) > 2000)
+            or len(value) > 8000
+        ):
+            clean[key] = f"[redacted {len(value)} chars]"
+        else:
+            clean[key] = value
+    return clean
+
+
+def _sanitize_progress_result(result: Any) -> str:
+    """
+    Ensure progress result never keeps multi-MB base64 in filter memory/UI.
+
+    Prefer gateway-side redaction; this is defense-in-depth if upstream still
+    dumps a native vision envelope onto hermes.tool.progress.
+    """
+    if result is None:
+        return ""
+    if isinstance(result, dict):
+        if result.get("_multimodal") or result.get("_multimodal_redacted"):
+            summary = result.get("text_summary") or result.get("text") or ""
+            raw_meta = result.get("meta")
+            meta = raw_meta if isinstance(raw_meta, dict) else {}
+            size = meta.get("size_bytes")
+            size_note = f" ({size/1024:.1f}KB)" if isinstance(size, (int, float)) else ""
+            if summary:
+                return f"{summary}{size_note}"
+            return f"Image loaded natively{size_note}; base64 redacted from tool card."
+        try:
+            result = json.dumps(result, ensure_ascii=False)
+        except (TypeError, ValueError):
+            result = str(result)
+
+    result_str = result if isinstance(result, str) else str(result)
+    original_len = len(result_str)
+
+    # Fast multimodal envelope detection without full json.loads of multi-MB blobs
+    head = result_str[:240]
+    if '"_multimodal"' in head or "'_multimodal'" in head or '"_multimodal_redacted"' in head:
+        # text_summary is usually AFTER the huge content[].image_url base64 —
+        # search head+tail only, never scan the whole multi-MB string with json.loads.
+        sample = (
+            result_str[:4000] + result_str[-6000:]
+            if original_len > 10000
+            else result_str
+        )
+        m = re.search(r'"text_summary"\s*:\s*"((?:\\.|[^"\\])*)"', sample)
+        if m:
+            try:
+                summary = json.loads(f'"{m.group(1)}"')
+            except Exception:
+                summary = m.group(1)
+            logger.info(
+                f"[multimodal] stripped envelope result_len={original_len} "
+                f"-> summary_len={len(summary)}"
+            )
+            return f"{summary}（已移除 base64 像素，原始 progress {original_len/1024:.1f}KB）"
+        logger.info(f"[multimodal] stripped envelope result_len={original_len} (no summary)")
+        return f"圖片已載入模型上下文（base64 已從 tool card 移除，原始 {original_len/1024:.1f}KB）"
+
+    if "data:image" in result_str or original_len > 100_000:
+        redacted = _DATA_URL_RE.sub("[base64_image_redacted]", result_str)
+        if len(redacted) > 20000:
+            redacted = redacted[:20000] + f"...[truncated from {original_len} chars]"
+        logger.info(
+            f"[multimodal] redacted data-url/large result {original_len} -> {len(redacted)} chars"
+        )
+        return redacted
+
+    return result_str
+
+
 def _build_completion_details(tool_name: str, label: str = "", result: str = "", arguments: Optional[dict] = None) -> str:
     """
     Build a complete <details> tag for a completed tool call.
@@ -1019,18 +1116,12 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
     - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
     - 結果截斷（最多 5000 字元）
-    - **多模態處理**：基於 arguments 中的圖片欄位判斷，替換 base64 為簡短提示
+    - **多模態處理**：result/_multimodal/data:image 一律消毒，不把 base64 塞進 OWUI
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
     
-    # ── 確保 arguments 是 dict（hermes.tool.progress 可能傳入 JSON 字串）─
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except (json.JSONDecodeError, ValueError):
-            arguments = None
-    elif not isinstance(arguments, dict):
-        arguments = None
+    # ── 確保 arguments 是 dict，並去掉 base64 ─────────────────
+    arguments = _sanitize_progress_arguments(arguments)
     
     attrs = f'type="tool_calls" done="true" name="{safe_name}"'
     
@@ -1055,59 +1146,30 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     
     if result:
-        # ── 多模態處理：基於 arguments 判斷是否為視覺工具 ──
-        #
-        # 優雅策略：檢查 arguments 中是否包含圖片相關欄位（image_url, image_path 等），
-        # 而非硬編碼工具名稱清單。這樣未來新增視覺工具時不需要修改此處。
-        #
-        # 注意：result 可能是 dict（直接從 hermes.tool.progress 事件來）
-        # 或 str（已序列化的 JSON）。兩種都需處理。
-        
-        # 第一步：將 dict 轉為 str，並計算原始大小
-        result_str = ""  # 初始化，避免 Pyright 未綁定警告
-        result_len = 0
-        
-        if isinstance(result, dict):
-            # dict 格式：序列化後計算大小
-            try:
-                result_str = json.dumps(result, ensure_ascii=False)
-            except (TypeError, ValueError):
-                result_str = str(result)
-            result_len = len(result_str)
-        else:
-            # str 格式：直接使用
-            result_str = str(result) if not isinstance(result, str) else result
-            result_len = len(result_str)
-        
-        # 圖片相關欄位清單（包含單數/複數形式）
-        image_keys = {"image_url", "image_urls", "image_path", "image_paths", 
-                      "path", "paths", "screenshot_path", "screenshot_paths",
-                      "images", "image"}
-        
-        # 判斷：arguments 包含圖片欄位 + result 超過 10KB → 視為多模態信封包
-        has_image_arg = arguments is not None and image_keys & set(arguments.keys())
+        # 先消毒（gateway 應已 redact；這裡是第二道防線）
+        result_str = _sanitize_progress_result(result)
+        result_len = len(result_str)
+
+        has_image_arg = bool(arguments and (_IMAGE_ARG_KEYS & set(arguments.keys())))
+        is_multimodal_marker = (
+            "_multimodal" in result_str[:200]
+            or "base64_image_redacted" in result_str
+            or "base64 已從" in result_str
+            or "Image loaded natively" in result_str
+        )
         is_large_result = result_len > 10240
-        
-        # DEBUG: 記錄 arguments 狀態以便排查
-        if is_large_result and not has_image_arg:
-            logger.warning(
-                f"[multimodal-debug] Large result ({result_len} bytes) but has_image_arg=False! "
-                f"arguments type={type(arguments).__name__}, keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
-                f"tool_name={tool_name}"
-            )
-        elif is_large_result and has_image_arg:
-            logger.info(
-                f"[multimodal-debug] Large result ({result_len} bytes) detected as multimodal! "
-                f"arguments keys={list(arguments.keys()) if isinstance(arguments, dict) else arguments}, "
-                f"tool_name={tool_name}"
-            )
-        
-        if has_image_arg and is_large_result:
-            # 視覺工具的大結果：直接替換成簡短提示
-            # 模型已經在當輪"看到"圖片了，下一輪不需要再塞幾MB的base64
-            inner += f"\n<result>圖片已從上下文移除（原始大小 {result_len/1024:.1f}KB）。想要再看圖片請再調用一次視覺工具即可。</result>"
+
+        if (has_image_arg and is_large_result) or is_multimodal_marker:
+            # 視覺 / 多模態：只留短提示，避免 OWUI 歷史被像素塞爆
+            if is_multimodal_marker and result_len <= 5000:
+                inner += f"\n<result>{html.escape(result_str)}</result>"
+            else:
+                inner += (
+                    f"\n<result>圖片已從 tool card 移除"
+                    f"（處理後 {result_len/1024:.1f}KB）。"
+                    f"像素只在當輪模型上下文，需要再看請重呼 vision 工具。</result>"
+                )
         else:
-            # 一般結果：用 html.escape 避免 XSS
             truncated = result_str[:5000] + ("..." if result_len > 5000 else "")
             inner += f"\n<result>{html.escape(truncated)}</result>"
     
@@ -1259,18 +1321,21 @@ class ToolCallBuffer:
         _t0 = time.monotonic()
         try:
             state = self.active_tools.pop(tc_id, {})
-            state["result"] = payload.get("result", "")
-            state["arguments"] = payload.get("arguments", state.get("arguments", {}))
+            # Sanitize immediately so multi-MB base64 never sits in buffer/state
+            raw_result = payload.get("result", "")
+            raw_args = payload.get("arguments", state.get("arguments", {}))
+            result = _sanitize_progress_result(raw_result)
+            arguments = _sanitize_progress_arguments(raw_args) or {}
+            # Drop references to possibly huge upstream payloads ASAP
+            del raw_result, raw_args
             
-            tool_name = state.get("tool", "unknown")
-            result = state.get("result", "")
+            tool_name = state.get("tool", payload.get("tool", "unknown"))
             
             chunks = []
             
             # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
             emoji = state.get("emoji", get_tool_emoji(tool_name))
             label = state.get("label", tool_name)
-            arguments = state.get("arguments", {})
             details = _build_completion_details(tool_name, label, result, arguments)
             
             # 加 \n\n 確保 Markdown 正確解析 <details> block
@@ -1433,7 +1498,14 @@ async def transform_stream(
         _readline_count += 1
         _read_start = time.monotonic()
         try:
-            line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+            # Cap single SSE line. Gateway should already redact multi-MB base64
+            # from hermes.tool.progress; this is a backstop so one bad frame
+            # cannot blow RSS. 6MB > embed target(~4MB) with JSON overhead, but
+            # far below "hold 20MB×N images" territory.
+            line = await asyncio.wait_for(
+                reader.readuntil(max_size=6 * 1024 * 1024),
+                timeout=1.0,
+            )
         except asyncio.TimeoutError:
             # 超時了，繼續循環，下次心跳會發送
             # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
@@ -1455,6 +1527,34 @@ async def transform_stream(
                     f"first_content={first_content_sent} done={done_received} "
                     f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
                 )
+            continue
+        except LineTooLong as e:
+            # Oversized SSE frame (likely unredacted vision base64). Drain the
+            # rest of the line without retaining it, then inject a stub card so
+            # the stream survives for Open WebUI.
+            logger.error(
+                f"[enhance-v2] SSE line too long ({e}); draining remainder and "
+                f"skipping frame to protect RAM. Fix: ensure gateway redacts "
+                f"multimodal base64 from hermes.tool.progress."
+            )
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(64 * 1024), timeout=2.0)
+                    if not chunk:
+                        break
+                    if b"\n" in chunk:
+                        break
+            except Exception as drain_err:
+                logger.error(f"[enhance-v2] drain after LineTooLong failed: {drain_err}")
+            # Keep OWUI alive with a tiny placeholder
+            yield _build_content_chunk(
+                "\n\n<details type=\"tool_calls\" done=\"true\" name=\"vision_or_large_tool\">"
+                "\n<summary></summary>"
+                "\n<arguments>{\\\"note\\\":\\\"progress frame dropped (oversized SSE)\\\"}</arguments>"
+                "\n<result>上游 progress 封包過大已丟棄（疑 base64）。"
+                "模型當輪上下文不受影響；tool card 僅占位。</result>"
+                "\n</details>\n"
+            )
             continue
         except Exception as e:
             # readline() 可能丟出 exception（例如 client 斷開連線）
@@ -1797,16 +1897,17 @@ async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
-        # read_bufsize: vision_analyze 回傳的 base64 圖片可達 3-4MB
-        # aiohttp 的 StreamReader._high_water = read_bufsize * 2
-        # readline() 的 max_size 預設為 _high_water
-        # 設為 4MB 使 _high_water = 8MB，足以容納最大的 base64 圖片
+        # read_bufsize: single SSE line soft-cap is handled in transform_stream
+        # (readuntil max_size=6MB). Keep session buffer modest — gateway must
+        # redact multimodal base64 from hermes.tool.progress so we never need
+        # 20MB×N headroom here (that would thrash RAM under MemoryMax).
+        # high_water = read_bufsize * 2 = 12MB (above 6MB line cap).
         
         # ✅ 關鍵修復：設定 auto_decompress=False 避免額外的解壓縮開銷
         # 並確保 timer_host 正確設定以支援 backpressure
         _http_session = aiohttp.ClientSession(
             timeout=timeout,
-            read_bufsize=4194304,
+            read_bufsize=6 * 1024 * 1024,
             auto_decompress=False,  # 避免不必要的解壓縮
         )
     return _http_session
