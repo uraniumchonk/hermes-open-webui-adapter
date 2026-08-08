@@ -1116,9 +1116,9 @@ def _sanitize_progress_result(result: Any) -> str:
                 f"[multimodal] stripped envelope result_len={original_len} "
                 f"-> summary_len={len(summary)}"
             )
-            return f"{summary}（已移除 base64 像素，原始 progress {original_len/1024:.1f}KB）"
+            return f"{summary}（圖片已經從你的上下文移除 你的下一輪回答將不會具有圖片知識 若用戶詢問有關內容 需要再調用一次圖片工具）"
         logger.info(f"[multimodal] stripped envelope result_len={original_len} (no summary)")
-        return f"圖片已載入模型上下文（base64 已從 tool card 移除，原始 {original_len/1024:.1f}KB）"
+        return f"圖片已載入模型上下文（圖片已經從你的上下文移除 你的下一輪回答將不會具有圖片知識 若用戶詢問有關內容 需要再調用一次圖片工具）"
 
     if "data:image" in result_str or original_len > 100_000:
         redacted = _DATA_URL_RE.sub("[base64_image_redacted]", result_str)
@@ -1545,7 +1545,26 @@ async def transform_stream(
             # 超時了，繼續循環，下次心跳會發送
             # DEBUG: 記錄 buffer 狀態，排查 gateway 是否發送數據
             _read_elapsed = time.monotonic() - _read_start
-            
+
+            # ── EOF detection ──
+            if reader.at_eof():
+                logger.info(
+                    f"[enhance-v2] Upstream EOF detected on timeout (stream_age={time.monotonic() - _stream_start:.1f}s, "
+                    f"readline_count={_readline_count}). Breaking immediately."
+                )
+                yield b'data: {"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' % (
+                    completion_id.encode(), created, model.encode()
+                )
+                yield b'data: [DONE]\n\n'
+                break
+
+            # ── Tight loop protection (critical fix) ──
+            # readuntil() 在 half-closed socket 上會瞬間回傳（不等 timeout），
+            # 導致每秒數萬次的緊密迴圈。偵測瞬間超時並強制延遲。
+            if _read_elapsed < 0.5:
+                # 瞬間超時 → 強制等待，打破緊密迴圈
+                await asyncio.sleep(1.0)
+
             # ── Stale stream protection ──
             # upstream 長時間完全無數據 → 判定 gateway 已「啞巴」死亡
             # （relay finalization 異常 / gateway 重啟後舊連線失效）。
