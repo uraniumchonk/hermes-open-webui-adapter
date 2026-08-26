@@ -37,6 +37,10 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
     """
     Extract tool info from a <details> tag.
 
+    支援兩種格式：
+    - 舊格式（child-tag）：<arguments>...</arguments> + <result>...</result>
+    - 新格式（attribute-based）：arguments="..." attribute + result 在 body
+
     Returns: {tool_name, args_summary, args_obj, result_summary, result_raw, truncated}
     """
     import html as _html
@@ -52,11 +56,20 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
     name_match = re.search(r'name=([^ >]+)', tag, flags=re.IGNORECASE)
     tool_name = _html.unescape(name_match.group(1)) if name_match else "unknown"
 
+    # ── arguments：先試 <arguments> 子標籤，再試 arguments="..." attribute ──
+    args_raw = ""
     args_match = re.search(r'<arguments>(.*?)</arguments>', tag, re.DOTALL)
-    args_summary = ""
-    args_obj = None
     if args_match:
         args_raw = _html.unescape(args_match.group(1).strip())
+    else:
+        # 新格式：arguments 在 attribute 裡（HTML-escaped JSON）
+        attr_match = re.search(r'arguments="((?:[^"\\]|\\.)*)"', tag, re.DOTALL)
+        if attr_match:
+            args_raw = _html.unescape(attr_match.group(1).strip())
+
+    args_summary = ""
+    args_obj = None
+    if args_raw:
         try:
             args_obj = json.loads(args_raw)
             clean_args = {k: v for k, v in args_obj.items() if k not in ("tool_name", "label")}
@@ -73,12 +86,34 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
         except json.JSONDecodeError:
             args_summary = args_raw[:100]
 
-    result_match = re.search(r'<result>(.*?)</result>', tag, re.DOTALL)
-    result_summary = ""
+    # ── result：先試 <result> 子標籤，再試 body（</summary> 之後到 </details> 之前）──
     result_raw = ""
-    truncated = False
+    result_match = re.search(r'<result>(.*?)</result>', tag, re.DOTALL)
     if result_match:
         result_raw = _html.unescape(result_match.group(1).strip())
+    else:
+        # 新格式：result 在 body 裡（</summary> 之後到 </details> 之前）
+        # 移除 <summary>...</summary> 和 <arguments>...</arguments>（若有殘留）
+        body = tag
+        # 取開標籤之後的內容
+        open_end = tag.find('>')
+        if open_end != -1:
+            body = tag[open_end + 1:]
+        # 移除結尾的 </details>
+        close_start = body.rfind('</details>')
+        if close_start != -1:
+            body = body[:close_start]
+        # 移除 <summary>...</summary>
+        body = re.sub(r'<summary>.*?</summary>', '', body, flags=re.DOTALL)
+        # 移除 <arguments>...</arguments>（舊格式殘留）
+        body = re.sub(r'<arguments>.*?</arguments>', '', body, flags=re.DOTALL)
+        # 移除 <result>...</result>（舊格式殘留，避免重複）
+        body = re.sub(r'<result>.*?</result>', '', body, flags=re.DOTALL)
+        result_raw = body.strip()
+
+    result_summary = ""
+    truncated = False
+    if result_raw:
         try:
             result_obj = json.loads(result_raw)
             if isinstance(result_obj, dict):
