@@ -1135,41 +1135,39 @@ def _sanitize_progress_result(result: Any) -> str:
 def _build_completion_details(tool_name: str, label: str = "", result: str = "", arguments: Optional[dict] = None) -> str:
     """
     Build a complete <details> tag for a completed tool call.
-    
-    - 確保 name 屬性正確（不會為空）
-    - <summary> 顯示工具名稱 + emoji（供用戶視覺識別）
-    - <arguments> 包含 tool_name + 完整參數（讓模型能識別工具與輸入）
-    - 結果放在 <result> 標籤內（避免 HTML 實體編碼問題）
+
+    格式（attribute-based，與 Conduit v4.1.0 + OWUI 0.10.2 前端對齊）：
+      <details type="tool_calls" done="true" name="tool" arguments="{...}">
+      <summary></summary>
+      result text here
+      </details>
+
+    - arguments 放在 attribute（JSON，短、無換行，前端 parseAttributes 直接讀）
+    - result 放在 body（可長、可換行；Conduit DetailsBlockSyntax 會把 body
+      normalize 進 result attribute；OWUI detailsTokenizer 的 token.text 也是 body）
     - 結果截斷（最多 5000 字元）
     - **多模態處理**：result/_multimodal/data:image 一律消毒，不把 base64 塞進 OWUI
     """
     safe_name = html.escape(tool_name) if tool_name else "unknown"
-    
+
     # ── 確保 arguments 是 dict，並去掉 base64 ─────────────────
     arguments = _sanitize_progress_arguments(arguments)
-    
-    attrs = f'type="tool_calls" done="true" name="{safe_name}"'
-    
-    # <summary> 內容留空以節省上下文（arguments 已包含完整資訊）
-    inner = "\n<summary></summary>"
-    
-    # <arguments> 標籤：包含 tool_name + 完整參數（讓模型能識別工具）
+
+    # ── attributes：type / done / name / arguments ─────────────
+    # arguments 必須 HTML-escape（quote=True）才能安全嵌在 "..." 裡
     if arguments:
-        # 將 tool_name 加入 arguments，讓模型知道這是哪個工具
         full_args = {"tool_name": tool_name, **arguments}
-        args_str = json.dumps(full_args, ensure_ascii=False)
-        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     elif label:
-        # fallback: 只有 label，也加入 tool_name
         full_args = {"tool_name": tool_name, "label": label}
-        args_str = json.dumps(full_args, ensure_ascii=False)
-        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
     else:
-        # 最後 fallback: 只有 tool_name
         full_args = {"tool_name": tool_name}
-        args_str = json.dumps(full_args, ensure_ascii=False)
-        inner += f"\n<arguments>{html.escape(args_str)}</arguments>"
-    
+    args_str = json.dumps(full_args, ensure_ascii=False)
+    args_attr = html.escape(args_str, quote=True)
+
+    attrs = f'type="tool_calls" done="true" name="{safe_name}" arguments="{args_attr}"'
+
+    # ── body：result（plain text，可含換行）────────────────────
+    body_parts: list[str] = []
     if result:
         # 先消毒（gateway 應已 redact；這裡是第二道防線）
         result_str = _sanitize_progress_result(result)
@@ -1187,18 +1185,22 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
         if (has_image_arg and is_large_result) or is_multimodal_marker:
             # 視覺 / 多模態：只留短提示，避免 OWUI 歷史被像素塞爆
             if is_multimodal_marker and result_len <= 5000:
-                inner += f"\n<result>{html.escape(result_str)}</result>"
+                body_parts.append(result_str)
             else:
-                inner += (
-                    f"\n<result>圖片已從 tool card 移除"
+                body_parts.append(
+                    f"圖片已從 tool card 移除"
                     f"（處理後 {result_len/1024:.1f}KB）。"
-                    f"像素只在當輪模型上下文，需要再看請重呼 vision 工具。</result>"
+                    f"像素只在當輪模型上下文，需要再看請重呼 vision 工具。"
                 )
         else:
             truncated = result_str[:5000] + ("..." if result_len > 5000 else "")
-            inner += f"\n<result>{html.escape(truncated)}</result>"
-    
-    return f'<details {attrs}>{inner}\n</details>'
+            body_parts.append(truncated)
+
+    body = "\n".join(body_parts)
+
+    # 開標籤必須是單行（前端 regex 逐行匹配），所以 attributes 裡不能有換行
+    # html.escape 已把 < > & " 都 escape 掉，args_str 是 json.dumps 單行輸出，安全
+    return f'<details {attrs}>\n<summary></summary>\n{body}\n</details>'
 
 
 def _build_content_chunk(content: str) -> bytes:
@@ -1625,11 +1627,11 @@ async def transform_stream(
                 logger.error(f"[enhance-v2] drain after LineTooLong failed: {drain_err}")
             # Keep OWUI alive with a tiny placeholder
             yield _build_content_chunk(
-                "\n\n<details type=\"tool_calls\" done=\"true\" name=\"vision_or_large_tool\">"
-                "\n<summary></summary>"
-                "\n<arguments>{\\\"note\\\":\\\"progress frame dropped (oversized SSE)\\\"}</arguments>"
-                "\n<result>上游 progress 封包過大已丟棄（疑 base64）。"
-                "模型當輪上下文不受影響；tool card 僅占位。</result>"
+                "\n\n<details type=\"tool_calls\" done=\"true\" name=\"vision_or_large_tool\" "
+                "arguments=\"{&quot;note&quot;: &quot;progress frame dropped (oversized SSE)&quot;}\">"
+                "\n<summary></summary>\n"
+                "上游 progress 封包過大已丟棄（疑 base64）。"
+                "模型當輪上下文不受影響；tool card 僅占位。\n"
                 "\n</details>\n"
             )
             continue
@@ -1828,17 +1830,11 @@ async def transform_stream(
                                 pass
                         modified_frame = frame
                     elif TOOL_MODE == "enhance-v2":
-                        # enhance-v2: 只過濾 Gateway 發送的 <details type="tool_calls"> 標籤
-                        # 避免誤殺正常內容中包含 <details 字串的情況
-                        if parsed_json:
-                            try:
-                                delta = parsed_json.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-                                # 只過濾我們自己的 tool_calls details 標籤
-                                if 'type="tool_calls"' in content or 'type="tool_calls">' in content:
-                                    continue
-                            except (IndexError, KeyError):
-                                pass
+                        # enhance-v2: 保留所有 content chunk（包括模型輸出的 <details> 字串）
+                        # 舊邏輯會丟掉任何包含 'type="tool_calls"' 的 chunk，
+                        # 導致模型正常輸出被截斷（例如主人測試原樣貼出 <details> 標籤）。
+                        # tool filter 自己注入的 tool card 是獨立 chunk（handle_tool_completion），
+                        # 不經過這裡的 content 過濾路徑，所以不需要在這裡防重複。
                         modified_frame = frame
                     else:
                         # passthrough: keep <details> as-is
