@@ -109,7 +109,13 @@ def _extract_tool_info(tag: str, max_result_length: int) -> dict:
         body = re.sub(r'<arguments>.*?</arguments>', '', body, flags=re.DOTALL)
         # 移除 <result>...</result>（舊格式殘留，避免重複）
         body = re.sub(r'<result>.*?</result>', '', body, flags=re.DOTALL)
-        result_raw = body.strip()
+        body = body.strip()
+        # 剝離 code fence（新格式把 body 整段包進 fenced code block 防跳脫）
+        fence_match = re.match(r'^(`{3,})\n(.*?)\n\1$', body, re.DOTALL)
+        if fence_match:
+            body = fence_match.group(2)
+        # unescape（body 內的 <details 等已被 escape 成 &lt; 形式）
+        result_raw = _html.unescape(body)
 
     result_summary = ""
     truncated = False

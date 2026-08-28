@@ -1132,6 +1132,44 @@ def _sanitize_progress_result(result: Any) -> str:
     return result_str
 
 
+def _neutralize_details_tags(text: str) -> str:
+    """
+    把 body 裡的 <details / </details> 字串 escape 掉。
+
+    OWUI detailsTokenizer 的 findMatchingClosingTag 是純字串深度計數
+    （不認識 code fence），body 內若出現 </details> 會把 token 提前截斷，
+    其後的 <details ...> 會被當成真卡片渲染（注入）。
+    把 < 換成 &lt; 即可打破字串匹配；OWUI 渲染時 decode() 會還原，
+    再經 code fence escape，顯示仍是乾淨的原文。
+    """
+    return text.replace("<details", "&lt;details").replace("</details>", "&lt;/details&gt;")
+
+
+def _wrap_in_code_fence(text: str) -> str:
+    """
+    把文字包進 fenced code block，防止內容跳脫。
+
+    動機：result 裡若含 ``` 代碼塊、</details>、<script> 等字元，
+    直接當 markdown 渲染會破壞 <details> 結構（提前閉合 / HTML 注入 /
+    代碼塊嵌套錯亂）。包進 code fence 後，所有 < > ` 都只當純文字顯示。
+
+    fence 長度會比內容中最長的連續 backtick 還長一截，
+    避免內容自帶 ``` 時提前關閉外層 fence。
+    """
+    if not text:
+        return text
+    max_run = run = 0
+    for ch in text:
+        if ch == "`":
+            run += 1
+            if run > max_run:
+                max_run = run
+        else:
+            run = 0
+    fence = "`" * max(3, max_run + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
 def _build_completion_details(tool_name: str, label: str = "", result: str = "", arguments: Optional[dict] = None) -> str:
     """
     Build a complete <details> tag for a completed tool call.
@@ -1145,6 +1183,8 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     - arguments 放在 attribute（JSON，短、無換行，前端 parseAttributes 直接讀）
     - result 放在 body（可長、可換行；Conduit DetailsBlockSyntax 會把 body
       normalize 進 result attribute；OWUI detailsTokenizer 的 token.text 也是 body）
+    - body 整段包進 fenced code block（fence 長度自動 >= 內容最長 backtick run + 1），
+      防止 result 內的 ``` / </details> / <script> 跳脫破壞結構
     - 結果截斷（最多 5000 字元）
     - **多模態處理**：result/_multimodal/data:image 一律消毒，不把 base64 塞進 OWUI
     """
@@ -1197,6 +1237,12 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
             body_parts.append(truncated)
 
     body = "\n".join(body_parts)
+    # 防跳脫兩道：
+    # 1. neutralize body 內的 <details / </details>（OWUI tokenizer 是純字串計數，不認 fence）
+    # 2. 整段包進 code fence（``` / <script> / <b> 等一律降級為純文字）
+    if body:
+        body = _neutralize_details_tags(body)
+        body = _wrap_in_code_fence(body)
 
     # 開標籤必須是單行（前端 regex 逐行匹配），所以 attributes 裡不能有換行
     # html.escape 已把 < > & " 都 escape 掉，args_str 是 json.dumps 單行輸出，安全
