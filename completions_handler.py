@@ -20,6 +20,7 @@ import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 import native_tool_context
+import special_tags
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,10 @@ async def handle_completions_request(
         logger.info(f"[test-mode] Triggered! Sending tool card samples directly.")
         return _handle_test_mode(completion_id, created_ts, model)
 
+    # ✅ Task 1: strip 思考內容（OWUI 把思考區域組裝回傳 LLM 時砍掉，防污染反饋迴圈）
     # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
     if "messages" in req_json and isinstance(req_json["messages"], list):
+        req_json["messages"] = special_tags.strip_thinking_content(req_json["messages"])
         req_json["messages"] = sanitize_request_messages(req_json["messages"])
 
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")

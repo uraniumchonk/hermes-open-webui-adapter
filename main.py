@@ -44,6 +44,7 @@ from responses_handler import handle_responses_request
 import tool_history_format
 from comp_mode import compress_tool_results
 import native_tool_context
+import special_tags
 try:
     import yaml
     HAS_YAML = True
@@ -1242,6 +1243,9 @@ def _build_completion_details(tool_name: str, label: str = "", result: str = "",
     # 2. 整段包進 code fence（``` / <script> / <b> 等一律降級為純文字）
     if body:
         body = _neutralize_details_tags(body)
+        # Task 2：neutralize 特殊標籤（THINK_TAG / TOOL_TAG / OWUI reasoning 等），
+        # 避免檔案內容裡的標籤被 OWUI tag 偵測通拉跳脫
+        body = special_tags.neutralize_special_tags(body)
         body = _wrap_in_code_fence(body)
 
     # 開標籤必須是單行（前端 regex 逐行匹配），所以 attributes 裡不能有換行
