@@ -1,0 +1,113 @@
+{
+  "_comment": "特殊標籤清單（自動提取自 jinja + OWUI 0.11.1）。filter 用此清單 neutralize tool result body 內的標籤，避免 OWUI tag 偵測通拉跳脫。",
+  "source": {
+    "jinja": "/home/thomas2018/models/Qwen3.8-27B-AWQ-INT4/chat_template.jinja",
+    "owui_middleware": "/home/thomas2018/openwebui/lib/python3.12/site-packages/open_webui/utils/middleware.py"
+  },
+  "model_jinja_tags": [
+    "<tools>",
+    "</tools>",
+    "<tool_call>",
+    "<function=example_function_name>",
+    "<parameter=example_parameter_1>",
+    "</parameter>",
+    "<parameter=example_parameter_2>",
+    "</function>",
+    "</tool_call>",
+    "<IMPORTANT>",
+    "<function=...>",
+    "</IMPORTANT>",
+    "<tool_response>",
+    "</tool_response>",
+    "<think>",
+    "</think>"
+  ],
+  "owui_reasoning_tags": [
+    [
+      "<think>",
+      "</think>"
+    ],
+    [
+      "<thinking>",
+      "</thinking>"
+    ],
+    [
+      "<reason>",
+      "</reason>"
+    ],
+    [
+      "<reasoning>",
+      "</reasoning>"
+    ],
+    [
+      "<thought>",
+      "</thought>"
+    ],
+    [
+      "<Thought>",
+      "</Thought>"
+    ],
+    [
+      "<|begin_of_thought|>",
+      "<|end_of_thought|>"
+    ],
+    [
+      "◁think▷",
+      "◁/think▷"
+    ]
+  ],
+  "owui_solution_tags": [
+    [
+      "<|begin_of_solution|>",
+      "<|end_of_solution|>"
+    ]
+  ],
+  "owui_code_interpreter_tags": [
+    [
+      "<code_interpreter>",
+      "</code_interpreter>"
+    ]
+  ],
+  "filter_details_tags": [
+    "<details",
+    "</details>"
+  ],
+  "all_tags_to_neutralize": [
+    "<tools>",
+    "</tools>",
+    "<tool_call>",
+    "<function=example_function_name>",
+    "<parameter=example_parameter_1>",
+    "</parameter>",
+    "<parameter=example_parameter_2>",
+    "</function>",
+    "</tool_call>",
+    "<IMPORTANT>",
+    "<function=...>",
+    "</IMPORTANT>",
+    "<tool_response>",
+    "</tool_response>",
+    "<think>",
+    "</think>",
+    "<thinking>",
+    "</thinking>",
+    "<reason>",
+    "</reason>",
+    "<reasoning>",
+    "</reasoning>",
+    "<thought>",
+    "</thought>",
+    "<Thought>",
+    "</Thought>",
+    "<|begin_of_thought|>",
+    "<|end_of_thought|>",
+    "◁think▷",
+    "◁/think▷",
+    "<|begin_of_solution|>",
+    "<|end_of_solution|>",
+    "<code_interpreter>",
+    "</code_interpreter>",
+    "<details",
+    "</details>"
+  ]
+}
