@@ -110,6 +110,21 @@ session-id header）。**不是專案必要條件。**
 
 ---
 
+## 給 AI agent
+
+這個 repo 附帶 **`AGENTS.md`**——完整的操作指南：架構、檔案地圖、8 支 Hermes
+patch（套用順序 + grep 驗證 + 重匯）、兩台部署、以及你的人類 owner 需要知道的
+常規維護。
+
+把 repo 直接丟給你的 agent（Hermes、Claude Code、Codex…）：
+
+> 讀 `AGENTS.md`，幫我在這台機器架好這套系統。
+
+它就能裝依賴、配好 `config.yaml`、套 patch、部署完成——並會主動簡報後續維護
+給你的 owner。不用人工讀文件。
+
+---
+
 ## 專案結構
 
 ```
