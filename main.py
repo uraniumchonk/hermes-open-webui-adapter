@@ -2039,33 +2039,6 @@ async def get_session() -> aiohttp.ClientSession:
     return _http_session
 
 
-# ── Test Mode: Tool Card Rendering Samples ─────────────────
-# ⚠️ 必須放在 catch-all route 之前，否則會被捕獲！
-
-@APP.get("/test-tool-cards")
-async def test_tool_cards():
-    """
-    測試模式：直接輸出各種 <details> 格式的 SSE stream，
-    讓使用者在 Open WebUI 前端觀察渲染效果。
-    """
-    import time as _time
-    from test_mode import generate_test_stream
-
-    completion_id = f"chatcmpl-{int(_time.time()*1000)}"
-    created_ts = int(_time.time())
-
-    return StreamingResponse(
-        generate_test_stream(completion_id, created_ts, "test-model"),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Content-Encoding": "identity",
-        },
-    )
-
-
 # ── Route: Catch-all proxy ────────────────────────────────
 
 @APP.api_route("/{port_prefix}/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
