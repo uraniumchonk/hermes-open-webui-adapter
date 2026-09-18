@@ -1,6 +1,7 @@
 # Hermes Tool Filter
 
-SSE proxy between **Open WebUI** and **Hermes Gateway** (`/v1/chat/completions` only).
+SSE proxy between **Open WebUI** and **Hermes Gateway** — `/v1/chat/completions`
+and `/v1/responses`.
 
 English · [繁體中文](README.zh-TW.md)
 
@@ -69,20 +70,34 @@ With the filter, history is rewritten. **Two templates:**
 ]
 ```
 
-### `flat` — still one assistant string (legacy branch)
+### `flat` — still one assistant string (legacy, frozen)
 
-```json
-{
-  "role": "assistant",
-  "content": "Let me check.\n\n[START_PREV_ACTION]\n[ACTION_TYPE]\nweb_search\n[ACTION_ARG]\nquery: BTC price\n[RESULT]\nprice: 64000\n[END_PREV_ACTION]\n\nAbout 64000."
-}
-```
+The older `flat` template (single assistant string with `[START_PREV_ACTION]`
+hints) lived on the now-deleted `flat-history` branch. `main` ships `structured`
+only.
 
-| | `structured` | `flat` |
-|--|--------------|--------|
-| Roles the model sees | `assistant` + `tool` | `assistant` only |
-| Pollution | Structural | Hint-based |
-| Branch | **`main`** (only option) | **`flat-history`** (frozen) |
+---
+
+## `/v1/responses` — session continuity
+
+Open WebUI's Responses mode drops tool items between turns, so the agent loses
+tool memory. The filter fixes this with a lightweight session marker:
+
+1. **First turn** — no marker in the request → forward as-is; the response
+   gets a visible session tag appended to the first assistant message:
+   ````
+   ```
+   <!--hermes-sid:<id>-->
+   ```
+   ````
+2. **Next turns** — the filter reads that one marker (forward scan, early
+   exit — the huge middle history is never read), rewrites the request to
+   `[last user]` + an `X-Hermes-Session-Id` header, and the Gateway reloads
+   the full transcript (tool calls included) from its session DB.
+
+The marker never reaches the model (the filter drops the payload history and
+the Gateway strips any stray marker). One marker per chat, on the first
+assistant message only.
 
 ---
 
@@ -90,14 +105,30 @@ With the filter, history is rewritten. **Two templates:**
 
 https://github.com/uraniumchonk/hermes-open-webui-adapter
 
-| Want | Branch | Link |
-|------|--------|------|
-| Current (structured only) | `main` | [ZIP](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/main.zip) |
-| Need `flat` switch | `flat-history` | [ZIP](https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/flat-history.zip) · [tree](https://github.com/uraniumchonk/hermes-open-webui-adapter/tree/flat-history) |
-
 ```bash
-git clone -b main https://github.com/uraniumchonk/hermes-open-webui-adapter.git
-# or: git clone -b flat-history ...
+git clone https://github.com/uraniumchonk/hermes-open-webui-adapter.git
+# or: https://github.com/uraniumchonk/hermes-open-webui-adapter/archive/refs/heads/main.zip
+```
+
+---
+
+## Project structure
+
+```
+main.py                      # entry point: proxy routing, streaming, health
+completions_handler.py       # /v1/chat/completions — tool-card enhance + sanitize
+responses_handler.py         # /v1/responses — session continuity + tool results
+responses_session.py         # sid marker extract/inject (responses path only)
+tool_history_format.py       # tool card → model-safe history (structured)
+tool_history_structured.py   # structured sanitizer (native tool roles)
+native_tool_context.py       # native tool-context injection
+special_tags.py              # neutralize special tags in tool results
+special_tags.json            # tag list (data)
+extract_tags.py              # one-off tag generator (re-run after model/OWUI upgrade)
+comp_mode.py                 # optional tool-result compression
+patches/                     # optional personal Hermes patches (see below)
+config.yaml                  # sample config
+requirements.txt
 ```
 
 ---
