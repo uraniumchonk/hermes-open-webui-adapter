@@ -40,17 +40,36 @@ logger = logging.getLogger("tool-filter")
 # HTML 註解：OWUI markdown 渲染不可見、存檔存活（同 <details> 先例）。
 # id 字元集：uuid4 或 api-<16hex>（gateway 兩種 session id 格式都涵蓋）。
 SID_MARKER_RE = re.compile(r"<!--hermes-sid:([A-Za-z0-9][A-Za-z0-9_-]{7,63})-->")
+# The marker is embedded inside a fenced code block (visible session tag).
+# When stripping, remove the WHOLE fence+marker+fence so no empty code
+# block is left behind.
+SID_MARKER_FENCED_RE = re.compile(
+    r"\n*```[ \t]*\n?<!--hermes-sid:[A-Za-z0-9][A-Za-z0-9_-]{7,63}-->\n?[ \t]*```\n*"
+)
 
 
 def build_marker(session_id: str) -> str:
-    """Build the sid marker for embedding into assistant content."""
-    return f"<!--hermes-sid:{session_id}-->"
+    """Build the sid marker for embedding into assistant content.
+
+    Visible by design: newline + fenced code block, so it renders as a
+    small code snippet at the end of the FIRST assistant message (the user
+    wants to see it as a session tag, not a hidden HTML comment). The
+    extraction regex matches the marker regardless of the surrounding
+    fence, and the gateway's strip removes the whole thing before the LLM
+    ever sees it.
+    """
+    return f"\n\n```\n<!--hermes-sid:{session_id}-->\n```"
 
 
 def strip_markers(text: Any) -> Any:
-    """Remove sid markers from a text value (str passthrough for non-str)."""
+    """Remove sid markers from a text value (str passthrough for non-str).
+
+    Removes the fenced form (code block + marker + code block) first so no
+    empty code block is left, then any bare markers.
+    """
     if not isinstance(text, str) or "<!--hermes-sid:" not in text:
         return text
+    text = SID_MARKER_FENCED_RE.sub("", text)
     return SID_MARKER_RE.sub("", text)
 
 
@@ -78,25 +97,32 @@ def _item_texts(item: Dict[str, Any]) -> List[str]:
 
 
 def extract_session_id(input_items: Any) -> Optional[str]:
-    """Scan input items in REVERSE for the sid marker in assistant content.
+    """Scan input items FORWARD for the sid marker; return the first one.
 
-    Returns the last marker found — the latest assistant message carries the
-    current session tip (compression rotation changes the id mid-conversation;
-    older markers are stale, and the gateway's _resolve_live_session_id also
-    resolves them, so either way the latest is the right choice).
+    Design invariant: exactly ONE marker per chat, always on the FIRST
+    assistant message (the filter only embeds when the request carries
+    none). So the first assistant item is the only place to look — a
+    forward scan with early exit touches just the first 1-2 items no
+    matter how huge the payload is. The middle history is disposable
+    garbage we never read (the whole point: keep the request light).
 
-    Only assistant items are scanned: a marker in a user item means the user
-    pasted an assistant message — not a continuation signal.
+    Only assistant items are scanned: a marker in a user item means the
+    user pasted an assistant message — not a continuation signal (this
+    also blocks session fixation via a typed sid in a user message).
+
+    No marker found → None → the caller mints a fresh session and embeds
+    the marker in THIS response (self-heals if the first assistant was
+    regenerated or deleted).
     """
     if not isinstance(input_items, list):
         return None
-    for item in reversed(input_items):
+    for item in input_items:
         if not isinstance(item, dict) or item.get("role") != "assistant":
             continue
         for text in _item_texts(item):
             matches = SID_MARKER_RE.findall(text)
             if matches:
-                return matches[-1]
+                return matches[0]
     return None
 
 

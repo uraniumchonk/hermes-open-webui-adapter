@@ -344,13 +344,19 @@ async def _handle_post_responses(
         if modified_body is not None:
             body = modified_body
 
+    # Only embed a marker in the response when the request carried none
+    # (first turn). Continuation turns already have the first assistant's
+    # marker — re-embedding would clutter every message.
+    should_embed = sid is None
+
     if stream_flag:
         return await _stream_responses(
-            upstream_url, fwd_headers, body, model, sse_mode
+            upstream_url, fwd_headers, body, model, sse_mode,
+            should_embed=should_embed,
         )
     else:
         return await _blocking_responses(
-            upstream_url, fwd_headers, body
+            upstream_url, fwd_headers, body, should_embed=should_embed
         )
 
 
@@ -445,6 +451,7 @@ async def _blocking_responses(
     upstream_url: str,
     fwd_headers: Dict[str, str],
     body: bytes,
+    should_embed: bool = True,
 ) -> JSONResponse:
     """
     非串流模式：等待完整回應後再回傳。
@@ -464,8 +471,10 @@ async def _blocking_responses(
             )
             # Embed the sid marker in the final assistant text so the next
             # request can continue this session (responses path only).
+            # First turn only (should_embed) — continuation turns keep the
+            # single marker on the first assistant message.
             out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
-            if out_sid and resp.status == 200 and isinstance(resp_body, dict):
+            if should_embed and out_sid and resp.status == 200 and isinstance(resp_body, dict):
                 if inject_marker_into_blocking_response(resp_body, out_sid):
                     logger.info(
                         f"[responses-session] Marker embedded (blocking): sid={out_sid[:12]}…"
@@ -479,6 +488,7 @@ async def _stream_responses(
     body: bytes,
     model: str,
     sse_mode: str,
+    should_embed: bool = True,
 ) -> StreamingResponse:
     """
     串流模式：SSE passthrough 或轉換。
@@ -505,10 +515,12 @@ async def _stream_responses(
                     # its session id in the response header; embed it in the
                     # final assistant text so the next request continues this
                     # session (history + tool calls loaded from SessionDB).
+                    # First turn only (should_embed) — continuation turns keep
+                    # the single marker on the first assistant message.
                     out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
 
                     if sse_mode == "passthrough":
-                        if out_sid and resp.status == 200:
+                        if should_embed and out_sid and resp.status == 200:
                             # Frame-level passthrough with marker injection
                             # (last delta + done text + completed envelope).
                             async for chunk in stream_with_marker(resp, out_sid):
@@ -521,7 +533,7 @@ async def _stream_responses(
                         # 轉換模式：將 Responses SSE 轉為 Chat Completions SSE
                         async for chunk in _stream_and_convert(
                             resp, model, completion_id, created_ts,
-                            marker_sid=out_sid if resp.status == 200 else "",
+                            marker_sid=out_sid if (should_embed and resp.status == 200) else "",
                         ):
                             yield chunk
                         return
