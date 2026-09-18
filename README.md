@@ -120,6 +120,22 @@ files as references, not guaranteed clean applies on every Hermes version.
 
 ---
 
+## For AI agents
+
+This repo ships an **`AGENTS.md`** — a complete operating guide: architecture,
+file map, the 8 Hermes patches (apply order + grep verification + re-export),
+two-machine deployment, and the standing maintenance your human needs to know.
+
+Hand the repo straight to your agent (Hermes, Claude Code, Codex, …):
+
+> Read `AGENTS.md` and set up this system on my machine.
+
+It can install the deps, wire `config.yaml`, apply the patches, and deploy —
+and it will brief your human on the ongoing maintenance. No manual reading
+required.
+
+---
+
 ## Project structure
 
 ```
