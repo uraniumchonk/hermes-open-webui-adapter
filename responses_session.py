@@ -55,7 +55,16 @@ def strip_markers(text: Any) -> Any:
 
 
 def _item_texts(item: Dict[str, Any]) -> List[str]:
-    """Extract text payloads from a Responses input item (str or parts list)."""
+    """Extract text payloads from a Responses input item (str or parts list).
+
+    Accepts ANY part type carrying a "text" key — the Responses API uses
+    "output_text" for assistant parts and "input_text" for user parts
+    (Open WebUI's convert_to_responses_payload emits exactly these), and
+    plain "text" for compatibility clients. Filtering on a single type
+    here was the OWUI tool-amnesia leak: the marker went undetected, the
+    full body was forwarded, and the LLM saw (and hallucinated copies of)
+    the marker.
+    """
     content = item.get("content")
     if isinstance(content, str):
         return [content]
@@ -63,7 +72,7 @@ def _item_texts(item: Dict[str, Any]) -> List[str]:
         return [
             p.get("text", "")
             for p in content
-            if isinstance(p, dict) and p.get("type") == "text"
+            if isinstance(p, dict) and isinstance(p.get("text"), str)
         ]
     return []
 
@@ -113,8 +122,8 @@ def rewrite_input_to_last_user(req_json: Dict[str, Any]) -> bool:
         content = strip_markers(content)
     elif isinstance(content, list):
         content = [
-            {**p, "text": strip_markers(p.get("text", ""))}
-            if isinstance(p, dict) and p.get("type") == "text"
+            {**p, "text": strip_markers(p["text"])}
+            if isinstance(p, dict) and isinstance(p.get("text"), str)
             else p
             for p in content
         ]
