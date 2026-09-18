@@ -248,9 +248,9 @@ async def stream_with_marker(
     - the response.output_text.done text field (full text)
     - the response.completed envelope's final message item
 
-    Duplicate markers are harmless: extraction takes the last match, and the
-    marker never reaches the model (the filter drops the payload history; the
-    gateway loads from SessionDB).
+    All three are the SAME assistant message, so OWUI stores one marker.
+    The marker never reaches the model (the filter drops the payload
+    history; the gateway loads from SessionDB and strips any stray marker).
     """
     marker = build_marker(session_id)
     buffer = b""
