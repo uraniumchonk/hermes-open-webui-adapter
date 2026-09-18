@@ -1,10 +1,10 @@
-diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index a756134d..b3265c91 100644
---- a/gateway/platforms/api_server.py
-+++ b/gateway/platforms/api_server.py
-@@ -206,6 +206,120 @@ def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> by
-     return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
- 
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 96adfa5753..b11a50d26e 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -23,6 +23,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
+ # Logger parity with the origin module (moved log records keep their name).
+ logger = logging.getLogger("gateway.platforms.api_server")
  
 +# vision_analyze native fast path returns a multimodal envelope with full
 +# base64 pixels. That result still goes into the agent loop for the model, but
@@ -120,12 +120,12 @@ index a756134d..b3265c91 100644
 +    return result_str
 +
 +
- def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
-     """Parse a listen port without letting malformed env/config values crash startup."""
-     try:
-@@ -3907,9 +4021,15 @@ class APIServerAdapter(BasePlatformAdapter):
+ async def _iter_stream_items(stream_q, agent_task, response):
+     """Yield agent stream items until EOS, writing SSE keepalives while idle.
  
-         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
+@@ -431,21 +545,60 @@ class OpenAICompatRoutesMixin:
+         # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
+         # (Anthropic rejects images there, OpenAI text models ignore them).
          system_prompt = None
 -        conversation_messages: List[Dict[str, str]] = []
 +        # Any — assistant may carry tool_calls; tool messages carry tool_call_id.
@@ -133,20 +133,17 @@ index a756134d..b3265c91 100644
 +        # silently destroyed OpenAI-native tool history from hermes_tool_filter
 +        # structured conversion, so the model only saw plain assistant prose.
 +        conversation_messages: List[Dict[str, Any]] = []
- 
          for idx, msg in enumerate(messages):
 +            if not isinstance(msg, dict):
 +                continue
              role = msg.get("role", "")
              raw_content = msg.get("content", "")
              if role == "system":
-@@ -3920,19 +4040,47 @@ class APIServerAdapter(BasePlatformAdapter):
-                     system_prompt = content
-                 else:
-                     system_prompt = system_prompt + "\n" + content
+                 content = _normalize_chat_content(raw_content)
+                 system_prompt = content if system_prompt is None else system_prompt + "\n" + content
 +            elif role == "tool":
 +                # OpenAI-native tool result. Must survive into agent history so
-+                # chat_template renders <|im_start|>tool ... special tokens.
++                # chat_template renders the tool special tokens.
 +                # Content may be empty string; still keep the row for pairing.
 +                entry: Dict[str, Any] = {
 +                    "role": "tool",
@@ -166,8 +163,8 @@ index a756134d..b3265c91 100644
                  except ValueError as exc:
                      return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
 -                conversation_messages.append({"role": role, "content": content})
--
--        # Extract the last user message as the primary input
+-        user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
+-        history = conversation_messages[:-1]
 +                entry = {"role": role, "content": content}
 +                # Preserve assistant.tool_calls (structured history from
 +                # hermes_tool_filter). Without this the tool results have no
@@ -178,11 +175,7 @@ index a756134d..b3265c91 100644
 +
 +        # Last USER message is the primary input — not merely messages[-1],
 +        # because a malformed client could end on assistant/tool.
-         user_message: Any = ""
--        history = []
--        if conversation_messages:
--            user_message = conversation_messages[-1].get("content", "")
--            history = conversation_messages[:-1]
++        user_message: Any = ""
 +        history: List[Dict[str, Any]] = []
 +        last_user_idx = None
 +        for i in range(len(conversation_messages) - 1, -1, -1):
@@ -192,24 +185,27 @@ index a756134d..b3265c91 100644
 +        if last_user_idx is not None:
 +            user_message = conversation_messages[last_user_idx].get("content", "")
 +            history = conversation_messages[:last_user_idx]
- 
          if not _content_has_visible_payload(user_message):
-             return web.json_response(
-@@ -4077,6 +4225,10 @@ class APIServerAdapter(BasePlatformAdapter):
-                     "label": label,
-                     "toolCallId": tool_call_id,
-                     "status": "running",
+             return _invalid_request("No user message found in messages")
+ 
+@@ -530,14 +683,38 @@ class OpenAICompatRoutesMixin:
+                 label = build_tool_preview(function_name, function_args) or function_name
+                 _stream_q.put_threadsafe(("__tool_progress__", {
+                     "tool": function_name, "emoji": get_tool_emoji(function_name), "label": label,
+-                    "toolCallId": tool_call_id, "status": "running"}))
++                    "toolCallId": tool_call_id, "status": "running",
 +                    # hermes_tool_filter enhance-v2 needs args on running so
 +                    # completed can still build <arguments> if needed.
 +                    # Never put data:image base64 on the wire (multi-MB SSE).
 +                    "arguments": _redact_progress_arguments(function_args),
-                 }))
++                }))
  
              def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-@@ -4085,14 +4237,26 @@ class APIServerAdapter(BasePlatformAdapter):
-                 Dropped if the start was filtered (internal tool, missing
-                 id, or never seen) so clients never get an orphaned
-                 ``completed`` they can't correlate to a prior ``running``.
++                """``hermes.tool.progress`` status=completed.
++
++                Dropped if the start was filtered (internal tool, missing
++                id, or never seen) so clients never get an orphaned
++                ``completed`` they can't correlate to a prior ``running``.
 +
 +                Must include arguments + result: hermes_tool_filter injects
 +                <details><arguments>/<result> from these fields. Without
@@ -219,17 +215,17 @@ index a756134d..b3265c91 100644
 +                Multimodal / base64 payloads are redacted here — the agent
 +                loop still receives the full function_result for the model;
 +                progress SSE is UI-only and must stay small.
-                 """
++                """
                  if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                      return
                  _started_tool_call_ids.discard(tool_call_id)
 +                result_str = _redact_progress_result(function_result)
                  _stream_q.put_threadsafe(("__tool_progress__", {
-                     "tool": function_name,
-                     "toolCallId": tool_call_id,
-                     "status": "completed",
+-                    "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
++                    "tool": function_name, "toolCallId": tool_call_id, "status": "completed",
 +                    "arguments": _redact_progress_arguments(function_args),
 +                    "result": result_str,
-                 }))
++                }))
  
-             # Start agent in background.  agent_ref is a mutable container
+             # tool_progress_callback deliberately NOT wired: it would duplicate the structured
+             # start/complete callbacks (which carry the tool_call id).

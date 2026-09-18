@@ -25,6 +25,13 @@ import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from responses_session import (
+    extract_session_id,
+    inject_marker_into_blocking_response,
+    rewrite_input_to_last_user,
+    stream_with_marker,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -305,16 +312,37 @@ async def _handle_post_responses(
     # 取得設定
     sse_mode = config.get("responses_sse_mode", "passthrough")
     
-    # ── Inject previous tool results into input ──
-    # When Open WebUI sends a stateful request with previous_response_id,
-    # it only carries user messages in the input — tool results from the
-    # previous turn are lost.  Fetch the prior response and inject its
-    # function_call / function_call_output items so the model can see them.
-    modified_body = await _inject_previous_tool_results(
-        request, upstream_url, fwd_headers, req_json, sess, config
-    )
-    if modified_body is not None:
-        body = modified_body
+    # ── Session continuation via sid marker (responses path only) ──
+    # The marker (<!--hermes-sid:<id>-->) was embedded in the previous turn's
+    # assistant content (see responses_session). Found → rewrite input to
+    # [last user] only + X-Hermes-Session-Id header; the gateway loads the
+    # full transcript (including tool calls) from SessionDB. Not found →
+    # first turn: forward as-is, the response side embeds the marker.
+    sid = extract_session_id(req_json.get("input"))
+    if sid:
+        if rewrite_input_to_last_user(req_json):
+            fwd_headers = {**fwd_headers, "X-Hermes-Session-Id": sid}
+            body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
+            logger.info(
+                f"[responses-session] Continuation: sid={sid[:12]}… "
+                f"input rewritten to last user only (body={len(body)}B)"
+            )
+        else:
+            logger.warning(
+                f"[responses-session] Marker found (sid={sid[:12]}…) but no user "
+                f"item in input; forwarding as-is"
+            )
+    else:
+        # ── Inject previous tool results into input (previous_response_id path) ──
+        # When Open WebUI sends a stateful request with previous_response_id,
+        # it only carries user messages in the input — tool results from the
+        # previous turn are lost.  Fetch the prior response and inject its
+        # function_call / function_call_output items so the model can see them.
+        modified_body = await _inject_previous_tool_results(
+            request, upstream_url, fwd_headers, req_json, sess, config
+        )
+        if modified_body is not None:
+            body = modified_body
 
     if stream_flag:
         return await _stream_responses(
@@ -434,6 +462,14 @@ async def _blocking_responses(
                 f"[responses] Non-streaming response received, "
                 f"status={resp.status}, output_items={len(resp_body.get('output', []))}"
             )
+            # Embed the sid marker in the final assistant text so the next
+            # request can continue this session (responses path only).
+            out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
+            if out_sid and resp.status == 200 and isinstance(resp_body, dict):
+                if inject_marker_into_blocking_response(resp_body, out_sid):
+                    logger.info(
+                        f"[responses-session] Marker embedded (blocking): sid={out_sid[:12]}…"
+                    )
             return JSONResponse(content=resp_body, status_code=resp.status)
 
 
@@ -465,14 +501,27 @@ async def _stream_responses(
                         f"upstream_status={resp.status}"
                     )
 
+                    # Session marker (responses path only): the gateway returns
+                    # its session id in the response header; embed it in the
+                    # final assistant text so the next request continues this
+                    # session (history + tool calls loaded from SessionDB).
+                    out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
+
                     if sse_mode == "passthrough":
-                        # 直接透傳 SSE 事件（Open WebUI 能處理原生 Responses SSE）
-                        async for chunk in resp.content:
-                            yield chunk
+                        if out_sid and resp.status == 200:
+                            # Frame-level passthrough with marker injection
+                            # (last delta + done text + completed envelope).
+                            async for chunk in stream_with_marker(resp, out_sid):
+                                yield chunk
+                        else:
+                            # 直接透傳 SSE 事件（Open WebUI 能處理原生 Responses SSE）
+                            async for chunk in resp.content:
+                                yield chunk
                     else:
                         # 轉換模式：將 Responses SSE 轉為 Chat Completions SSE
                         async for chunk in _stream_and_convert(
-                            resp, model, completion_id, created_ts
+                            resp, model, completion_id, created_ts,
+                            marker_sid=out_sid if resp.status == 200 else "",
                         ):
                             yield chunk
                         return
@@ -497,10 +546,19 @@ async def _stream_and_convert(
     model: str,
     completion_id: str,
     created_ts: int,
+    marker_sid: str = "",
 ) -> AsyncGenerator[bytes, None]:
-    """讀取 Responses SSE 並轉換為 Chat Completions SSE"""
+    """讀取 Responses SSE 並轉換為 Chat Completions SSE。
+
+    marker_sid 非空時，在 response.completed 的 finish chunk 之前補發一個
+    delta.content = <!--hermes-sid:...-->，讓轉換模式下的 assistant 文字也
+    帶上 session marker（同 passthrough 的 stream_with_marker）。
+    """
+    from responses_session import build_marker
+
     buffer = b""
     last_heartbeat = time.monotonic()
+    marker = build_marker(marker_sid) if marker_sid else ""
 
     while True:
         # 心跳
@@ -545,6 +603,22 @@ async def _stream_and_convert(
             chunk = responses_sse_to_chat_sse(
                 event_type, data_obj, model, completion_id, created_ts
             )
+            if event_type == "response.completed" and marker:
+                # Emit the sid marker as a content delta BEFORE the finish
+                # chunk so it lands in the accumulated assistant text.
+                marker_payload = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": marker},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(marker_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                logger.info(f"[responses-session] Marker embedded (convert): sid={marker_sid[:12]}…")
             if chunk:
                 yield chunk
 

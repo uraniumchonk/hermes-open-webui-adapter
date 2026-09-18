@@ -1,0 +1,29 @@
+diff --git a/tools/file_operations.py b/tools/file_operations.py
+index 97b951c56f..6de8d9ee51 100644
+--- a/tools/file_operations.py
++++ b/tools/file_operations.py
+@@ -297,8 +297,22 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
+         if content_sample:
+             # Undecodable bytes arrive as U+FFFD ("printable", so the ratio misses
+             # them); treat as binary so a round-trip can't write back mojibake.
+-            if "\ufffd" in content_sample[:1000]:
+-                return True
++            #
++            # HOWEVER: head -c N truncates at byte boundary, which can split
++            # a multi-byte UTF-8 character, producing a single trailing U+FFFD
++            # even for perfectly valid text files. We must distinguish this
++            # truncation artifact from real binary content. Strategy: count
++            # U+FFFD occurrences; if only one and it is at the very end of the
++            # sample (within last 3 chars, enough to cover a 4-byte UTF-8 char
++            # split), treat it as a truncation artifact and ignore it.
++            check_sample = content_sample[:1000]
++            fffd_indices = [i for i, c in enumerate(check_sample) if c == "\ufffd"]
++            if fffd_indices:
++                sample_len = len(check_sample)
++                # More than one FFFD, or FFFD not near the end → real binary
++                if len(fffd_indices) > 1 or fffd_indices[-1] < sample_len - 3:
++                    return True
++                # Single trailing FFFD → truncation artifact, skip the check
+             non_printable = sum(1 for c in content_sample[:1000] if ord(c) < 32 and c not in '\n\r\t')
+             return non_printable / min(len(content_sample), 1000) > 0.30
+         return False

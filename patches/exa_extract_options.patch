@@ -1,0 +1,67 @@
+diff --git a/plugins/web/exa/provider.py b/plugins/web/exa/provider.py
+index f6d4dc753b..8ac6185e34 100644
+--- a/plugins/web/exa/provider.py
++++ b/plugins/web/exa/provider.py
+@@ -29,6 +29,43 @@ def _get_exa_client() -> Any:
+     return cached_sdk_client("_exa_client", "EXA_API_KEY", _MISSING_KEY, "search.exa", _factory)
+ 
+ 
++def _exa_extract_options() -> tuple:
++    """Read Exa extract tuning knobs from config (web.*).
++
++    Returns ``(max_characters, max_age_hours, filter_empty_results)``:
++
++    - ``max_characters``: aligns with Hermes's ``web.extract_char_limit``
++      (default 15000) so Exa returns as much as Hermes will keep, instead
++      of the SDK's 10000-char default truncating long pages early.
++    - ``max_age_hours``: cache freshness via ``web.exa_max_age_hours``
++      (default 0 = always fetch fresh). 0 = always fresh, -1 = cache only,
++      N = hours.
++    - ``filter_empty_results``: drop empty results via
++      ``web.exa_filter_empty_results`` (default True).
++    """
++    try:
++        from hermes_cli.config import load_config
++
++        web_cfg = load_config().get("web") or {}
++    except Exception:
++        web_cfg = {}
++
++    try:
++        max_characters = int(web_cfg.get("extract_char_limit", 15000))
++    except (TypeError, ValueError):
++        max_characters = 15000
++    if max_characters < 1000:
++        max_characters = 15000
++
++    try:
++        max_age_hours = int(web_cfg.get("exa_max_age_hours", 0))
++    except (TypeError, ValueError):
++        max_age_hours = 0
++
++    filter_empty = bool(web_cfg.get("exa_filter_empty_results", True))
++    return max_characters, max_age_hours, filter_empty
++
++
+ class ExaWebSearchProvider(BaseWebSearchProvider):
+     """Exa search + extract provider."""
+ 
+@@ -56,7 +93,17 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
+             if use_keyless("exa", provider_env("EXA_API_KEY")):
+                 return keyless_extract("Exa", "exa", urls, logger)
+             logger.info("Exa extract: %d URL(s)", len(urls))
+-            response = _get_exa_client().get_contents(urls, text=True)
++            max_chars, max_age, filter_empty = _exa_extract_options()
++            logger.info(
++                "Exa extract options: max_chars=%d max_age_hours=%d filter_empty=%s",
++                max_chars, max_age, filter_empty,
++            )
++            response = _get_exa_client().get_contents(
++                urls,
++                text={"max_characters": max_chars},
++                max_age_hours=max_age,
++                filter_empty_results=filter_empty,
++            )
+             return [document(r.url or "", r.title or "", r.text or "") for r in response.results or []]
+ 
+         return run_extract("Exa", logger, urls, _body, sdk=True)

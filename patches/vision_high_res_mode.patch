@@ -1,0 +1,325 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index ccf72855ba..0e8608f2dd 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -7911,9 +7911,12 @@ async def async_call_llm(
+     api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+-    route_info: Optional[Dict[str, str]] = None,
++    route_info: Optional[Dict[str, str]] = None, extra_headers: Optional[Dict[str, str]] = None,
+ ) -> Any:
+-    """Run an asynchronous auxiliary LLM request under the configured limit."""
++    """Run an asynchronous auxiliary LLM request under the configured limit.
++
++    ``extra_headers`` (local patch): per-request HTTP headers (e.g.
++    ``X-Meow-No-Compress: 1`` for the metrics proxy's full-resolution vision mode)."""
+     semaphore = _acquire_async_aux_semaphore(task)
+     if semaphore is not None:
+         await semaphore.acquire()
+@@ -7924,6 +7927,7 @@ async def async_call_llm(
+                 main_runtime=main_runtime, messages=messages, temperature=temperature,
+                 max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
+                 reasoning_config=reasoning_config, route_info=route_info,
++                extra_headers=extra_headers,
+             )
+     finally:
+         if semaphore is not None:
+@@ -7935,16 +7939,16 @@ async def _async_call_llm_impl(
+     api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+-    route_info: Optional[Dict[str, str]] = None,
++    route_info: Optional[Dict[str, str]] = None, extra_headers: Optional[Dict[str, str]] = None,
+ ) -> Any:
+     """Centralized asynchronous LLM call; see call_llm() for full documentation.
+-    No per-request header / api_mode override on the async entry point."""
++    No per-request api_mode override on the async entry point (headers are allowed)."""
+     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
+         task, async_mode=True, provider=provider, model=model, base_url=base_url,
+         api_key=api_key, main_runtime=main_runtime, messages=messages,
+         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=timeout,
+         extra_body=extra_body, reasoning_config=reasoning_config,
+-        extra_headers=None, api_mode=None, route_info=route_info,
++        extra_headers=extra_headers, api_mode=None, route_info=route_info,
+     )
+     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
+     try:
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 6065da4ac0..50d98302de 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1599,7 +1599,10 @@ def run_conversation(
+     addresses, after every history rewrite including post-turn micro-compaction.
+     """
+     from agent.turn_context import export_current_turn_boundary
+-
++    # Meow high-res vision (local patch): the flag is set during a tool round and
++    # must not leak into the next turn — clear it at every turn boundary.
++    from agent.high_res_flags import clear_high_res
++    clear_high_res(agent.session_id)
+     result = _run_conversation_turn(
+         agent,
+         user_message,
+diff --git a/agent/high_res_flags.py b/agent/high_res_flags.py
+new file mode 100644
+index 0000000000..420739403b
+--- /dev/null
++++ b/agent/high_res_flags.py
+@@ -0,0 +1,46 @@
++"""Session-scoped high-res vision flags (local patch).
++
++``vision_analyze(high_res=True)`` marks the calling session so that the main
++loop's API requests for the rest of that turn carry ``X-Meow-No-Compress: 1``.
++The metrics proxy (18080) skips its image downscaling for those requests, so
++the image reaches the backend at full resolution (up to the backend's own
++~16.8 MP cap) instead of the proxy's compressed budget.
++
++Lifecycle: set during a tool round, cleared at the start of the NEXT turn
++(``run_conversation``), so the flag covers every API call of the turn in which
++the image was loaded — stable request bytes within the turn, no prompt-cache
++churn — and reverts to normal compression on later turns.
++
++Keyed by session id (one process serves many sessions); thread-safe.
++"""
++
++from __future__ import annotations
++
++import threading
++
++_lock = threading.Lock()
++_active: dict[str, bool] = {}
++
++
++def mark_high_res(session_id: str | None) -> None:
++    """Mark ``session_id`` for full-resolution image requests (no-op if empty)."""
++    if not session_id:
++        return
++    with _lock:
++        _active[session_id] = True
++
++
++def is_high_res_active(session_id: str | None) -> bool:
++    """True while the session's high-res flag is set (no-op if empty)."""
++    if not session_id:
++        return False
++    with _lock:
++        return _active.get(session_id, False)
++
++
++def clear_high_res(session_id: str | None) -> None:
++    """Drop the session's high-res flag (no-op if empty or unset)."""
++    if not session_id:
++        return
++    with _lock:
++        _active.pop(session_id, None)
+diff --git a/agent/turn_api_request.py b/agent/turn_api_request.py
+index f218023921..762a7030c9 100644
+--- a/agent/turn_api_request.py
++++ b/agent/turn_api_request.py
+@@ -13,6 +13,7 @@ import logging
+ from typing import Any
+ 
+ from agent.message_sanitization import sanitize_outbound_kwargs
++from agent.high_res_flags import is_high_res_active
+ from utils import env_var_enabled
+ 
+ logger = logging.getLogger("agent.conversation_loop")
+@@ -135,6 +136,10 @@ def build_api_request(
+     if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+         _set_extra_header(api_kwargs, "x-initiator", "user")
+         agent._is_user_initiated_turn = False
++    # Meow high-res vision (local patch): vision_analyze(high_res=True) marks the
++    # session so this turn's requests skip the metrics proxy's image downscaling.
++    if is_high_res_active(agent.session_id):
++        _set_extra_header(api_kwargs, "X-Meow-No-Compress", "1")
+     try:
+         from hermes_cli.middleware import apply_llm_request_middleware
+ 
+diff --git a/tests/tools/test_vision_region.py b/tests/tools/test_vision_region.py
+index dcc7c5f255..a7dfd9d484 100644
+--- a/tests/tools/test_vision_region.py
++++ b/tests/tools/test_vision_region.py
+@@ -181,7 +181,7 @@ class TestSchemaAndHandler:
+         src = _make_png(tmp_path / "img.png", 100, 50)
+         seen = {}
+ 
+-        async def _fake_native(image_url, question, task_id=None, region=None):
++        async def _fake_native(image_url, question, task_id=None, region=None, **_kw):
+             seen["region"] = region
+             return {"_multimodal": True, "content": []}
+ 
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index 24f8302c51..1801444608 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -34,6 +34,7 @@ def _load_auxiliary_client() -> None:
+ 
+ 
+ from hermes_constants import get_hermes_dir
++from agent.high_res_flags import mark_high_res
+ from tools.debug_helpers import DebugSession
+ from tools.website_policy import check_website_access
+ from tools.vision_tools_history_budget import (
+@@ -41,7 +42,6 @@ from tools.vision_tools_history_budget import (
+     release_embed as _release_embed,
+     repeat_refusal as _repeat_refusal,
+     resolve_repeat_cap as _resolve_repeat_cap,
+-    resolve_embed_target_bytes as _resolve_embed_target_bytes,
+ )
+ from tools.vision_tools_image_prep import (
+     _VISION_MAX_VALIDATED_AGGREGATE_PIXELS,
+@@ -586,9 +586,19 @@ async def _resize_prepared(prepared: _PreparedImage, scale_info: dict, **kwargs)
+ 
+ async def _vision_analyze_native(
+     image_url: str, question: str, task_id: Optional[str] = None, region: Optional[list] = None,
++    high_res: bool = False, session_id: Optional[str] = None,
+ ) -> Any:
+     """Fast path for vision-capable main models: a ``_multimodal`` envelope dict on success,
+-    or a JSON error string (the normal tool-result contract) on failure."""
++    or a JSON error string (the normal tool-result contract) on failure.
++
++    Local patch: hermes's own history-embed downscale (256 KB / 1568 px) is DISABLED — the
++    metrics proxy (18080) is the single image-compression point, and every native-path
++    backend in this deployment is that proxy. Cloud backends take the aux path below, which
++    keeps its own size handling.
++
++    ``high_res`` (local patch): mark the session so the main loop's requests for this turn
++    carry ``X-Meow-No-Compress: 1`` — the metrics proxy then forwards the image at full
++    resolution (backend cap ~16.8 MP) instead of its normal 6 MP / 3840 px compression."""
+     if not isinstance(image_url, str) or not image_url.strip():
+         return tool_error("image_url is required", success=False)
+     # A cap > 0 RESERVES the slot here (atomic check-and-count); released below if no embed happens.
+@@ -608,25 +618,19 @@ async def _vision_analyze_native(
+             return tool_error(str(exc), success=False)
+         image_data_url = await _run_encode_on_cpu_executor(
+             _image_to_base64_data_url, prepared.path, mime_type=prepared.mime)
+-        # Proactive embed cap: this image is re-sent on every later turn, so resize DOWN to the
+-        # history-reuse target whenever the byte or long-edge cap is exceeded, not just at 20 MB.
++        # Local patch: hermes's own history-embed downscale (256 KB / 1568 px) is DISABLED —
++        # the metrics proxy (18080) is the single image-compression point (image_max_pixels /
++        # image_max_longest_side), and every native-path backend in this deployment is that
++        # proxy. Cloud backends take the aux path below, which keeps its own size handling.
++        # Keep only the 20 MB session-wedge guard.
+         _scale_info: dict = {}
+-        # Anthropic still rejects >5 MB / >8000px with a non-retryable 400, but those are one-shot viewing
+-        # limits — history embeds are sized smaller so repeated vision_analyze turns don't blow the context
+-        # (#92699).
+-        embed_target_bytes = _resolve_embed_target_bytes()
+-        _over_dims = await _run_encode_on_cpu_executor(
+-            _image_exceeds_dimension, prepared.path, _EMBED_MAX_DIMENSION)
+-        if len(image_data_url) > embed_target_bytes or _over_dims:
+-            image_data_url = await _resize_prepared(
+-                prepared, _scale_info,
+-                max_base64_bytes=embed_target_bytes, max_dimension=_EMBED_MAX_DIMENSION, force_jpeg=True)
+-            # Reject rather than embed a session-wedging payload.
+-            if len(image_data_url) > _MAX_BASE64_BYTES:
+-                return tool_error(_too_large_message(image_data_url), success=False)
++        if len(image_data_url) > _MAX_BASE64_BYTES:
++            return tool_error(_too_large_message(image_data_url), success=False)
+         embedded = True
+         if not reserved:
+             _record_embed(image_url)
++        if high_res:
++            mark_high_res(session_id)
+         return _build_native_vision_tool_result(
+             image_url=image_url, question=question, image_data_url=image_data_url,
+             image_size_bytes=prepared.size_bytes,
+@@ -643,10 +647,13 @@ async def _vision_analyze_native(
+ 
+ 
+ def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: float, *,
+-                     min_timeout: Optional[float] = None) -> dict:
++                     min_timeout: Optional[float] = None, high_res: bool = False) -> dict:
+     """``async_call_llm`` kwargs with ``auxiliary.vision.timeout`` / ``.temperature`` from config.
+     Local vision models (llama.cpp, ollama) can take well over 30s, hence generous defaults
+-    (temperature 0.1); ``min_timeout`` lets video enforce a floor."""
++    (temperature 0.1); ``min_timeout`` lets video enforce a floor.
++
++    ``high_res`` (local patch): adds ``X-Meow-No-Compress: 1`` so the metrics proxy skips
++    image downscaling for this (aux) request — full-resolution mode."""
+     timeout, temperature = default_timeout, 0.1
+     try:
+         _vision_cfg = _cfg_auxiliary("vision", default={}) or {}
+@@ -656,8 +663,11 @@ def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: floa
+             temperature = float(_vision_cfg["temperature"])
+     except Exception:
+         pass
+-    return {"task": "vision", "messages": messages, "temperature": temperature, "timeout": timeout,
+-            **({"model": model} if model else {})}
++    kwargs = {"task": "vision", "messages": messages, "temperature": temperature, "timeout": timeout,
++              **({"model": model} if model else {})}
++    if high_res:
++        kwargs["extra_headers"] = {"X-Meow-No-Compress": "1"}
++    return kwargs
+ 
+ 
+ def _media_messages(user_prompt: str, part_type: str, data_url: str) -> list:
+@@ -776,9 +786,12 @@ async def _run_analysis(
+ 
+ async def vision_analyze_tool(
+     image_url: str, user_prompt: str, model: str = None,
+-    task_id: Optional[str] = None, region: Optional[list] = None) -> str:
++    task_id: Optional[str] = None, region: Optional[list] = None,
++    high_res: bool = False) -> str:
+     """Describe an image (URL, local path, data: URL) with the auxiliary vision LLM. ``user_prompt``
+-    is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/."""
++    is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/.
++    ``high_res`` (local patch): full-resolution mode — the request carries
++    ``X-Meow-No-Compress: 1`` so the metrics proxy skips image downscaling."""
+     async def stage(prompt: str, debug_call_data: dict, temp_paths: list) -> tuple:
+         prepared = await _prepare_image(image_url, task_id, region, validate_decode=False)
+         temp_paths.append(prepared.path)
+@@ -796,7 +809,7 @@ async def vision_analyze_tool(
+         debug_call_data["image_size_bytes"] = prepared.size_bytes
+         messages = _media_messages(prompt, "image_url", image_data_url)
+         logger.info("Processing image with vision model...")
+-        call_kwargs = _aux_call_kwargs(messages, model, 120.0)
++        call_kwargs = _aux_call_kwargs(messages, model, 120.0, high_res=high_res)
+         _load_auxiliary_client()
+         try:
+             response = await async_call_llm(**call_kwargs)
+@@ -880,6 +893,15 @@ VISION_ANALYZE_SCHEMA = {
+                     "re-call with a region to zoom into small text or fine "
+                     "detail."
+                 )
++            },
++            "high_res": {
++                "type": "boolean",
++                "description": (
++                    "Optional, default false. Full-resolution mode: the metrics proxy also skips "
++                    "image compression, so the backend sees the full image (up to ~16K image "
++                    "tokens instead of the usual ~6K proxy-compressed). Use ONLY when the user "
++                    "explicitly asks for maximum detail or full resolution."
++                )
+             }
+         },
+         "required": ["image_url", "question"]
+@@ -901,19 +923,24 @@ def _configured_aux_model(sections: tuple, env_vars: tuple) -> Optional[str]:
+ 
+ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+     image_url, question, region = args.get("image_url", ""), args.get("question", ""), args.get("region")
++    high_res = bool(args.get("high_res", False))  # local patch: full-resolution mode
+     task_id = kw.get("task_id")
++    session_id = kw.get("session_id")
+     # No concurrency gate around the whole analysis — the CPU burst is bounded inside the
+     # encode/resize step, so multi-image fan-out keeps full request concurrency.
+     if _should_use_native_vision_fast_path():
+-        logger.info("vision_analyze: native fast path")
+-        return await _vision_analyze_native(image_url, question, task_id=task_id, region=region)
++        logger.info("vision_analyze: native fast path (high_res=%s)", high_res)
++        return await _vision_analyze_native(
++            image_url, question, task_id=task_id, region=region,
++            high_res=high_res, session_id=session_id)
+ 
+     # Legacy path: aux LLM describes the image and we return its text.
+     full_prompt = (
+         "Fully describe and explain everything about this image, then answer the "
+         f"following question:\n\n{question}")
+     model = _configured_aux_model(("vision",), ("AUXILIARY_VISION_MODEL",))
+-    return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region)
++    return await vision_analyze_tool(
++        image_url, full_prompt, model, task_id=task_id, region=region, high_res=high_res)
+ 
+ 
+ registry.register(
