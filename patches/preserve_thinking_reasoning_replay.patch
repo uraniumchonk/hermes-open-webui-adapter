@@ -1,0 +1,211 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index cd4c532ec3..8c05fe6331 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2305,6 +2305,11 @@ def init_agent(
+ 
+     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
+     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
++    # Per-route preserve_thinking opt-in (local patch, issue #56004): keep
++    # the `reasoning` field on replay for vLLM endpoints whose chat template
++    # re-renders historical thinking. Read once at init; switch_model /
++    # try_activate_fallback / restore keep it in sync with the active route.
++    agent._preserve_thinking_flag = agent._read_preserve_thinking_from_config()
+     agent.request_overrides = dict(request_overrides or {})
+     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
+     agent._force_ascii_payload = False
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 90f3078c32..12c0a251db 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -900,6 +900,7 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
+         agent._transport_cache.clear()
+     agent.api_key = rt["api_key"]
+     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
++    agent._preserve_thinking_flag = rt.get("preserve_thinking_flag", False)
+     agent.request_overrides = dict(rt.get("request_overrides") or {})
+     agent._client_kwargs = dict(rt["client_kwargs"])
+ 
+@@ -1985,6 +1986,10 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
+             "refusing to keep the previous provider's endpoint"
+         )
+     agent.api_mode = api_mode
++    # Local patch (issue #56004): re-resolve preserve_thinking for the
++    # new route (must run after the base_url swap above so the lookup
++    # sees the new endpoint) so the flag travels with the active provider.
++    agent._preserve_thinking_flag = agent._read_preserve_thinking_from_config()
+     # New api_mode may need a different transport.
+     if hasattr(agent, "_transport_cache"):
+         agent._transport_cache.clear()
+@@ -2086,6 +2091,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
+         "use_native_cache_layout": agent._use_native_cache_layout,
+         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
+         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
++        "preserve_thinking_flag": getattr(agent, "_preserve_thinking_flag", False),
+         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
+         # PRE-switch overrides from the stale init snapshot.
+         # See #75091.
+@@ -3000,7 +3006,11 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
+     request falls back to Mistral, and Mistral 422s on the stale pad.
+     """
+     from agent.message_sanitization import reapply_reasoning_echo
+-    return reapply_reasoning_echo(api_messages, agent._needs_thinking_reasoning_pad())
++    return reapply_reasoning_echo(
++        api_messages,
++        agent._needs_thinking_reasoning_pad(),
++        preserve_thinking=bool(getattr(agent, "_preserve_thinking_flag", False)),
++    )
+ 
+ 
+ def _iter_httpx_pools_with_owner(http_client: Any):
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index a940e631c0..f730d05fb0 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1975,6 +1975,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+             agent.base_url, agent.api_mode = fb_base_url, fb_api_mode
+             # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
+             agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
++            # Local patch (issue #56004): resolve preserve_thinking for the
++            # fallback route so the flag travels with the active provider;
++            # restore_primary_runtime reverts it from the snapshot.
++            agent._preserve_thinking_flag = agent._read_preserve_thinking_from_config()
+             if hasattr(agent, "_transport_cache"):
+                 agent._transport_cache.clear()
+             agent._fallback_activated = True
+@@ -2045,7 +2049,19 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
+     for msg in messages:
+         api_msg = msg.copy()
+         agent._copy_reasoning_content_for_api(msg, api_msg)
++        # Local patch (issue #56004): keep non-empty `reasoning` for
++        # preserve_thinking routes (vLLM re-renders historical thinking
++        # from it; `reasoning_content` is dropped on input). Mirrors the
++        # main-loop build in turn_context.py.
++        _rt = api_msg.get("reasoning")
++        _keep_reasoning = (
++            getattr(agent, "_preserve_thinking_flag", False)
++            and isinstance(_rt, str)
++            and _rt.strip()
++        )
+         for key in _SUMMARY_FOREIGN_MESSAGE_KEYS:
++            if key == "reasoning" and _keep_reasoning:
++                continue
+             api_msg.pop(key, None)
+         # Mirror of the transport's role-qualified strip: ``name`` is
+         # schema-foreign on tool results only (strict providers reject with
+diff --git a/agent/message_sanitization.py b/agent/message_sanitization.py
+index 4575937a36..644b9dd72d 100644
+--- a/agent/message_sanitization.py
++++ b/agent/message_sanitization.py
+@@ -545,13 +545,24 @@ def apply_reasoning_content_policy(source_msg: dict, api_msg: dict, needs_thinki
+         api_msg["reasoning_content"] = " "
+ 
+ 
+-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+-    """Re-pad (or strip) assistant turns' reasoning_content for the ACTIVE provider.
++def reapply_reasoning_echo(
++    api_messages: list,
++    needs_thinking_pad: bool,
++    preserve_thinking: bool = False,
++) -> int:
++    """Re-pad (or strip) assistant turns' reasoning fields for the ACTIVE provider.
+ 
+     ``api_messages`` is built once under the primary provider; a mid-conversation fallback
+     can switch providers, so baked-in fields must be reconciled: TO a require-side provider
+     re-applies the pad (else 400), TO a strict one strips it (else 422). Idempotent.
+     Returns the number of assistant turns changed.
++
++    Local patch (issue #56004): the ``reasoning`` field is reconciled too.
++    vLLM >= 0.20 re-renders historical thinking from ``reasoning`` (and
++    silently drops ``reasoning_content`` on input) when the served chat
++    template supports ``preserve_thinking`` (Qwen3.6/3.8, Gemma 4).  For
++    preserve_thinking routes the non-empty ``reasoning`` field is kept; for
++    every other provider it is stripped so strict endpoints never see it.
+     """
+     changed = 0
+     for api_msg in api_messages:
+@@ -574,6 +585,17 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+         elif "reasoning_content" in api_msg:
+             api_msg.pop("reasoning_content", None)
+             changed += 1
++        # Local patch (issue #56004): reconcile the `reasoning` field.
++        # Keep non-empty values only for preserve_thinking routes; strip
++        # them everywhere else (strict providers reject unknown fields, and
++        # empty values would render empty historical blocks that break
++        # prefix caching — QwenLM/Qwen3.8#131).
++        if "reasoning" in api_msg:
++            rt = api_msg.get("reasoning")
++            keep = preserve_thinking and isinstance(rt, str) and rt.strip()
++            if not keep:
++                api_msg.pop("reasoning", None)
++                changed += 1
+     return changed
+ 
+ 
+diff --git a/agent/reasoning_params.py b/agent/reasoning_params.py
+index 05b253a654..8f57d966da 100644
+--- a/agent/reasoning_params.py
++++ b/agent/reasoning_params.py
+@@ -153,6 +153,35 @@ class ReasoningParamsMixin:
+         except Exception:
+             return False
+ 
++    def _read_preserve_thinking_from_config(self) -> bool:
++        """Resolve the ``preserve_thinking`` capability for the current route.
++
++        Local patch (issue #56004): vLLM >= 0.20 re-renders historical
++        thinking from the ``reasoning`` field (NOT ``reasoning_content``,
++        which it silently drops on input) when the served chat template
++        supports ``preserve_thinking`` (Qwen3.6/3.8, Gemma 4).  The flag is
++        declared per custom-provider model entry, e.g.::
++
++            custom_providers:
++              - base_url: http://127.0.0.1:18080/v1
++                models:
++                  qwen-27b-default:
++                    preserve_thinking: true
++
++        True only when the *current* (model, base_url) route explicitly
++        opts in; anything else (missing entry, non-bool, non-custom
++        provider) returns False.
++        """
++        try:
++            from hermes_cli.config import get_custom_provider_model_capability
++            return bool(
++                get_custom_provider_model_capability(
++                    self.model, self.base_url, "preserve_thinking"
++                )
++            )
++        except Exception:
++            return False
++
+     # Echo families are host/provider-driven, not model-name-driven: aggregators re-exporting Kimi reject the
+     # echo. Rule table: ``message_sanitization._REASONING_ECHO_RULES``. Kimi deliberately passes the raw
+     # provider and no model (its rule matches exact provider ids + hosts only).
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index fd671e52d5..ba88547a16 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1125,7 +1125,21 @@ def build_api_messages(
+         agent._copy_reasoning_content_for_api(msg, api_msg)
+         # 'reasoning' is trajectory-only (copied to 'reasoning_content' above);
+         # finish_reason is rejected by strict APIs (e.g. Mistral).
+-        api_msg.pop("reasoning", None)
++        # Local patch (issue #56004): exception for preserve_thinking routes
++        # (vLLM >= 0.20 + Qwen3.6/3.8-style templates) — vLLM re-renders
++        # historical thinking from the `reasoning` field and silently drops
++        # `reasoning_content` on input, so the internal field IS the
++        # provider-facing carrier there. Non-empty values only: empty blocks
++        # break prefix caching (QwenLM/Qwen3.8#131). reapply_reasoning_echo
++        # re-strips it on fallback to a strict provider.
++        _rt = api_msg.get("reasoning")
++        _keep = (
++            getattr(agent, "_preserve_thinking_flag", False)
++            and isinstance(_rt, str)
++            and _rt.strip()
++        )
++        if not _keep:
++            api_msg.pop("reasoning", None)
+         api_msg.pop("finish_reason", None)
+         # Fill empty non-final user/assistant wire copies so the pre-call sanitizer
+         # stops re-healing and flooding errors.log; durable history is untouched.

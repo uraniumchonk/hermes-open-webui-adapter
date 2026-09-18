@@ -1,0 +1,76 @@
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 96adfa5753..bd1f37262c 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -786,6 +963,27 @@ class OpenAICompatRoutesMixin:
+         gateway_session_key, key_err = self._parse_session_key_header(request)
+         if key_err is not None:
+             return key_err
++        # X-Hermes-Session-Id continues an existing session (history from state.db,
++        # not the body); requires a configured API key or any client could read
++        # history by guessing ids. Mirrors the chat/completions handler: the
++        # responses endpoint previously had no header-based continuation, so
++        # stateless clients (Open WebUI Responses mode) lost all tool-call
++        # history between turns.
++        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
++        if provided_session_id:
++            if not self._api_key:
++                logger.warning(
++                    "Session continuation via X-Hermes-Session-Id rejected: "
++                    "no API key configured.  Set API_SERVER_KEY to enable "
++                    "session continuity.")
++                return _error_response("Session continuation requires API key authentication. "
++                        "Configure API_SERVER_KEY to enable this feature.", 403)
++            # Same guard as the native gateway: ids are interpolated into on-disk filenames.
++            from gateway.session import _is_path_unsafe
++            if re.search(r'[\r\n\x00]', provided_session_id) or _is_path_unsafe(provided_session_id):
++                return _invalid_request("Invalid session ID")
++            if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
++                return _invalid_request("Session ID too long")
+         try:
+             body = await request.json()
+         except Exception:
+@@ -838,7 +1036,28 @@ class OpenAICompatRoutesMixin:
+             if previous_response_id:
+                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+         stored_session_id = None
+-        if not conversation_history and previous_response_id:
++        if provided_session_id:
++            # Header continuation: the SessionDB row is canonical — load the
++            # full transcript (including tool calls) from it, overriding any
++            # body conversation_history (same semantics as the chat/completions
++            # header path: "history comes from state.db, not the body"). An
++            # empty/missing row falls back to the body history (or empty).
++            try:
++                from gateway.platforms.api_server_runs import _resolve_live_session_id
++                # #98619/#13437: a client-addressed id from before a compression
++                # rotation must adopt the live continuation tip (same canonical
++                # resolution the chat/completions header path uses); fails open.
++                stored_session_id = await _resolve_live_session_id(self, provided_session_id)
++                db = await self._ensure_session_db_async()
++                if db is not None:
++                    db_history = await asyncio.to_thread(
++                        db.get_messages_as_conversation, stored_session_id)
++                    if db_history:
++                        conversation_history = db_history
++            except Exception as e:
++                logger.warning("Failed to load session history for %s: %s", provided_session_id, e)
++                stored_session_id = provided_session_id
++        elif not conversation_history and previous_response_id:
+             stored = self._response_store.get(previous_response_id)
+             if stored is None:
+                 return _error_response(f"Previous response not found: {previous_response_id}", 404)
+@@ -854,9 +1073,10 @@ class OpenAICompatRoutesMixin:
+         if body.get("truncation") == "auto":
+             conversation_history = _auto_truncate_response_history(conversation_history)
+ 
+-        # Session precedence: previous_response_id chain > declared X-Hermes-Session-Key > fresh
+-        # id. Binding the declared key follows the same precedence: a chain-selected session must
+-        # not have its routing key rewritten to this header.
++        # Session precedence: X-Hermes-Session-Id > previous_response_id chain >
++        # declared X-Hermes-Session-Key > fresh id. Binding the declared key
++        # follows the same precedence: a chain-selected session must not have
++        # its routing key rewritten to this header.
+         _declared_selected = not stored_session_id and bool(gateway_session_key)
+         session_id = (
+             stored_session_id
