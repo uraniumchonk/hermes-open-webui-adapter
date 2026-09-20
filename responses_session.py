@@ -257,13 +257,22 @@ async def stream_with_marker(
     pending_delta: Optional[bytes] = None
     placed = 0
 
-    def _flush_pending() -> Optional[bytes]:
+    def _flush_pending(is_final: bool) -> Optional[bytes]:
+        # Append the marker ONLY when the held delta is the final one (right
+        # before output_text.done / completed / EOF). In a multi-turn agent
+        # loop the gateway keeps ONE message item open and interleaves text
+        # deltas with tool-call frames; the old logic marked the last delta
+        # before EVERY non-delta frame, so the marker appeared once per turn.
+        # is_final gates the marker to the true last delta only.
         nonlocal pending_delta, placed
         if pending_delta is None:
             return None
-        frame = _append_marker_to_frame(pending_delta, marker)
-        if frame is not pending_delta:
-            placed += 1
+        if is_final:
+            frame = _append_marker_to_frame(pending_delta, marker)
+            if frame is not pending_delta:
+                placed += 1
+        else:
+            frame = pending_delta
         pending_delta = None
         return frame + b"\n\n"
 
@@ -291,9 +300,12 @@ async def stream_with_marker(
                     yield pending_delta + b"\n\n"
                 pending_delta = frame_bytes
                 continue
-            # Non-delta frame: flush the buffered delta (with marker if it was
-            # the last one), then handle this frame.
-            flushed = _flush_pending()
+            # Non-delta frame: flush the buffered delta. The marker goes on
+            # ONLY if this frame is the terminal done/completed (the held
+            # delta was the final one); intermediate tool-call frames flush
+            # it clean so the marker doesn't appear once per agent-loop turn.
+            is_final = event_type in ("response.output_text.done", "response.completed")
+            flushed = _flush_pending(is_final)
             if flushed is not None:
                 yield flushed
             if event_type in ("response.output_text.done", "response.completed"):
@@ -303,8 +315,8 @@ async def stream_with_marker(
                 yield out + b"\n\n"
                 continue
             yield frame_bytes + b"\n\n"
-    # EOF: flush whatever is left.
-    flushed = _flush_pending()
+    # EOF: flush whatever is left (best-effort final).
+    flushed = _flush_pending(is_final=True)
     if flushed is not None:
         yield flushed
     if buffer.strip():
