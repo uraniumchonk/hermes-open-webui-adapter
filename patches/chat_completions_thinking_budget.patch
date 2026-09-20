@@ -1,8 +1,8 @@
 diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
-index ec77a52587..7cd09e9a67 100644
+index ee11801b38..e8874c1227 100644
 --- a/agent/transports/chat_completions.py
 +++ b/agent/transports/chat_completions.py
-@@ -461,10 +461,19 @@ class ChatCompletionsTransport(ProviderTransport):
+@@ -520,10 +520,19 @@ class ChatCompletionsTransport(ProviderTransport):
  
          if params.get("extra_body_additions"):
              extra_body.update(params["extra_body_additions"])
