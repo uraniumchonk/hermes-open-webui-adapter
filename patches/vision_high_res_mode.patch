@@ -1,8 +1,8 @@
 diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
-index 244e60830f..826ed7595e 100644
+index 7000f34261..3b351cc05f 100644
 --- a/agent/auxiliary_client.py
 +++ b/agent/auxiliary_client.py
-@@ -8038,9 +8038,12 @@ async def async_call_llm(
+@@ -8069,9 +8069,12 @@ async def async_call_llm(
      api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
      temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
      timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
@@ -17,7 +17,7 @@ index 244e60830f..826ed7595e 100644
      semaphore = _acquire_async_aux_semaphore(task)
      if semaphore is not None:
          await semaphore.acquire()
-@@ -8051,6 +8054,7 @@ async def async_call_llm(
+@@ -8082,6 +8085,7 @@ async def async_call_llm(
                  main_runtime=main_runtime, messages=messages, temperature=temperature,
                  max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
                  reasoning_config=reasoning_config, route_info=route_info,
@@ -25,7 +25,7 @@ index 244e60830f..826ed7595e 100644
              )
      finally:
          if semaphore is not None:
-@@ -8062,16 +8066,16 @@ async def _async_call_llm_impl(
+@@ -8093,16 +8097,16 @@ async def _async_call_llm_impl(
      api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
      temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
      timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
@@ -150,7 +150,7 @@ index dcc7c5f255..a7dfd9d484 100644
              return {"_multimodal": True, "content": []}
  
 diff --git a/tools/vision_tools.py b/tools/vision_tools.py
-index 861a5f689d..767269f69a 100644
+index 7df14bbe2d..47a8f045c1 100644
 --- a/tools/vision_tools.py
 +++ b/tools/vision_tools.py
 @@ -34,6 +34,7 @@ def _load_auxiliary_client() -> None:
@@ -169,7 +169,7 @@ index 861a5f689d..767269f69a 100644
  )
  from tools.vision_tools_image_prep import (
      _VISION_MAX_VALIDATED_AGGREGATE_PIXELS,
-@@ -587,9 +587,19 @@ async def _resize_prepared(prepared: _PreparedImage, scale_info: dict, **kwargs)
+@@ -593,9 +593,19 @@ async def _resize_prepared(prepared: _PreparedImage, scale_info: dict, **kwargs)
  
  async def _vision_analyze_native(
      image_url: str, question: str, task_id: Optional[str] = None, region: Optional[list] = None,
@@ -190,7 +190,7 @@ index 861a5f689d..767269f69a 100644
      if not isinstance(image_url, str) or not image_url.strip():
          return tool_error("image_url is required", success=False)
      already_native = _native_turn_duplicate(image_url, region)
-@@ -612,25 +622,19 @@ async def _vision_analyze_native(
+@@ -618,25 +628,19 @@ async def _vision_analyze_native(
              return tool_error(str(exc), success=False)
          image_data_url = await _run_encode_on_cpu_executor(
              _image_to_base64_data_url, prepared.path, mime_type=prepared.mime)
@@ -225,7 +225,7 @@ index 861a5f689d..767269f69a 100644
          return _build_native_vision_tool_result(
              image_url=image_url, question=question, image_data_url=image_data_url,
              image_size_bytes=prepared.size_bytes,
-@@ -647,10 +651,13 @@ async def _vision_analyze_native(
+@@ -653,10 +657,13 @@ async def _vision_analyze_native(
  
  
  def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: float, *,
@@ -241,7 +241,7 @@ index 861a5f689d..767269f69a 100644
      timeout, temperature = default_timeout, 0.1
      try:
          _vision_cfg = _cfg_auxiliary("vision", default={}) or {}
-@@ -660,8 +667,11 @@ def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: floa
+@@ -666,8 +673,11 @@ def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: floa
              temperature = float(_vision_cfg["temperature"])
      except Exception:
          pass
@@ -255,7 +255,7 @@ index 861a5f689d..767269f69a 100644
  
  
  def _media_messages(user_prompt: str, part_type: str, data_url: str) -> list:
-@@ -780,9 +790,12 @@ async def _run_analysis(
+@@ -786,9 +796,12 @@ async def _run_analysis(
  
  async def vision_analyze_tool(
      image_url: str, user_prompt: str, model: str = None,
@@ -270,7 +270,7 @@ index 861a5f689d..767269f69a 100644
      async def stage(prompt: str, debug_call_data: dict, temp_paths: list) -> tuple:
          prepared = await _prepare_image(image_url, task_id, region, validate_decode=False)
          temp_paths.append(prepared.path)
-@@ -800,7 +813,7 @@ async def vision_analyze_tool(
+@@ -806,7 +819,7 @@ async def vision_analyze_tool(
          debug_call_data["image_size_bytes"] = prepared.size_bytes
          messages = _media_messages(prompt, "image_url", image_data_url)
          logger.info("Processing image with vision model...")
@@ -279,7 +279,7 @@ index 861a5f689d..767269f69a 100644
          _load_auxiliary_client()
          try:
              response = await async_call_llm(**call_kwargs)
-@@ -884,6 +897,15 @@ VISION_ANALYZE_SCHEMA = {
+@@ -890,6 +903,15 @@ VISION_ANALYZE_SCHEMA = {
                      "re-call with a region to zoom into small text or fine "
                      "detail."
                  )
@@ -295,7 +295,7 @@ index 861a5f689d..767269f69a 100644
              }
          },
          "required": ["image_url", "question"]
-@@ -905,19 +927,24 @@ def _configured_aux_model(sections: tuple, env_vars: tuple) -> Optional[str]:
+@@ -911,19 +933,24 @@ def _configured_aux_model(sections: tuple, env_vars: tuple) -> Optional[str]:
  
  async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
      image_url, question, region = args.get("image_url", ""), args.get("question", ""), args.get("region")

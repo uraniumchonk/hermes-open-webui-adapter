@@ -1,5 +1,5 @@
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index 982da2f8e2..9ad3534a1b 100644
+index 6c0b6edc57..c6612fccb4 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
 @@ -779,9 +779,9 @@ PLATFORM_HINTS = {
