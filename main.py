@@ -2022,7 +2022,12 @@ def _mem_guard_reject() -> bool:
 async def get_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
-        timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
+        # NO lifetime cap (total=None): long agent tasks (10min+ tool loops)
+        # must survive. Dead-upstream protection lives elsewhere:
+        #   - streaming: transform_stream STALE_STREAM_TIMEOUT=120s
+        #     (gateway emits ": keepalive" every 10s, so 120s idle = dead)
+        #   - non-streaming: per-request timeout in _passthrough_non_streaming
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=None)
         # read_bufsize: single SSE line soft-cap is handled in transform_stream
         # (readuntil max_size=6MB). Keep session buffer modest — gateway must
         # redact multimodal base64 from hermes.tool.progress so we never need

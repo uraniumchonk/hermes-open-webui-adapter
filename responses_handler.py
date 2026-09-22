@@ -459,7 +459,10 @@ async def _blocking_responses(
     直接透傳 Responses API 的 JSON 回應，因為 Open WebUI 在 Responses 模式下
     期望的就是 Responses 格式的回應。
     """
-    timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
+    # Non-streaming: the response body arrives all at once at the END of the
+    # agent run, so the wire is silent during the whole task — the idle
+    # timeout must be generous. No 10-min cap: long tasks are legitimate.
+    timeout = aiohttp.ClientTimeout(total=3600, connect=10, sock_read=3600)
     async with aiohttp.ClientSession(timeout=timeout, read_bufsize=524288) as local_sess:
         async with local_sess.post(
             upstream_url, data=body, headers=fwd_headers
@@ -500,7 +503,15 @@ async def _stream_responses(
     created_ts = int(time.time())
 
     async def generate() -> AsyncGenerator[bytes, None]:
-        timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=600)
+        # NO lifetime cap (total=None): a healthy agent task can run far
+        # longer than 10 minutes (the old total=600 killed in-flight tasks
+        # at exactly 600s — 2026-09-23 incident). Dead-upstream detection
+        # is idle-based instead: the gateway emits ": keepalive" SSE
+        # comments every 10s (CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS), so
+        # 120s without ANY data (keepalives included) means the upstream
+        # is dead — same semantics as transform_stream's
+        # STALE_STREAM_TIMEOUT=120s on the completions path.
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
         async with aiohttp.ClientSession(timeout=timeout, read_bufsize=524288) as local_sess:
             try:
                 async with local_sess.post(
