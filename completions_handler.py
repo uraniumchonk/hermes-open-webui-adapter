@@ -268,8 +268,14 @@ async def _passthrough_non_streaming(
     resp_body = b""
     resp_status = 502
     try:
+        # The shared session has no lifetime cap (long agent tasks); bound
+        # the non-streaming path explicitly. The wire is silent for the
+        # whole agent run (body arrives at the end), so both total and
+        # sock_read are generous.
+        _non_stream_timeout = aiohttp.ClientTimeout(total=3600, connect=10, sock_read=3600)
         async with sess.request(
-            method, upstream_url, data=body, headers=fwd_headers
+            method, upstream_url, data=body, headers=fwd_headers,
+            timeout=_non_stream_timeout,
         ) as resp:
             resp_body = await resp.read()
             resp_status = resp.status
