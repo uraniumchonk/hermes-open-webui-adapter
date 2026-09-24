@@ -1,0 +1,35 @@
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index eb7f28bdc4..ddd12d9628 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -701,8 +701,13 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
+ def cron_create(args):
+     # The gateway-lifecycle guard lives in cron.jobs.create_job (every creation path); a block
+     # surfaces as result["error"].
++    # --prompt (option) wins over the positional prompt: the positional is a nargs='?' that
++    # CPython argparse drops when it follows an option, so the option is the safe form.
++    prompt = getattr(args, "prompt_flag", None)
++    if prompt is None:
++        prompt = args.prompt
+     result = _cron_api(
+-        action="create", schedule=args.schedule, prompt=args.prompt,
++        action="create", schedule=args.schedule, prompt=prompt,
+         skill=getattr(args, "skill", None),
+         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
+         no_agent=getattr(args, "no_agent", False) or None,
+diff --git a/hermes_cli/subcommands/cron.py b/hermes_cli/subcommands/cron.py
+index 365ac5368b..fa146aad45 100644
+--- a/hermes_cli/subcommands/cron.py
++++ b/hermes_cli/subcommands/cron.py
+@@ -25,6 +25,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
+     cron_create.add_argument("schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'")
+     cron_create.add_argument(
+         "prompt", nargs="?", help="Optional self-contained prompt or task instruction")
++    cron_create.add_argument("--prompt", dest="prompt_flag",
++        help="Prompt/task instruction. Preferred over the positional form: CPython "
++             "argparse mis-parses a nargs='?' positional when it follows an option "
++             "(e.g. `create 30m --name x PROMPT` drops PROMPT), but `--prompt` is "
++             "safe in any position.")
+     cron_create.add_argument("--name", help="Optional human-friendly job name")
+     cron_create.add_argument("--deliver",
+         help="Delivery target: origin, local, telegram, discord, signal, "
