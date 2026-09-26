@@ -2,8 +2,10 @@
 # Hermes Tool Filter — Configuration
 # ═══════════════════════════════════════════════════════════
 # 需要改的在上；預設 / 很少動的在下。
-# Env 可覆寫：TOOL_MODE, BIND_PORT, BIND_HOST, AUTO_SPLIT_THRESHOLD
+# Env 可覆寫：BIND_PORT, BIND_HOST
 # 穩定參考：git 877fdb7（structured 上線後、flat 刪除前的完整 config）
+#          git 15da799（tool_mode 舊模式 / native_passthrough / auto_split /
+#          compression_mode / session_isolation_mode / comp_mode 移除前）
 
 # ── 必改 ──────────────────────────────────────────────────
 # path prefix → 本機 Hermes Gateway
@@ -32,16 +34,9 @@ tool_history_format: "structured"
 enable_history_sanitization: true
 sanitization_result_max_length: 20000
 
-# enhance-v2 = 即時串流 + <details> tool card（Open WebUI）
-tool_mode: "enhance-v2"
-
 # ── 預設 / 很少改 ─────────────────────────────────────────
 bind_host: "0.0.0.0"
 bind_port: 9099
-auto_split_threshold: 0          # 0=關；Conduit 不支援 session.split
-compression_mode: "disabled"     # server-side | disabled
-session_isolation_mode: "disabled"  # marker | disabled
-comp_mode: "disabled"            # 訊息含 [comp] 時壓縮舊 tool 文字
 
 # flat 時代用的 hint 檔（structured 不需要；保留鍵名僅供對照舊文件）
 # tool_usage_hint_file: "tool_hint.txt"

@@ -99,7 +99,6 @@ python main.py
 upstreams:
   "30001": "http://127.0.0.1:30001"
 
-tool_mode: "enhance-v2"
 enable_history_sanitization: true
 sanitization_result_max_length: 20000
 ```
@@ -139,17 +138,17 @@ required.
 ## Project structure
 
 ```
-main.py                      # entry point: proxy routing, streaming, health
-completions_handler.py       # /v1/chat/completions — tool-card enhance + sanitize
+main.py                      # entry point: app, proxy routing, /health
+runtime.py                   # logging, config, crash debug, memory guard, shared session
+completions_handler.py       # /v1/chat/completions — history sanitize + forward
+stream_enhance.py            # SSE transform: hermes.tool.progress → tool cards
 responses_handler.py         # /v1/responses — session continuity + tool results
 responses_session.py         # sid marker extract/inject (responses path only)
 tool_history_format.py       # tool card → model-safe history (structured)
 tool_history_structured.py   # structured sanitizer (native tool roles)
-native_tool_context.py       # native tool-context injection
 special_tags.py              # neutralize special tags in tool results
 special_tags.json            # tag list (data)
 extract_tags.py              # one-off tag generator (re-run after model/OWUI upgrade)
-comp_mode.py                 # optional tool-result compression
 patches/                     # optional personal Hermes patches (see above)
 config.yaml                  # sample config
 requirements.txt

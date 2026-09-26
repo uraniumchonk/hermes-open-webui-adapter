@@ -1,11 +1,10 @@
 """
 Completions Handler — 處理 /v1/chat/completions 端點。
 
-從 main.py 遷移過來的現有邏輯，負責：
 1. 接收 Open WebUI 的 Chat Completions 請求
-2. 執行 history sanitization（清理 <details> 污染）
+2. 執行 history sanitization（清理 <details> 污染 → native assistant + tool roles）
 3. 轉發給 Hermes Gateway
-4. 即時轉換 SSE stream（enhance-v2 模式）
+4. 即時轉換 SSE stream（stream_enhance.transform_stream，enhance-v2）
 """
 
 from __future__ import annotations
@@ -14,59 +13,57 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, Dict
 
 import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
-import native_tool_context
 import special_tags
+import tool_history_format
+from runtime import CONFIG
+from stream_enhance import transform_stream
+from tool_history_structured import sanitize_messages_structured
 
 logger = logging.getLogger(__name__)
 
-# ── Test Mode Trigger ──────────────────────────────────────
-# 當最後一則 user message 包含這個關鍵字時，觸發測試模式。
-TEST_MODE_TRIGGER = "[TEST_TOOL_CARDS]"
+
+# ── History Sanitization (Anti-pollution) ─────────────────
+#
+# 問題：hermes_tool_filter 注入的 <details> 標籤以 delta.content 純文字形式
+# 進入 Open WebUI 的對話歷史。下次請求時，這些標籤會完整出現在模型的 prompt 中，
+# 導致模型模仿輸出 <details> 格式，形成污染反饋迴圈。
+#
+# 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
+# 把 <details type="tool_calls"> 區塊轉換為安全的格式。
+#
+# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length
+# 只支援 structured 格式（OpenAI native tool role messages）
 
 
-def _check_test_mode(req_json: Dict[str, Any]) -> bool:
+def sanitize_request_messages(messages: list) -> list:
     """
-    檢查請求是否為測試模式。
-    條件：最後一則 user message 的內容包含 TEST_MODE_TRIGGER。
+    Scan and sanitize all messages in the request to prevent <details> pollution.
+    Only processes assistant role content.
+
+    Runtime path: structured only (OpenAI native tool role).
+    flat/legacy were removed in 61a58dc — see git ≤877fdb7 + README templates.
     """
-    messages = req_json.get("messages", [])
     if not messages:
-        return False
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return TEST_MODE_TRIGGER in content
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and TEST_MODE_TRIGGER in part.get("text", ""):
-                        return True
-            break
-    return False
+        return messages
 
+    enabled, _max_len, fmt = tool_history_format._get_sanitization_config(CONFIG)
+    if not enabled:
+        return messages
 
-def _handle_test_mode(completion_id: str, created: int, model: str) -> StreamingResponse:
-    """
-    測試模式：直接回傳預先寫好的 tool card 樣本，不轉發 upstream。
-    """
-    from test_mode import generate_test_stream
-    return StreamingResponse(
-        generate_test_stream(completion_id, created, model),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "X-Proxy-Buffering": "no",
-            "Flush-After-Header": "true",
-            "Content-Encoding": "identity",
-        },
-    )
+    if fmt != "structured":
+        # Do not silently pretend flat still works.
+        logger.warning(
+            "[history] tool_history_format=%r is not in runtime "
+            "(removed 61a58dc; restore from git ≤877fdb7). Using structured.",
+            fmt,
+        )
+
+    return sanitize_messages_structured(messages, CONFIG)
 
 
 async def handle_completions_request(
@@ -77,54 +74,20 @@ async def handle_completions_request(
     req_json: Dict[str, Any],
     sess: aiohttp.ClientSession,
     upstream_port: str,
-    # 從 main.py 傳入的函數引用
-    sanitize_request_messages,
-    transform_stream,
-    hermes_sid: str = "",
 ) -> Any:
     """
     主處理器：處理所有 /v1/chat/completions 請求。
 
     支援：
-    - 測試模式（直接回傳預先寫好的樣本）
     - 串流模式（SSE + enhance-v2 轉換）
-    - native_passthrough 模式（完全透傳 + SQLite 存儲 + 歷史注入）
     - 非串流模式（直接透傳）
     """
-    # 🔍 臨時 DEBUG：記錄請求結構（確認 Open WebUI 發送什麼欄位）
-    _debug_keys = list(req_json.keys())
-    _meta = req_json.get("metadata", {})
-    _has_chat_id = "chat_id" in req_json or "chatId" in req_json or "chatId" in str(_meta)
-    _msg_count = len(req_json.get("messages", []))
-    _stream_opts = req_json.get("stream_options", {})
-    _num_ctx = req_json.get("num_ctx", "")
-    # 提取 messages 的 role 分佈
-    _roles = [m.get("role","?") for m in req_json.get("messages",[])]
-    # 提取第一個 message 的 keys（system prompt）
-    _first_msg_keys = list(req_json.get("messages",[{}])[0].keys()) if _msg_count > 0 else []
-    # 計算每個 message 的 content 長度
-    _msg_lens = [len(str(m.get("content",""))) for m in req_json.get("messages",[])]
-    # 檢查是否有 X-Hermes-Session-Id 已經存在
-    _has_hermes_sid = bool(request.headers.get("X-Hermes-Session-Id", "").strip())
-    logger.info(
-        f"[DEBUG-request] keys={_debug_keys} | stream_options={_stream_opts} "
-        f"| num_ctx={_num_ctx} | metadata_keys={list(_meta.keys())} "
-        f"| messages={_msg_count} roles={_roles} "
-        f"| msg_lens={_msg_lens} | first_msg_keys={_first_msg_keys} "
-        f"| chat_id={_has_chat_id} | hermes_sid={_has_hermes_sid} | model={req_json.get('model','')}"
-    )
-
     model = req_json.get("model", "hermes-agent")
     stream_flag = req_json.get("stream", True)
     original_path = request.scope.get("path", "")
 
     completion_id = f"chatcmpl-{int(time.time()*1000)}"
     created_ts = int(time.time())
-
-    # ── 🧪 Test Mode: 直接回傳測試樣本，不轉發 upstream ──
-    if _check_test_mode(req_json):
-        logger.info(f"[test-mode] Triggered! Sending tool card samples directly.")
-        return _handle_test_mode(completion_id, created_ts, model)
 
     # ✅ Task 1: strip 思考內容（OWUI 把思考區域組裝回傳 LLM 時砍掉，防污染反饋迴圈）
     # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
@@ -134,26 +97,8 @@ async def handle_completions_request(
 
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
 
-    # ✅ Session Isolation: inject session ID header if marker mode is enabled
-    from main import _session_isolation_enabled
-    if _session_isolation_enabled() and hermes_sid:
-        fwd_headers = dict(fwd_headers)
-        fwd_headers["X-Hermes-Session-Id"] = hermes_sid
-        logger.info(f"[session] Injecting X-Hermes-Session-Id: {hermes_sid[:8]}...")
-
-    # Detect client type from User-Agent to decide if we strip <details> tags
-    user_agent = request.headers.get("user-agent", "").lower()
-    strip_details = "dart" in user_agent or "conduit" in user_agent
-
     # --- Streaming path (chat completions with stream=true) ---
     if stream_flag and "chat/completions" in original_path:
-        completion_id = f"chatcmpl-{int(time.time()*1000)}"
-        created_ts = int(time.time())
-
-        # ✅ Native Passthrough Mode: 使用新的 transform_stream (組件1+2+3)
-        from main import TOOL_MODE as MAIN_TOOL_MODE
-        use_native = MAIN_TOOL_MODE == "native_passthrough"
-
         async def generate():
             upstream_resp = None
             try:
@@ -164,48 +109,29 @@ async def handle_completions_request(
                 )
                 logger.info(
                     f"[port={upstream_port}] Proxied chat completions, "
-                    f"upstream status={upstream_resp.status}, "
-                    f"strip_details={strip_details} (UA: {user_agent[:50]}), "
-                    f"native_passthrough={use_native}"
+                    f"upstream status={upstream_resp.status}"
                 )
-                
-                # ✅ Session Isolation: update cached session ID from upstream response
-                from main import _session_isolation_enabled, update_session_id
-                if _session_isolation_enabled() and hermes_sid:
-                    new_sid = upstream_resp.headers.get("X-Hermes-Session-Id", "").strip()
-                    if new_sid and new_sid != hermes_sid:
-                        update_session_id(req_json.get("messages", []), new_sid)
-                        logger.info(f"[session] Updated cache: {hermes_sid[:8]}... → {new_sid[:8]}...")
                 
                 # ✅ 關鍵修復：使用 queue 解耦讀取和寫入，避免 backpressure
                 # 當下游客戶端讀取慢時，yield 會阻塞，但讀取任務在背景運行
-                import asyncio
                 queue = asyncio.Queue(maxsize=1000)  # 限制記憶體使用
                 read_task = None
                 
                 async def reader_task():
                     """背景任務：持續從 upstream 讀取並轉換"""
                     try:
-                        if use_native:
-                            db = native_tool_context.get_tool_context_db()
-                            async for chunk in native_tool_context.native_passthrough_transform_stream(
-                                upstream_resp.content, model, completion_id, created_ts,
-                                upstream_port, hermes_sid, db, capture_notifications=True,
-                            ):
-                                await queue.put(chunk)
-                        else:
-                            async for chunk in transform_stream(
-                                upstream_resp.content, model, completion_id, created_ts,
-                                upstream_port, strip_details, hermes_sid,
-                            ):
-                                await queue.put(chunk)
+                        async for chunk in transform_stream(
+                            upstream_resp.content, model, completion_id, created_ts,
+                        ):
+                            await queue.put(chunk)
                         # 標記完成
                         await queue.put(None)
                     except Exception as e:
                         logger.error(f"[queue-reader] Error: {type(e).__name__}: {e}")
                         await queue.put(None)
                 
-                # 啟動背景讀取任務
+                # 啟動背景讀取任務（保留 read_task 參照：event loop 只持有 task 的弱參照，
+                # 沒人引用可能在執行中被 GC——pyflakes 報 unused 也別刪）
                 read_task = asyncio.create_task(reader_task())
                 
                 # 從 queue 讀取並 yield - 這不會阻塞 upstream 讀取
@@ -218,7 +144,7 @@ async def handle_completions_request(
                 logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
                 raise
             except aiohttp.ServerDisconnectedError:
-                logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
+                logger.info(f"[port={upstream_port}] Upstream disconnected")
             except aiohttp.ClientError as e:
                 logger.warning(f"[port={upstream_port}] Client error: {type(e).__name__}: {e}")
                 yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
