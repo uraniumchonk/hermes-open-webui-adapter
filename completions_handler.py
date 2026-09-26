@@ -1,11 +1,10 @@
 """
 Completions Handler — 處理 /v1/chat/completions 端點。
 
-從 main.py 遷移過來的現有邏輯，負責：
 1. 接收 Open WebUI 的 Chat Completions 請求
-2. 執行 history sanitization（清理 <details> 污染）
+2. 執行 history sanitization（清理 <details> 污染 → native assistant + tool roles）
 3. 轉發給 Hermes Gateway
-4. 即時轉換 SSE stream（enhance-v2 模式）
+4. 即時轉換 SSE stream（stream_enhance.transform_stream，enhance-v2）
 """
 
 from __future__ import annotations
@@ -20,8 +19,52 @@ import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 import special_tags
+import tool_history_format
+from runtime import CONFIG
+from stream_enhance import transform_stream
+from tool_history_structured import sanitize_messages_structured
 
 logger = logging.getLogger(__name__)
+
+
+# ── History Sanitization (Anti-pollution) ─────────────────
+#
+# 問題：hermes_tool_filter 注入的 <details> 標籤以 delta.content 純文字形式
+# 進入 Open WebUI 的對話歷史。下次請求時，這些標籤會完整出現在模型的 prompt 中，
+# 導致模型模仿輸出 <details> 格式，形成污染反饋迴圈。
+#
+# 解決：在把請求轉發到 upstream 之前，掃描 messages 中的 assistant content，
+# 把 <details type="tool_calls"> 區塊轉換為安全的格式。
+#
+# 配置：config.yaml 中的 enable_history_sanitization, sanitization_result_max_length
+# 只支援 structured 格式（OpenAI native tool role messages）
+
+
+def sanitize_request_messages(messages: list) -> list:
+    """
+    Scan and sanitize all messages in the request to prevent <details> pollution.
+    Only processes assistant role content.
+
+    Runtime path: structured only (OpenAI native tool role).
+    flat/legacy were removed in 61a58dc — see git ≤877fdb7 + README templates.
+    """
+    if not messages:
+        return messages
+
+    enabled, _max_len, fmt = tool_history_format._get_sanitization_config(CONFIG)
+    if not enabled:
+        return messages
+
+    if fmt != "structured":
+        # Do not silently pretend flat still works.
+        logger.warning(
+            "[history] tool_history_format=%r is not in runtime "
+            "(removed 61a58dc; restore from git ≤877fdb7). Using structured.",
+            fmt,
+        )
+
+    return sanitize_messages_structured(messages, CONFIG)
+
 
 async def handle_completions_request(
     request: Request,
@@ -31,9 +74,6 @@ async def handle_completions_request(
     req_json: Dict[str, Any],
     sess: aiohttp.ClientSession,
     upstream_port: str,
-    # 從 main.py 傳入的函數引用
-    sanitize_request_messages,
-    transform_stream,
 ) -> Any:
     """
     主處理器：處理所有 /v1/chat/completions 請求。
