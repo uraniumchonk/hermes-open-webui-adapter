@@ -1,8 +1,8 @@
 diff --git a/tools/file_operations.py b/tools/file_operations.py
-index 379f5dda11..da50cf8478 100644
+index 2a9d3aab63..b6e287a14d 100644
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -313,8 +313,22 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
+@@ -440,8 +440,22 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
          if content_sample:
              # Undecodable bytes arrive as U+FFFD ("printable", so the ratio misses
              # them); treat as binary so a round-trip can't write back mojibake.

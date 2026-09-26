@@ -1,9 +1,9 @@
 diff --git a/plugins/web/exa/provider.py b/plugins/web/exa/provider.py
-index f6d4dc753b..8ac6185e34 100644
+index fad5bea3b5..d387a8daf6 100644
 --- a/plugins/web/exa/provider.py
 +++ b/plugins/web/exa/provider.py
 @@ -29,6 +29,43 @@ def _get_exa_client() -> Any:
-     return cached_sdk_client("_exa_client", "EXA_API_KEY", _MISSING_KEY, "search.exa", _factory)
+     return cached_sdk_client("_exa_client", "EXA_API_KEY", _MISSING_KEY, "exa", _factory)
  
  
 +def _exa_extract_options() -> tuple:

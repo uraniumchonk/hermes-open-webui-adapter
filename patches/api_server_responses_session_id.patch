@@ -1,8 +1,8 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 0a261a2fd4..17ed2b438a 100644
+index 5c9737bd19..d78ebe9f24 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
-@@ -519,6 +633,36 @@ class _ResponsesStream:
+@@ -635,6 +635,36 @@ class _ResponsesStream:
          await self.write_event("response.failed", {"type": "response.failed", "response": env})
  
  
@@ -39,7 +39,7 @@ index 0a261a2fd4..17ed2b438a 100644
  class OpenAICompatRoutesMixin:
      """/v1/chat/completions and /v1/responses handlers + SSE writers."""
  
-@@ -956,6 +1163,27 @@ class OpenAICompatRoutesMixin:
+@@ -1190,6 +1220,27 @@ class OpenAICompatRoutesMixin:
          gateway_session_key, key_err = self._parse_session_key_header(request)
          if key_err is not None:
              return key_err
@@ -67,7 +67,7 @@ index 0a261a2fd4..17ed2b438a 100644
          try:
              body = await request.json()
          except Exception:
-@@ -977,11 +1205,11 @@ class OpenAICompatRoutesMixin:
+@@ -1211,11 +1262,11 @@ class OpenAICompatRoutesMixin:
  
          input_messages: List[Dict[str, Any]] = []
          if isinstance(raw_input, str):
@@ -81,7 +81,7 @@ index 0a261a2fd4..17ed2b438a 100644
                  elif _is_reasoning_input_item(item):
                      continue
                  elif isinstance(item, dict):
-@@ -989,7 +1217,7 @@ class OpenAICompatRoutesMixin:
+@@ -1223,7 +1274,7 @@ class OpenAICompatRoutesMixin:
                          content = _normalize_multimodal_content(item.get("content", ""))
                      except ValueError as exc:
                          return _multimodal_validation_error(exc, param=f"input[{idx}].content")
@@ -90,7 +90,7 @@ index 0a261a2fd4..17ed2b438a 100644
          else:
              return _error_response("'input' must be a string or array", 400)
  
-@@ -1008,11 +1236,32 @@ class OpenAICompatRoutesMixin:
+@@ -1242,11 +1293,32 @@ class OpenAICompatRoutesMixin:
                      entry_content = _normalize_multimodal_content(entry["content"])
                  except ValueError as exc:
                      return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
@@ -122,10 +122,10 @@ index 0a261a2fd4..17ed2b438a 100644
 +                logger.warning("Failed to load session history for %s: %s", provided_session_id, e)
 +                stored_session_id = provided_session_id
 +        elif not conversation_history and previous_response_id:
-             stored = self._response_store.get(previous_response_id)
+             stored = self._current_response_store().get(previous_response_id)
              if stored is None:
                  return _error_response(f"Previous response not found: {previous_response_id}", 404)
-@@ -1028,9 +1277,10 @@ class OpenAICompatRoutesMixin:
+@@ -1262,9 +1334,10 @@ class OpenAICompatRoutesMixin:
          if body.get("truncation") == "auto":
              conversation_history = _auto_truncate_response_history(conversation_history)
  
@@ -139,7 +139,7 @@ index 0a261a2fd4..17ed2b438a 100644
          _declared_selected = not stored_session_id and bool(gateway_session_key)
          session_id = (
              stored_session_id
-@@ -1042,6 +1292,18 @@ class OpenAICompatRoutesMixin:
+@@ -1276,6 +1349,18 @@ class OpenAICompatRoutesMixin:
              model_alias=body.get("model"))
          if selection_error is not None:
              return selection_error
@@ -159,10 +159,10 @@ index 0a261a2fd4..17ed2b438a 100644
              user_message=user_message, conversation_history=conversation_history,
              ephemeral_system_prompt=instructions, session_id=session_id,
 diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
-index f1dc90c740..7e54feca75 100644
+index 2ba16401ac..eed9d6c5c6 100644
 --- a/tests/gateway/test_api_server.py
 +++ b/tests/gateway/test_api_server.py
-@@ -1741,6 +1741,203 @@ class TestResponsesEndpoint:
+@@ -1690,6 +1690,203 @@ class TestResponsesEndpoint:
              assert data["output"][0]["content"][0]["text"] != f"provider auth failed OPENAI_API_KEY={raw_secret}"
  
  
