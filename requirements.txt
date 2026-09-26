@@ -9,6 +9,3 @@ aiohttp>=3.10.0
 
 # Config parsing (config.yaml)
 pyyaml>=6.0
-
-# SQLite async (native_tool_context.py — tool result persistence)
-aiosqlite>=0.20.0

@@ -34,14 +34,12 @@ from typing import Any, Dict, Optional, AsyncGenerator, List
 import aiohttp
 from aiohttp.http_exceptions import LineTooLong
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, Response, JSONResponse
+from fastapi.responses import Response, JSONResponse
 
 # ── Handler modules ────────────────────────────────────────
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
 import tool_history_format
-from comp_mode import compress_tool_results
-import native_tool_context
 import special_tags
 try:
     import yaml
@@ -225,10 +223,6 @@ def _load_config() -> Dict[str, Any]:
         logger.warning("config.yaml exists but PyYAML is not installed. Install with: pip install pyyaml")
 
     # 2. .env 環境變數覆蓋
-    if os.environ.get("TOOL_MODE"):
-        cfg["tool_mode"] = os.environ["TOOL_MODE"]
-    if os.environ.get("AUTO_SPLIT_THRESHOLD"):
-        cfg["auto_split_threshold"] = int(os.environ["AUTO_SPLIT_THRESHOLD"])
     if os.environ.get("BIND_PORT"):
         cfg["bind_port"] = int(os.environ["BIND_PORT"])
     if os.environ.get("BIND_HOST"):
@@ -265,32 +259,6 @@ else:
 # Default upstream if no port prefix matched
 DEFAULT_UPSTREAM = PORT_MAP.get("30000", "http://127.0.0.1:30000")
 
-# ── Emoji Mapping ─────────────────────────────────────────
-
-TOOL_EMOJI: Dict[str, str] = {
-    "terminal": "💻",
-    "read_file": "📖",
-    "write_file": "✍️",
-    "patch": "🩹",
-    "search_files": "🔎",
-    "execute_code": "🐍",
-    "delegate_task": "🔀",
-    "clarify": "❓",
-    "todo": "📋",
-    "web_search": "🌐",
-    "brave_web_search": "🌐",
-    "memory": "🧠",
-    "skill_view": "🛠️",
-    "session_search": "🔍",
-    "process": "⚙️",
-}
-DEFAULT_EMOJI = "🔧"
-
-
-def get_tool_emoji(tool: str) -> str:
-    return TOOL_EMOJI.get(tool, DEFAULT_EMOJI)
-
-
 # ── Upstream Resolver ─────────────────────────────────────
 
 def resolve_upstream(path: str) -> str:
@@ -317,30 +285,6 @@ def resolve_upstream(path: str) -> str:
     return DEFAULT_UPSTREAM + "/" + stripped
 
 
-# ── SSE Stream Transformer ────────────────────────────────
-
-TOOL_MODE = CONFIG.get("tool_mode", "enhance")
-AUTO_SPLIT_THRESHOLD = CONFIG.get("auto_split_threshold", 0)
-
-logger.info(f"Configuration loaded: tool_mode={TOOL_MODE}, auto_split={AUTO_SPLIT_THRESHOLD}")
-
-def _strip_details_from_content(frame: str) -> str:
-    """
-    Parse an SSE frame's JSON data, preserve <details>...</details> for
-    Conduit APP rendering, and re-serialize. Returns the modified frame.
-
-    Conduit APP has a complete <details> rendering system:
-    - <details type="tool_calls"> is rendered as expandable tool cards
-    - ToolCallsParser.sanitizeForApi() strips them before sending to LLM
-    - So we keep the raw <details> tags intact for UI rendering
-
-    We only enhance the <details> tags by adding missing attributes
-    (arguments, result) when available from hermes.tool.progress events.
-    """
-    # Simply return the frame as-is — Conduit handles <details> natively
-    return frame
-
-
 # ── History Sanitization (Anti-pollution) ─────────────────
 #
 # 問題：hermes_tool_filter 注入的 <details> 標籤以 delta.content 純文字形式
@@ -354,9 +298,7 @@ def _strip_details_from_content(frame: str) -> str:
 # 只支援 structured 格式（OpenAI native tool role messages）
 
 
-def sanitize_request_messages(
-    messages: list, model: str = "", hermes_sid: str = ""
-) -> list:
+def sanitize_request_messages(messages: list) -> list:
     """
     Scan and sanitize all messages in the request to prevent <details> pollution.
     Only processes assistant role content.
@@ -381,612 +323,6 @@ def sanitize_request_messages(
 
     from tool_history_structured import sanitize_messages_structured
     return sanitize_messages_structured(messages, CONFIG)
-
-
-# ── Client-Side [comp] Compression ─────────────────────────
-#
-# When the user includes [comp] in their message, compress all tool results
-# in the conversation history BEFORE that message to reduce context window size.
-#
-# This is a client-side compression that directly modifies the messages array
-# sent to the model — unlike server-side compression which relies on Gateway's
-# state.db. Useful when you want to manually control context size mid-conversation.
-#
-# Modes:
-#   enabled   — Active. Scans for [comp] in the last user message, then truncates
-#               all tool results in previous messages to a summary + inserts a
-#               marker so the LLM knows history was compressed.
-#   disabled  — No client-side compression (default).
-#
-# If the user sends ONLY "[comp]" (no other content), the proxy returns a
-# pre-written auto-reply directly without forwarding to the LLM. The compressed
-# messages + marker are still processed, so the conversation context includes
-# the compression notification.
-
-_COMP_TRIGGER = "[comp]"
-
-_COMP_MARKER_CODE = "comp"
-
-_COMP_NOTIFICATION = """[CONVERSATION COMPRESSED] Previous tool results have been truncated to save context space. The full results are still available in the server-side session history. If you need to reference specific data from earlier tool calls, please re-run the relevant tools to reload the data into context."""
-
-# Auto-reply text when user sends ONLY "[comp]" — returned directly without LLM.
-_COMP_AUTO_REPLY = """[CONVERSATION COMPRESSED] Tool execution history has been truncated to reduce context size. You can now continue with new instructions."""
-
-
-def _comp_mode_enabled(config: dict = None) -> bool:
-    """Check if client-side compression mode is enabled."""
-    cfg = config if config is not None else CONFIG
-    return cfg.get("comp_mode", "disabled") == "enabled"
-
-
-def _strip_comp_trigger(content):
-    """Remove [comp] trigger from user message content."""
-    if isinstance(content, str):
-        return content.replace(_COMP_TRIGGER, "").strip()
-    elif isinstance(content, list):
-        new_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                new_parts.append({**part, "text": part["text"].replace(_COMP_TRIGGER, "").strip()})
-            else:
-                new_parts.append(part)
-        return new_parts
-    return content
-
-
-def _compress_prev_action_blocks(content: str, max_length: int) -> tuple[str, int]:
-    """
-    Compress [START_PREV_ACTION]...[END_PREV_ACTION] blocks in content.
-    
-    **只壓縮最後一個區塊** — 保留歷史上下文，只截斷最新的工具結果。
-    Keeps the tool name and args, but truncates the [RESULT] section.
-    Returns (compressed_content, blocks_compressed).
-    """
-    if not content:
-        return (content, 0)
-    
-    # 找到所有區塊的位置
-    pattern = r'\[START_PREV_ACTION\](.*?)\[END_PREV_ACTION\]'
-    matches = list(re.finditer(pattern, content, flags=re.DOTALL))
-    
-    if not matches:
-        return (content, 0)
-    
-    # 只壓縮最後一個區塊
-    last_match = matches[-1]
-    blocks_compressed = 1
-    
-    block_inner = last_match.group(1)
-    
-    # Extract tool name
-    tool_name_match = re.search(r'\[ACTION_TYPE\]\s*\n\s*([^\n]+)', block_inner)
-    tool_name = tool_name_match.group(1).strip() if tool_name_match else "unknown"
-    
-    # Extract args section
-    args_match = re.search(r'\[ACTION_ARG\]\s*\n(.*?)(?=\n\[RESULT\]|\n\[END)', block_inner, re.DOTALL)
-    args_text = args_match.group(1).strip() if args_match else "(none)"
-    if len(args_text) > 100:
-        args_text = args_text[:100] + "..."
-    
-    # Build compressed block
-    if max_length <= 0:
-        result_text = "(compressed)"
-    else:
-        result_text = f"(compressed from original, {max_length} chars kept)"
-    
-    compressed_block = (
-        f"[START_PREV_ACTION]\n"
-        f"[ACTION_TYPE]\n"
-        f"{tool_name}\n"
-        f"[ACTION_ARG]\n"
-        f"{args_text}\n"
-        f"[RESULT]\n"
-        f"{result_text}\n"
-        f"[END_PREV_ACTION]"
-    )
-    
-    # 只替換最後一個區塊
-    compressed = content[:last_match.start()] + compressed_block + content[last_match.end():]
-    
-    # 除錯: 記錄壓縮前後的大小
-    original_size = last_match.end() - last_match.start()
-    new_size = len(compressed_block)
-    logger.debug(f"[comp] PREV_ACTION block: {original_size} -> {new_size} chars ({(1-new_size/original_size)*100:.1f}% reduction)")
-    
-    return (compressed, blocks_compressed)
-
-
-def _compress_details_tags(content: str, max_length: int) -> tuple[str, int]:
-    """
-    Compress <details type="tool_calls"> tags in content.
-    
-    **只壓縮最後一個標籤** — 保留歷史上下文，只截斷最新的工具結果。
-    Replaces the <result> section with a truncated version.
-    Returns (compressed_content, tags_compressed).
-    """
-    if not content:
-        return (content, 0)
-    
-    # 修正: 支援 type="tool_calls" 和 type=tool_calls (有/無引號)
-    pattern = r'(<details[^>]*type=["\']?tool_calls["\']?[^>]*>)(.*?)(</details>)'
-    
-    # 找到所有標籤的位置
-    matches = list(re.finditer(pattern, content, flags=re.DOTALL | re.IGNORECASE))
-    
-    if not matches:
-        return (content, 0)
-    
-    # 只壓縮最後一個標籤
-    last_match = matches[-1]
-    tags_compressed = 1
-    
-    opening = last_match.group(1)
-    inner = last_match.group(2)
-    closing = last_match.group(3)
-    
-    # Find and compress <result> section
-    result_pattern = r'(<result>)(.*?)(</result>)'
-    def _compress_result(rm):
-        result_content = rm.group(2)
-        if len(result_content) > max_length:
-            return f"{rm.group(1)}{result_content[:max_length]}... (truncated by [comp]){rm.group(3)}"
-        return rm.group(0)
-    
-    inner_compressed = re.sub(result_pattern, _compress_result, inner, flags=re.DOTALL)
-    compressed_tag = f"{opening}{inner_compressed}{closing}"
-    
-    # 只替換最後一個標籤
-    compressed = content[:last_match.start()] + compressed_tag + content[last_match.end():]
-    return (compressed, tags_compressed)
-
-
-def compress_tool_results(messages: list, config: dict) -> tuple[list, bool]:
-    """
-    Client-side conversation compression triggered by [comp] in user message.
-    
-    When enabled and [comp] is detected in the last user message:
-    1. Remove [comp] from the user message
-    2. Compress all tool results in messages BEFORE this user message
-    3. Insert a notification message so the LLM knows history was compressed
-    4. Insert a persistent marker code block
-    
-    Returns (modified_messages, is_comp_only).
-    - is_comp_only=True means the user sent ONLY "[comp]" — caller should
-      return an auto-reply directly without forwarding to the LLM.
-    - is_comp_only=False means normal compression (still forward to LLM).
-    """
-    _perf_t0 = time.monotonic()
-    if not _comp_mode_enabled(config):
-        _elapsed = (time.monotonic() - _perf_t0) * 1000
-        logger.debug(f"[perf] compress_tool_results SKIPPED (comp_mode disabled) {_elapsed:.1f}ms")
-        return (messages, False)
-    
-    if not messages:
-        _elapsed = (time.monotonic() - _perf_t0) * 1000
-        logger.debug(f"[perf] compress_tool_results SKIPPED (empty messages) {_elapsed:.1f}ms")
-        return (messages, False)
-    
-    max_length = config.get("comp_result_max_length", 100)
-    
-    # Find the last user message and check for [comp]
-    last_user_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
-            last_user_idx = i
-            break
-    
-    if last_user_idx is None:
-        return (messages, False)
-    
-    last_user = messages[last_user_idx]
-    content = last_user.get("content", "")
-    
-    # Check if [comp] is present AND if it's the ONLY content
-    has_comp = False
-    is_comp_only = False
-    if isinstance(content, str):
-        has_comp = _COMP_TRIGGER in content
-        # is_comp_only: content is exactly "[comp]" after stripping whitespace
-        is_comp_only = content.strip() == _COMP_TRIGGER
-    elif isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and _COMP_TRIGGER in part.get("text", ""):
-                has_comp = True
-                # is_comp_only: single text part that is exactly "[comp]"
-                if len(content) == 1 and part.get("text", "").strip() == _COMP_TRIGGER:
-                    is_comp_only = True
-                break
-    
-    if not has_comp:
-        return (messages, False)
-    
-    # ── [comp] detected — perform compression ──
-    
-    # 1. Strip [comp] from the user message
-    last_user["content"] = _strip_comp_trigger(last_user["content"])
-    
-    # 2. Compress tool results in all messages BEFORE this user message
-    total_compressed = 0
-    
-    # 除錯: 記錄壓縮前的總大小
-    original_total_size = sum(len(str(m.get("content", ""))) for m in messages[:last_user_idx])
-    
-    for i in range(last_user_idx):
-        msg = messages[i]
-        role = msg.get("role", "")
-        raw_content = msg.get("content", "")
-        
-        if not raw_content:
-            continue
-        
-        # Handle both string and list content
-        if isinstance(raw_content, str):
-            # Compress [START_PREV_ACTION] blocks (flat format)
-            compressed, count1 = _compress_prev_action_blocks(raw_content, max_length)
-            # Also compress <details> tags if present
-            compressed, count2 = _compress_details_tags(compressed, max_length)
-            msg["content"] = compressed
-            total_compressed += count1 + count2
-            
-        elif isinstance(raw_content, list):
-            for part in raw_content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    compressed, count1 = _compress_prev_action_blocks(part["text"], max_length)
-                    compressed, count2 = _compress_details_tags(compressed, max_length)
-                    part["text"] = compressed
-                    total_compressed += count1 + count2
-    
-    # 除錯: 記錄壓縮後的總大小
-    new_total_size = sum(len(str(m.get("content", ""))) for m in messages[:last_user_idx])
-    logger.info(
-        f"[comp] Total size: {original_total_size} -> {new_total_size} chars "
-        f"({(1-new_total_size/original_total_size)*100:.1f}% reduction, {total_compressed} blocks)"
-    )
-    
-    # 3. Insert compression marker as a system message right before the last user message
-    marker_msg = {
-        "role": "system",
-        "content": f"{_COMP_NOTIFICATION}\n\n```\n{_COMP_MARKER_CODE}\ncompression: applied at message {last_user_idx}\nblocks_compressed: {total_compressed}\nmax_result_length: {max_length}\n```",
-    }
-    messages.insert(last_user_idx, marker_msg)
-    
-    logger.info(
-        f"[comp] Compression applied: {total_compressed} tool result(s) compressed "
-        f"across {last_user_idx} message(s), marker inserted at index {last_user_idx}"
-    )
-    
-    _elapsed = (time.monotonic() - _perf_t0) * 1000
-    logger.info(f"[perf] compress_tool_results DONE in {_elapsed:.1f}ms (messages={len(messages)}, compressed={total_compressed})")
-    return (messages, is_comp_only)
-
-
-# ── Conversation Compression ───────────────────────────────
-#
-# 當 X-Hermes-Session-Id 存在時，Hermes Gateway 會從 state.db 載入完整
-# 會話歷史，忽略請求中的 messages 歷史。因此我們可以只傳送 system prompt
-# + 最後一則 user message，大幅減少請求大小。
-#
-# 配置：config.yaml 中的 compression_mode
-#   server-side — 依賴 Gateway 的 server-side history（預設）
-#   disabled    — 傳送完整 messages（舊版行為）
-
-
-# ── Session Isolation (Collision Prevention) ────────────────
-#
-# When two conversations start with identical first messages, they would
-# collide on the same session ID. This feature prevents that by:
-# 1. Injecting a unique timestamp into the first user message
-# 2. Embedding a session marker in the assistant's response
-# 3. On subsequent requests, recovering the session from the marker
-#
-# Configuration: config.yaml session_isolation_mode
-#   disabled — No isolation (default, relies on X-Hermes-Session-Id header)
-#   marker   — Full isolation with visible code block markers
-
-
-import hashlib
-
-
-# Global session cache: {original_fingerprint → hermes_session_id}
-_session_cache: Dict[str, str] = {}
-
-# Pending session markers: {stamped_session_id: (original_fp, timestamp)}
-# Use a dict instead of a single global to avoid race conditions between requests.
-_pending_session_markers: dict = {}
-
-# 防洩漏：session 指紋快取長期運行會無限增長，加上限並丟棄最舊的。
-_MAX_SESSION_CACHE = 5000
-_MAX_PENDING_MARKERS = 1000
-
-
-def _bounded_put(cache: dict, key: str, value, max_size: int) -> None:
-    """有序 dict 的 bounded insert：超過上限時丟棄最舊的 10%。"""
-    cache[key] = value
-    if len(cache) > max_size:
-        drop = list(cache.keys())[: max(1, len(cache) // 10)]
-        for k in drop:
-            cache.pop(k, None)
-
-
-def _session_isolation_enabled() -> bool:
-    """Check if session isolation (marker mode) is enabled."""
-    return CONFIG.get("session_isolation_mode", "disabled") == "marker"
-
-
-def derive_session_id(messages: list) -> str:
-    """
-    Derive a stable session ID from the conversation's first user message.
-
-    Matches API Server's _derive_chat_session_id():
-    seed = f"{system_prompt}\\n{first_user_message}"
-    digest = sha256(seed).hexdigest()[:16]
-    return f"api-{digest}"
-    """
-    if not messages:
-        return ""
-
-    # Extract system prompt
-    system_prompt = ""
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                system_prompt = content
-            elif isinstance(content, list):
-                system_prompt = "".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            break
-
-    # Extract first user message
-    first_user = ""
-    for msg in messages:
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                first_user = content
-            elif isinstance(content, list):
-                first_user = "".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            break
-
-    seed = f"{system_prompt}\n{first_user}"
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
-    return f"api-{digest}"
-
-
-_TS_RE = re.compile(r"\n```session\s*\n.*?\n```\n", re.DOTALL)
-
-
-def _strip_timestamp_and_derive(messages: list) -> str:
-    """Strip the injected timestamp from the first user message and re-derive."""
-    if not messages:
-        return ""
-
-    system_prompt = ""
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                system_prompt = content
-            elif isinstance(content, list):
-                system_prompt = "".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            break
-
-    first_user = ""
-    for msg in messages:
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                first_user = _TS_RE.sub("", content)
-            elif isinstance(content, list):
-                parts = []
-                for p in content:
-                    if isinstance(p, dict) and p.get("type") == "text":
-                        parts.append(_TS_RE.sub("", p.get("text", "")))
-                    else:
-                        parts.append(p.get("text", ""))
-                first_user = "".join(parts)
-            break
-
-    seed = f"{system_prompt}\n{first_user}"
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
-    return f"api-{digest}"
-
-
-def get_or_create_session_id(messages: list) -> str:
-    """
-    Get existing session ID from cache, or derive a new one with collision prevention.
-
-    Strategy to prevent collisions when two conversations start with identical
-    content:
-
-    1. First, scan the conversation history for an embedded session marker in
-       any assistant message (code block or legacy zero-width space format).
-       If found, we reuse that session.
-
-    2. If no marker is found, this is a new conversation. We inject a timestamp
-       into the first user message so the Gateway creates a unique session,
-       and arrange for the marker to be embedded in the assistant's reply.
-
-    3. On the very next request, step-1 picks up the marker from history.
-
-    Cache structure: {original_fingerprint → hermes_session_id}
-    """
-    from datetime import datetime
-
-    # ── Step 1: Look for an embedded session marker in assistant history ──
-    marker_pattern = re.compile(
-        r"```session\s*\n\s*(api-[a-f0-9]{16})\s+(\d{4}-\d{2}-\d{2}T[^\s]+)\s*\n```",
-        re.IGNORECASE
-    )
-    legacy_pattern = re.compile(
-        r"(api-[a-f0-9]{16}):(\d{4}-\d{2}-\d{2}T[^\s\u200b]+)", re.IGNORECASE
-    )
-    found_ts = None
-    for msg in reversed(messages):
-        role = msg.get("role")
-        if role == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                m = marker_pattern.search(content)
-                if m:
-                    found_ts = m.group(1), m.group(2)
-                    logger.info(f"[session] ✅ Marker found in assistant message (code block): {found_ts[0][:8]}...")
-                    break
-                m = legacy_pattern.search(content)
-                if m:
-                    found_ts = m.group(1), m.group(2)
-                    logger.info(f"[session] ✅ Marker found in assistant message (legacy): {found_ts[0][:8]}...")
-                    break
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        m = marker_pattern.search(part["text"])
-                        if m:
-                            found_ts = m.group(1), m.group(2)
-                            logger.info(f"[session] ✅ Marker found in assistant message (list, code block): {found_ts[0][:8]}...")
-                            break
-                        m = legacy_pattern.search(part["text"])
-                        if m:
-                            found_ts = m.group(1), m.group(2)
-                            logger.info(f"[session] ✅ Marker found in assistant message (list, legacy): {found_ts[0][:8]}...")
-                            break
-        if found_ts:
-            break
-
-    if not found_ts:
-        logger.info(f"[session] ⚠️ No marker found in {len(messages)} messages")
-
-    if found_ts:
-        original_fp, recovered_ts = found_ts
-        if original_fp in _session_cache:
-            logger.info(f"[session] ✅ Marker found in history: {original_fp[:8]}... → cache hit")
-            return _session_cache[original_fp]
-        logger.warning(f"[session] Marker found but NOT in cache: {original_fp[:8]}...")
-        # Fallback: reconstruct stamped fingerprint and try that
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                ts_marker = f"\n```session\n{original_fp}  {recovered_ts}\n```\n"
-                if isinstance(content, str):
-                    msg["content"] = ts_marker + content
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            part["text"] = ts_marker + part["text"]
-                            break
-                break
-        stamped_fp = derive_session_id(messages)
-        if stamped_fp in _session_cache:
-            return _session_cache[stamped_fp]
-        return original_fp
-
-    # ── Step 2: No marker — new conversation, inject timestamp ──
-    derived = derive_session_id(messages)
-    if not derived:
-        return ""
-
-    timestamp = datetime.now().isoformat()
-    stamped_derived_temp = derived
-    ts_marker = f"\n```session\n{stamped_derived_temp}  {timestamp}\n```\n"
-    for msg in messages:
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                msg["content"] = ts_marker + content
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        part["text"] = ts_marker + part["text"]
-                        break
-            break
-
-    stamped_derived = derive_session_id(messages)
-
-    # Store in cache keyed by original fingerprint
-    original = _strip_timestamp_and_derive(messages)
-    _bounded_put(_session_cache, original, stamped_derived, _MAX_SESSION_CACHE)
-
-    # Remember the marker so transform_stream can embed it in the first
-    # assistant response.
-    _bounded_put(_pending_session_markers, stamped_derived, (original, timestamp), _MAX_PENDING_MARKERS)
-    logger.info(f"[session] NEW session created: {original} → {stamped_derived}, marker pending")
-
-    return stamped_derived
-
-
-def update_session_id(messages: list, new_sid: str) -> None:
-    """
-    Update the cached session ID after compression rotates it.
-
-    Hermes Gateway creates a new session after compression and returns
-    the new session ID in the response header. We need to track this.
-
-    The messages passed here may carry the injected timestamp, so we
-    strip it first to find the correct cache entry.
-    """
-    original = _strip_timestamp_and_derive(messages)
-    if original and new_sid:
-        _bounded_put(_session_cache, original, new_sid, _MAX_SESSION_CACHE)
-
-
-def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> list:
-    """
-    Compress the messages array when server-side session history is available.
-
-    When X-Hermes-Session-Id is present, Hermes Gateway loads the full
-    conversation from its database. The messages in the request body are
-    redundant — we only need the system prompt and the last user message.
-
-    Returns the compressed messages list.
-    """
-    _perf_t0 = time.monotonic()
-    if not messages:
-        _elapsed = (time.monotonic() - _perf_t0) * 1000
-        logger.debug(f"[perf] compress_request_messages SKIPPED (empty) {_elapsed:.1f}ms")
-        return messages
-
-    mode = config.get("compression_mode", "server-side")
-    if mode != "server-side" or not hermes_sid:
-        _elapsed = (time.monotonic() - _perf_t0) * 1000
-        logger.debug(f"[perf] compress_request_messages SKIPPED (mode={mode}, sid={'yes' if hermes_sid else 'no'}) {_elapsed:.1f}ms")
-        return messages
-
-    if len(messages) <= 2:
-        _elapsed = (time.monotonic() - _perf_t0) * 1000
-        logger.debug(f"[perf] compress_request_messages SKIPPED (len<=2) {_elapsed:.1f}ms")
-        return messages
-
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-
-    # Find the last user message
-    last_user = None
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user = m
-            break
-
-    if not last_user:
-        return messages
-
-    original_count = len(messages)
-    original_size = sum(len(str(m.get("content", ""))) for m in messages)
-
-    compressed = system_msgs + [last_user]
-    compressed_size = sum(len(str(m.get("content", ""))) for m in compressed)
-
-    logger.info(
-        f"[compression] Reduced {original_count} messages ({original_size} chars) "
-        f"→ {len(compressed)} messages ({compressed_size} chars) "
-        f"via server-side session history (session={hermes_sid[:8]}...)"
-    )
-    _elapsed = (time.monotonic() - _perf_t0) * 1000
-    logger.info(f"[perf] compress_request_messages DONE in {_elapsed:.1f}ms (msgs {original_count}->{len(compressed)}, chars {original_size}->{compressed_size})")
-    return compressed
 
 
 # ── Tool Mode Handlers ─────────────────────────────────────
@@ -1214,70 +550,6 @@ def _build_content_chunk(content: str) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def handle_tool_completion(tool_name: str, label: str = "", result: str = "") -> bytes:
-    """Build a completion <details> chunk to inject."""
-    details = _build_completion_details(tool_name, label, result)
-    return _build_content_chunk(details)
-
-
-# ── Finish chunk builder ─────────────
-
-
-def _build_finish_chunk(
-    completion_id: str, created: int, model: str,
-    finish_reason: str, usage: Optional[dict] = None
-) -> bytes:
-    """Build a finish chunk."""
-    chunk = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": finish_reason,
-        }],
-    }
-    if usage:
-        chunk["usage"] = usage
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-def _build_comp_auto_reply_stream(
-    text: str, model: str, completion_id: str, created: int
-) -> StreamingResponse:
-    """
-    Build a streaming response for [comp] auto-reply.
-    Emits the text as a series of content chunks followed by a finish chunk.
-    """
-    async def generate():
-        # Split text into small chunks for realistic streaming feel
-        chunk_size = 20
-        for i in range(0, len(text), chunk_size):
-            segment = text[i:i + chunk_size]
-            yield _build_content_chunk(segment)
-            await asyncio.sleep(0.01)  # Small delay for streaming effect
-        yield _build_finish_chunk(
-            completion_id, created, model,
-            finish_reason="stop",
-            usage={"prompt_tokens": 0, "completion_tokens": len(text), "total_tokens": len(text)}
-        )
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "X-Proxy-Buffering": "no",
-            "Flush-After-Header": "true",
-            "Content-Encoding": "identity",
-        },
-    )
-
-
 # ── Enhance-v2: Blocking Translation Mode ─────────────────
 # 
 # 核心概念：
@@ -1325,11 +597,9 @@ class ToolCallBuffer:
         _t0 = time.monotonic()
         self._prune()
         tool_name = payload.get("tool", "unknown")
-        emoji = payload.get("emoji", get_tool_emoji(tool_name))
         
         self.active_tools[tc_id] = {
             "tool": tool_name,
-            "emoji": emoji,
             "label": payload.get("label", tool_name),
             "arguments": payload.get("arguments", {}),
             "_started": time.monotonic(),
@@ -1393,21 +663,12 @@ async def transform_stream(
     model: str,
     completion_id: str,
     created: int,
-    upstream_port: str,
-    strip_details: bool = False,
-    hermes_sid: str = "",
 ) -> AsyncGenerator[bytes, None]:
     """
-    從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件。
-
-    TOOL_MODE 控制處理策略：
-    - passthrough: 直接透傳所有資料
-    - enhance: 過濾 done=false + 在 completed 時注入帶 label 的完成標籤
-    - strip: 移除 <details> 並替換為純文字
-    - enhance-v2: 推薦模式（即時串流 + 正確 tool card）
-      - content 正常即時輸出
-      - 只在 completed 時注入 <details type="tool_calls" done="true" arguments="..." result="...">
-      - **不** emit delta.tool_calls（避免 Open WebUI 重複執行工具）
+    從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件（enhance-v2）：
+    - content 正常即時輸出
+    - 只在 completed 時注入 <details type="tool_calls" done="true" arguments="...">result</details>
+    - **不** emit delta.tool_calls（避免 Open WebUI 重複執行工具）
     
     性能優化：
     - 使用 bytes buffer 避免反覆 decode/encode
@@ -1415,13 +676,10 @@ async def transform_stream(
     - 即時輸出而非累積大字符串
     
     心跳機制：
-    - 獨立於數據處理循環，每 10 秒發送一次心跳
+    - 獨立於數據處理循環；等第一塊內容時每 0.5 秒、之後每 1.5 秒
     - 確保即使上游暫時沒有數據，客戶端也不會超時
     """
 
-    # Track tool states for legacy modes
-    tool_states: Dict[str, dict] = {}
-    
     done_received = False
 
     # 使用 bytes buffer 避免反覆 decode/encode
@@ -1433,17 +691,13 @@ async def transform_stream(
     _rss_warn_bytes = 512 * 1024 * 1024
     _last_rss_check = 0.0
 
-    # 自動分割計數器
-    accumulated_content = ""
-    has_split = False
-    
     # 心跳計時器，防止超時
     last_heartbeat = time.monotonic()
     heartbeat_interval = 1.5  # 每 1.5 秒發送心跳（比 Open WebUI idle timeout 短）
     heartbeat_count = 0  # 心跳計數器
     
-    # enhance-v2 專用緩衝器
-    v2_buffer = ToolCallBuffer() if TOOL_MODE == "enhance-v2" else None
+    # enhance-v2 工具狀態追蹤
+    v2_buffer = ToolCallBuffer()
     
     # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
     tool_just_completed = False
@@ -1467,7 +721,7 @@ async def transform_stream(
                         if rss_bytes >= _rss_warn_bytes:
                             logger.warning(
                                 f"[mem] high RSS={rss_kb} kB buffer_len={len(buffer)} "
-                                f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0} "
+                                f"active_tools={len(v2_buffer.active_tools)} "
                                 f"heartbeat_count={heartbeat_count}"
                             )
                         else:
@@ -1579,7 +833,7 @@ async def transform_stream(
                     f"{stale_for:.0f}s (> {STALE_STREAM_TIMEOUT:.0f}s), "
                     f"stream_age={time.monotonic() - _stream_start:.1f}s "
                     f"readline_count={_readline_count} done={done_received} "
-                    f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}. "
+                    f"active_tools={len(v2_buffer.active_tools)}. "
                     f"Force-ending stream to free memory."
                 )
                 # 通知下游 stream 結束（避免 Open WebUI 一直轉圈）
@@ -1604,7 +858,7 @@ async def transform_stream(
                     f"stream_age={now - _stream_start:.1f}s readline_count={_readline_count} "
                     f"buffer_len={len(buffer)} heartbeat={heartbeat_count} "
                     f"first_content={first_content_sent} done={done_received} "
-                    f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0} "
+                    f"active_tools={len(v2_buffer.active_tools)} "
                     f"stale={time.monotonic() - _last_data_time:.0f}s"
                 )
             continue
@@ -1667,7 +921,7 @@ async def transform_stream(
                 f"done_received={done_received}, "
                 f"buffer_len={len(buffer)}, "
                 f"tool_just_completed={tool_just_completed}, "
-                f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
+                f"active_tools={len(v2_buffer.active_tools)}"
             )
             break
 
@@ -1698,19 +952,6 @@ async def transform_stream(
             # 關鍵修復：[DONE] 不代表 upstream 已經結束，agent loop 可能還在執行
             # 我們標記 done_received，但繼續讀取直到 upstream 真正關閉 (EOF)
             if "[DONE]" in frame and not done_received:
-                # ✅ Session Isolation: inject marker before [DONE] if pending
-                if _session_isolation_enabled() and hermes_sid in _pending_session_markers:
-                    original_fp, ts = _pending_session_markers.pop(hermes_sid)
-                    marker = f"\n```session\n{original_fp}  {ts}\n```\n"
-                    marker_json = json.dumps(marker)
-                    marker_chunk = (
-                        f'data: {{"id":"{completion_id}","object":"chat.completion.chunk",'
-                        f'"created":{created},"model":"{model}",'
-                        f'"choices":[{{"index":0,"delta":{{"content":{marker_json}}},"finish_reason":null}}]}}\n\n'
-                    )
-                    yield marker_chunk.encode("utf-8")
-                    logger.info(f"[session] ✅ Marker embedded: {original_fp[:8]}... ts={ts[:19]}")
-                
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
                 logger.info(
@@ -1751,128 +992,38 @@ async def transform_stream(
                     tc_id = parsed_json.get("toolCallId", "")
                     status = parsed_json.get("status", "")
                     tool = parsed_json.get("tool", "unknown")
-                    arguments = parsed_json.get("arguments", {})
 
-                    # ── enhance-v2 模式 ──
-                    if TOOL_MODE == "enhance-v2" and v2_buffer:
-                        if status == "running":
-                            chunks = v2_buffer.on_tool_running(tc_id, parsed_json, completion_id, created, model)
-                            for chunk in chunks:
-                                yield chunk
-                        elif status == "completed":
-                            # 立即輸出標準格式（不緩衝，直接返回 chunks）
-                            chunks = v2_buffer.on_tool_completed(
-                                tc_id, parsed_json, completion_id, created, model
-                            )
-                            for chunk in chunks:
-                                yield chunk
-                            # Tool completed 後立即發送多個 nudge（不阻塞）
-                            # 確保 Open WebUI 的 idle timer 被重置
-                            for i in range(3):
-                                yield _heartbeat_chunk_tpl % (
-                                    completion_id.encode(), created, model.encode()
-                                )
-                            # 發送可見的 thinking chunk，讓 Open WebUI 知道還在處理
-                            yield _build_content_chunk("\n\n")
-                            logger.info(
-                                f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
-                                f"sent 3 nudges + thinking chunk to keep stream alive"
-                            )
-                            tool_just_completed = True
-                        # 跳過 hermes.tool.progress 事件，不發送給客戶端
-                        continue
-                    
-                    # ── 其他模式 ──
                     if status == "running":
-                        tool_states[tc_id] = {
-                            "tool": tool,
-                            "emoji": parsed_json.get("emoji", ""),
-                            "label": parsed_json.get("label", tool),
-                            "arguments": arguments if isinstance(arguments, dict) else {},
-                            "result": "",
-                        }
-                        # 立即發送 running 狀態的佔位符，保持 stream 活躍
-                        if TOOL_MODE == "enhance":
-                            emoji = parsed_json.get("emoji", get_tool_emoji(tool))
-                            label = parsed_json.get("label", tool)
-                            yield _build_content_chunk(
-                                f'<details type="tool_calls" done="false" id="{tc_id}" name="{html.escape(tool)}">\n'
-                                f'<summary></summary>\n'
-                                f'</details>\n'
-                            )
+                        chunks = v2_buffer.on_tool_running(tc_id, parsed_json, completion_id, created, model)
+                        for chunk in chunks:
+                            yield chunk
                     elif status == "completed":
-                        state = tool_states.pop(tc_id, {})
-                        final_result = parsed_json.get("result", "")
-                        
-                        # enhance 模式: 注入完成標籤
-                        if TOOL_MODE == "enhance":
-                            tool_name = state.get("tool", tool)
-                            label = state.get("label", "")
-                            res = final_result if final_result else state.get("result", "")
-                            yield handle_tool_completion(tool_name, label, res)
-                    # Do NOT yield - skip this frame
+                        # 立即輸出標準格式（不緩衝，直接返回 chunks）
+                        chunks = v2_buffer.on_tool_completed(
+                            tc_id, parsed_json, completion_id, created, model
+                        )
+                        for chunk in chunks:
+                            yield chunk
+                        # Tool completed 後立即發送多個 nudge（不阻塞）
+                        # 確保 Open WebUI 的 idle timer 被重置
+                        for i in range(3):
+                            yield _heartbeat_chunk_tpl % (
+                                completion_id.encode(), created, model.encode()
+                            )
+                        # 發送可見的 thinking chunk，讓 Open WebUI 知道還在處理
+                        yield _build_content_chunk("\n\n")
+                        logger.info(
+                            f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
+                            f"sent 3 nudges + thinking chunk to keep stream alive"
+                        )
+                        tool_just_completed = True
+                    # 跳過 hermes.tool.progress 事件，不發送給客戶端
                     continue
 
-                # Handle <details> based on TOOL_MODE
-                if data_str and ("<details" in data_str or "<details" in frame):
-                    if TOOL_MODE == "strip":
-                        modified_frame = _strip_details_from_content(frame)
-                    elif TOOL_MODE == "enhance":
-                        # 過濾掉 done="false" 的標籤（只保留 completed 時注入的 done="true"）
-                        if parsed_json:
-                            try:
-                                delta = parsed_json.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if 'done="false"' in content:
-                                    continue
-                            except (IndexError, KeyError):
-                                pass
-                        modified_frame = frame
-                    elif TOOL_MODE == "enhance-v2":
-                        # enhance-v2: 保留所有 content chunk（包括模型輸出的 <details> 字串）
-                        # 舊邏輯會丟掉任何包含 'type="tool_calls"' 的 chunk，
-                        # 導致模型正常輸出被截斷（例如主人測試原樣貼出 <details> 標籤）。
-                        # tool filter 自己注入的 tool card 是獨立 chunk（handle_tool_completion），
-                        # 不經過這裡的 content 過濾路徑，所以不需要在這裡防重複。
-                        modified_frame = frame
-                    else:
-                        # passthrough: keep <details> as-is
-                        modified_frame = frame
-                else:
-                    modified_frame = frame
-                
-                # 自動分割檢查（使用已解析的 JSON）
-                if AUTO_SPLIT_THRESHOLD > 0 and not has_split and parsed_json:
-                    choices = parsed_json.get("choices")
-                    if isinstance(choices, list) and len(choices) > 0:
-                        delta = choices[0].get("delta")
-                        if isinstance(delta, dict):
-                            content = delta.get("content", "")
-                            if isinstance(content, str) and content:
-                                accumulated_content += content
-                                
-                                # 檢查是否超過閾值
-                                if len(accumulated_content) >= AUTO_SPLIT_THRESHOLD:
-                                    has_split = True
-                                    # 發送 [DONE] 結束當前 stream
-                                    yield b'data: {"id": "' + completion_id.encode() + b'", "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}\n\n'
-                                    yield b'data: [DONE]\n\n'
-                                    # 發送分割事件
-                                    split_event = {
-                                        "type": "session.split",
-                                        "message": "會話自動分割，繼續中...",
-                                        "chars_processed": len(accumulated_content)
-                                    }
-                                    yield b'event: session.split\n'
-                                    yield b'data: ' + json.dumps(split_event, ensure_ascii=False).encode() + b'\n\n'
-                                    # 清空計數器，繼續處理後續內容
-                                    accumulated_content = ""
-                
-                # 即時輸出，避免累積
                 # 過渡期 logging：tool completed 後的第一個 content chunk
-                if tool_just_completed and modified_frame:
+                if tool_just_completed and frame:
                     try:
-                        fc = json.loads(modified_frame) if not modified_frame.startswith(':') else None
+                        fc = json.loads(frame) if not frame.startswith(':') else None
                         if fc:
                             delta = fc.get("choices", [{}])[0].get("delta", {})
                             content = delta.get("content", "")
@@ -1884,7 +1035,10 @@ async def transform_stream(
                                 tool_just_completed = False
                     except (json.JSONDecodeError, IndexError, KeyError):
                         tool_just_completed = False
-                yield (modified_frame + "\n\n").encode("utf-8")
+                # content frame 原樣即時輸出——包括模型自己寫出的 <details> 字串
+                # （舊版丟掉含 type="tool_calls" 的 chunk，會截斷模型的正常輸出）。
+                # tool card 由 on_tool_completed 以獨立 chunk 注入，不經過這裡。
+                yield (frame + "\n\n").encode("utf-8")
                 
                 # ✅ 修復：追蹤第一個有內容的 chunk，之後才啟動心跳
                 if not first_content_sent and data_str:
@@ -1918,7 +1072,7 @@ async def transform_stream(
     logger.info(
         f"[crash-debug] STREAM COMPLETE stream_age={stream_age:.1f}s "
         f"readline_count={_readline_count} heartbeat={heartbeat_count} "
-        f"active_tools={len(v2_buffer.active_tools) if v2_buffer else 0}"
+        f"active_tools={len(v2_buffer.active_tools)}"
     )
 
 
@@ -2084,51 +1238,9 @@ async def proxy(request: Request, path: str):
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
     elif route == "completions":
-        # ✅ Session Isolation: derive/inject session ID if marker mode is enabled
-        hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if "messages" in req_json and isinstance(req_json["messages"], list):
-            if _session_isolation_enabled():
-                hermes_sid = get_or_create_session_id(req_json["messages"])
-            
-            # ✅ Client-side [comp] compression: truncate tool results if [comp] triggered
-            result = compress_tool_results(req_json["messages"], CONFIG)
-            req_json["messages"] = result[0]
-            is_comp_only = result[1]
-            
-            # ✅ If user sent ONLY [comp], return auto-reply directly without LLM
-            if is_comp_only:
-                model = req_json.get("model", "hermes-agent")
-                completion_id = f"chatcmpl-{int(time.time()*1000)}"
-                created_ts = int(time.time())
-                logger.info(f"[comp] Auto-reply triggered - returning compressed context directly")
-                auto_reply = CONFIG.get("comp_auto_reply", _COMP_AUTO_REPLY)
-                return _build_comp_auto_reply_stream(auto_reply, model, completion_id, created_ts)
-            
-            # ✅ Conversation Compression: compress messages before forwarding
-            req_json["messages"] = compress_request_messages(
-                req_json["messages"], hermes_sid, CONFIG
-            )
-            
-            # ✅ Component 4: Session Marker Detection & History Injection (Native Tool Context)
-            if TOOL_MODE == "native_passthrough" and hermes_sid:
-                marker_info = native_tool_context.detect_session_marker(req_json["messages"])
-                if marker_info:
-                    detected_sid, ts = marker_info
-                    target_sid = detected_sid if detected_sid == hermes_sid else hermes_sid
-                    try:
-                        db = native_tool_context.get_tool_context_db()
-                        tool_results = await db.get_tool_results_by_session(target_sid)
-                        if tool_results:
-                            req_json["messages"] = native_tool_context.inject_tool_results_into_history(
-                                req_json["messages"], target_sid, tool_results
-                            )
-                    except Exception as e:
-                        logger.warning(f"[tool-context] Failed to inject history: {e}")
-
         result = await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
-            hermes_sid,
         )
     else:
         # Passthrough for other endpoints (/v1/models, etc.)

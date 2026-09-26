@@ -19,7 +19,6 @@ from typing import Any, Dict
 import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
-import native_tool_context
 import special_tags
 
 logger = logging.getLogger(__name__)
@@ -35,14 +34,12 @@ async def handle_completions_request(
     # 從 main.py 傳入的函數引用
     sanitize_request_messages,
     transform_stream,
-    hermes_sid: str = "",
 ) -> Any:
     """
     主處理器：處理所有 /v1/chat/completions 請求。
 
     支援：
     - 串流模式（SSE + enhance-v2 轉換）
-    - native_passthrough 模式（完全透傳 + SQLite 存儲 + 歷史注入）
     - 非串流模式（直接透傳）
     """
     # 🔍 臨時 DEBUG：記錄請求結構（確認 Open WebUI 發送什麼欄位）
@@ -83,25 +80,10 @@ async def handle_completions_request(
 
     body = json.dumps(req_json, ensure_ascii=False).encode("utf-8")
 
-    # ✅ Session Isolation: inject session ID header if marker mode is enabled
-    from main import _session_isolation_enabled
-    if _session_isolation_enabled() and hermes_sid:
-        fwd_headers = dict(fwd_headers)
-        fwd_headers["X-Hermes-Session-Id"] = hermes_sid
-        logger.info(f"[session] Injecting X-Hermes-Session-Id: {hermes_sid[:8]}...")
-
-    # Detect client type from User-Agent to decide if we strip <details> tags
-    user_agent = request.headers.get("user-agent", "").lower()
-    strip_details = "dart" in user_agent or "conduit" in user_agent
-
     # --- Streaming path (chat completions with stream=true) ---
     if stream_flag and "chat/completions" in original_path:
         completion_id = f"chatcmpl-{int(time.time()*1000)}"
         created_ts = int(time.time())
-
-        # ✅ Native Passthrough Mode: 使用新的 transform_stream (組件1+2+3)
-        from main import TOOL_MODE as MAIN_TOOL_MODE
-        use_native = MAIN_TOOL_MODE == "native_passthrough"
 
         async def generate():
             upstream_resp = None
@@ -113,18 +95,8 @@ async def handle_completions_request(
                 )
                 logger.info(
                     f"[port={upstream_port}] Proxied chat completions, "
-                    f"upstream status={upstream_resp.status}, "
-                    f"strip_details={strip_details} (UA: {user_agent[:50]}), "
-                    f"native_passthrough={use_native}"
+                    f"upstream status={upstream_resp.status}"
                 )
-                
-                # ✅ Session Isolation: update cached session ID from upstream response
-                from main import _session_isolation_enabled, update_session_id
-                if _session_isolation_enabled() and hermes_sid:
-                    new_sid = upstream_resp.headers.get("X-Hermes-Session-Id", "").strip()
-                    if new_sid and new_sid != hermes_sid:
-                        update_session_id(req_json.get("messages", []), new_sid)
-                        logger.info(f"[session] Updated cache: {hermes_sid[:8]}... → {new_sid[:8]}...")
                 
                 # ✅ 關鍵修復：使用 queue 解耦讀取和寫入，避免 backpressure
                 # 當下游客戶端讀取慢時，yield 會阻塞，但讀取任務在背景運行
@@ -134,19 +106,10 @@ async def handle_completions_request(
                 async def reader_task():
                     """背景任務：持續從 upstream 讀取並轉換"""
                     try:
-                        if use_native:
-                            db = native_tool_context.get_tool_context_db()
-                            async for chunk in native_tool_context.native_passthrough_transform_stream(
-                                upstream_resp.content, model, completion_id, created_ts,
-                                upstream_port, hermes_sid, db, capture_notifications=True,
-                            ):
-                                await queue.put(chunk)
-                        else:
-                            async for chunk in transform_stream(
-                                upstream_resp.content, model, completion_id, created_ts,
-                                upstream_port, strip_details, hermes_sid,
-                            ):
-                                await queue.put(chunk)
+                        async for chunk in transform_stream(
+                            upstream_resp.content, model, completion_id, created_ts,
+                        ):
+                            await queue.put(chunk)
                         # 標記完成
                         await queue.put(None)
                     except Exception as e:
@@ -166,7 +129,7 @@ async def handle_completions_request(
                 logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
                 raise
             except aiohttp.ServerDisconnectedError:
-                logger.info(f"[port={upstream_port}] Upstream disconnected (expected after auto-split)")
+                logger.info(f"[port={upstream_port}] Upstream disconnected")
             except aiohttp.ClientError as e:
                 logger.warning(f"[port={upstream_port}] Client error: {type(e).__name__}: {e}")
                 yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure"}}\n\n'
