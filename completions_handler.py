@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, Dict
 
 import aiohttp
 from fastapi import Request
@@ -23,51 +23,6 @@ import native_tool_context
 import special_tags
 
 logger = logging.getLogger(__name__)
-
-# ── Test Mode Trigger ──────────────────────────────────────
-# 當最後一則 user message 包含這個關鍵字時，觸發測試模式。
-TEST_MODE_TRIGGER = "[TEST_TOOL_CARDS]"
-
-
-def _check_test_mode(req_json: Dict[str, Any]) -> bool:
-    """
-    檢查請求是否為測試模式。
-    條件：最後一則 user message 的內容包含 TEST_MODE_TRIGGER。
-    """
-    messages = req_json.get("messages", [])
-    if not messages:
-        return False
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return TEST_MODE_TRIGGER in content
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and TEST_MODE_TRIGGER in part.get("text", ""):
-                        return True
-            break
-    return False
-
-
-def _handle_test_mode(completion_id: str, created: int, model: str) -> StreamingResponse:
-    """
-    測試模式：直接回傳預先寫好的 tool card 樣本，不轉發 upstream。
-    """
-    from test_mode import generate_test_stream
-    return StreamingResponse(
-        generate_test_stream(completion_id, created, model),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "X-Proxy-Buffering": "no",
-            "Flush-After-Header": "true",
-            "Content-Encoding": "identity",
-        },
-    )
-
 
 async def handle_completions_request(
     request: Request,
@@ -86,7 +41,6 @@ async def handle_completions_request(
     主處理器：處理所有 /v1/chat/completions 請求。
 
     支援：
-    - 測試模式（直接回傳預先寫好的樣本）
     - 串流模式（SSE + enhance-v2 轉換）
     - native_passthrough 模式（完全透傳 + SQLite 存儲 + 歷史注入）
     - 非串流模式（直接透傳）
@@ -120,11 +74,6 @@ async def handle_completions_request(
 
     completion_id = f"chatcmpl-{int(time.time()*1000)}"
     created_ts = int(time.time())
-
-    # ── 🧪 Test Mode: 直接回傳測試樣本，不轉發 upstream ──
-    if _check_test_mode(req_json):
-        logger.info(f"[test-mode] Triggered! Sending tool card samples directly.")
-        return _handle_test_mode(completion_id, created_ts, model)
 
     # ✅ Task 1: strip 思考內容（OWUI 把思考區域組裝回傳 LLM 時砍掉，防污染反饋迴圈）
     # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
@@ -179,7 +128,6 @@ async def handle_completions_request(
                 
                 # ✅ 關鍵修復：使用 queue 解耦讀取和寫入，避免 backpressure
                 # 當下游客戶端讀取慢時，yield 會阻塞，但讀取任務在背景運行
-                import asyncio
                 queue = asyncio.Queue(maxsize=1000)  # 限制記憶體使用
                 read_task = None
                 

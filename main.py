@@ -22,14 +22,12 @@ import json
 import html
 import logging
 import os
-import random
 import re
 import signal
 import sys
 import threading
 import time
 import traceback
-import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, AsyncGenerator, List
 
@@ -291,38 +289,6 @@ DEFAULT_EMOJI = "🔧"
 
 def get_tool_emoji(tool: str) -> str:
     return TOOL_EMOJI.get(tool, DEFAULT_EMOJI)
-
-
-# ── Detail Tag Builder ────────────────────────────────────
-
-def build_details_tag(
-    tool_call_id: str,
-    tool_name: str,
-    emoji: str,
-    label: str,
-    done: bool,
-) -> str:
-    """建立 <details type="tool_calls"> 標籤供 Open WebUI 渲染。"""
-    safe_name = html.escape(tool_name)
-    if done:
-        return (
-            f'<details type="tool_calls" done="true" id="{tool_call_id}" '
-            f'name="{safe_name}">'
-            f'\n<summary>{emoji} Done</summary>'
-            f'</details>\n'
-        )
-    else:
-        return (
-            f'<details type="tool_calls" done="false" id="{tool_call_id}" '
-            f'name="{safe_name}">'
-            f'\n<summary>{emoji} Running... {label}</summary>'
-            f'</details>\n'
-        )
-
-
-def make_sse_line(data_obj: dict) -> bytes:
-    """序列化為 SSE data 行。"""
-    return f"data: {json.dumps(data_obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 # ── Upstream Resolver ─────────────────────────────────────
@@ -1026,17 +992,6 @@ def compress_request_messages(messages: list, hermes_sid: str, config: dict) -> 
 # ── Tool Mode Handlers ─────────────────────────────────────
 
 
-def _encode_detail_attribute(value: Any) -> str:
-    """
-    Encode a value as a <details> attribute:
-    JSON encode -> HTML escape (for safe attribute embedding).
-    """
-    if not value:
-        return ""
-    json_str = json.dumps(value, ensure_ascii=False)
-    return html.escape(json_str, quote=True)
-
-
 # 圖片參數鍵（不含裸 path/paths，避免 read_file 被誤判）
 _IMAGE_ARG_KEYS = {
     "image_url", "image_urls", "image_path", "image_paths",
@@ -1411,7 +1366,6 @@ class ToolCallBuffer:
             chunks = []
             
             # ✅ 只注入帶 arguments + result 的 <details>（正確做法）
-            emoji = state.get("emoji", get_tool_emoji(tool_name))
             label = state.get("label", tool_name)
             details = _build_completion_details(tool_name, label, result, arguments)
             
@@ -1469,7 +1423,6 @@ async def transform_stream(
     tool_states: Dict[str, dict] = {}
     
     done_received = False
-    split_done = False  # 是否已發送過分割標記
 
     # 使用 bytes buffer 避免反覆 decode/encode
     buffer = b""
@@ -1494,7 +1447,6 @@ async def transform_stream(
     
     # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
     tool_just_completed = False
-    tool_completed_at = 0  # 記錄 tool completed 的時間戳
     
     # ✅ 修復：追蹤是否已發送第一個有內容的 chunk，避免心跳干擾
     first_content_sent = False
@@ -1539,7 +1491,6 @@ async def transform_stream(
     
     # ✅ 新增：在等待 upstream 第一塊內容時，使用更短的心跳間隔（0.5 秒）
     # 學校網路可能需要更頻繁的心跳來保持連接活躍
-    initial_wait_heartbeat = time.monotonic()
     initial_wait_interval = 0.5  # 初始等待階段每 0.5 秒發送心跳
     
     # ✅ 預建心跳 chunk 模板（避免每次重複格式化）
@@ -1801,7 +1752,6 @@ async def transform_stream(
                     status = parsed_json.get("status", "")
                     tool = parsed_json.get("tool", "unknown")
                     arguments = parsed_json.get("arguments", {})
-                    result = parsed_json.get("result", "")
 
                     # ── enhance-v2 模式 ──
                     if TOOL_MODE == "enhance-v2" and v2_buffer:
@@ -1829,7 +1779,6 @@ async def transform_stream(
                                 f"sent 3 nudges + thinking chunk to keep stream alive"
                             )
                             tool_just_completed = True
-                            tool_completed_at = time.monotonic()  # 記錄 tool completed 時間
                         # 跳過 hermes.tool.progress 事件，不發送給客戶端
                         continue
                     
