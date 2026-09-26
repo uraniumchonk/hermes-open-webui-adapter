@@ -1995,102 +1995,83 @@ async def get_session() -> aiohttp.ClientSession:
 
 # ── Route: Catch-all proxy ────────────────────────────────
 
-@APP.api_route("/{port_prefix}/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
+_FORWARD_HEADERS = ("authorization", "content-type", "x-hermes-session-id", "x-hermes-session-key")
+
+
+def _proxy_error(status: int, code: str, message: str, headers: Optional[dict] = None) -> JSONResponse:
+    return JSONResponse(
+        content={"error": {"message": message, "type": "proxy_error", "code": code}},
+        status_code=status,
+        headers=headers,
+    )
+
+
+@APP.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy(request: Request, path: str):
     """
-    Main proxy route — routes to appropriate handler based on path.
-    
+    Single catch-all proxy. /<port>/v1/* goes to that port's Gateway,
+    anything else to DEFAULT_UPSTREAM (see resolve_upstream).
+
     Routes:
-    - /{port}/v1/responses/** → ResponsesHandler
-    - /{port}/v1/chat/completions → CompletionsHandler (enhance-v2)
-    - Other paths → passthrough
+    - */v1/responses/**      → responses_handler
+    - */v1/chat/completions  → completions_handler (enhance-v2)
+    - other paths            → passthrough
     """
-    # ── Crash Debug: request entry tracking ──
-    req_id = f"{port_prefix}/{rest[:50]}"
-    start_time = time.monotonic()
-    logger.info(f"[req-trace] ENTER {request.method} /{port_prefix}/{rest[:80]} req_id={req_id}")
-
-    # ── Performance Metrics: stage timers ──
-    _perf_stages: Dict[str, float] = {}
-    _perf_body_size = 0
-    _perf_msg_count = 0
-    _perf_msg_chars = 0
-    _perf_start = time.monotonic()
-
-    upstream_port = port_prefix
-    original_path = f"/{port_prefix}/{rest}"
+    original_path = f"/{path}"
+    upstream_port = path.split("/", 1)[0]
     upstream_url = resolve_upstream(original_path)
+    req_id = path[:60]
+    start_time = time.monotonic()
+    logger.info(f"[req-trace] ENTER {request.method} {original_path[:80]} req_id={req_id}")
 
     # ── Memory self-protection: reject under pressure before reading body ──
     if _mem_guard_reject():
-        return JSONResponse(
-            content={"error": {"message": "Proxy under memory pressure, retry later",
-                               "type": "proxy_error", "code": "memory_pressure"}},
-            status_code=503,
-            headers={"Retry-After": "5"},
-        )
+        return _proxy_error(503, "memory_pressure", "Proxy under memory pressure, retry later",
+                            headers={"Retry-After": "5"})
 
     # ── Request body cap: refuse pathological request bodies ──
+    too_large = f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit"
     content_length = request.headers.get("content-length")
     if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY:
-        return JSONResponse(
-            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
-                               "type": "proxy_error", "code": "body_too_large"}},
-            status_code=413,
-        )
-
+        return _proxy_error(413, "body_too_large", too_large)
     body = await request.body()
     if len(body) > MAX_REQUEST_BODY:
-        return JSONResponse(
-            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
-                               "type": "proxy_error", "code": "body_too_large"}},
-            status_code=413,
-        )
+        return _proxy_error(413, "body_too_large", too_large)
+    body_read_ms = (time.monotonic() - start_time) * 1000
 
-    # Build forwarded headers — include Hermes session headers for stateful mode
-    fwd_headers = {}
-    for hn, hv in request.headers.items():
-        hl = hn.lower()
-        if hl in ("authorization", "content-type", "x-hermes-session-id", "x-hermes-session-key"):
-            fwd_headers[hn] = hv
+    # Forward auth/content-type + Hermes session headers only
+    fwd_headers = {hn: hv for hn, hv in request.headers.items() if hn.lower() in _FORWARD_HEADERS}
 
-    # Parse request body
-    _perf_body_time = (time.monotonic() - _perf_start) * 1000
-    _perf_stages["body_read"] = _perf_body_time
     try:
         req_json = json.loads(body) if body else {}
     except json.JSONDecodeError:
         req_json = {}
 
-    _perf_body_size = len(body)
+    msg_count = msg_chars = 0
     if "messages" in req_json and isinstance(req_json["messages"], list):
-        _perf_msg_count = len(req_json["messages"])
-        _perf_msg_chars = sum(len(str(m.get("content", ""))) for m in req_json["messages"])
+        msg_count = len(req_json["messages"])
+        msg_chars = sum(len(str(m.get("content", ""))) for m in req_json["messages"])
 
     sess = await get_session()
 
-    # ── Route to appropriate handler ──
     if "/v1/responses" in original_path:
+        route = "responses"
+    elif "/v1/chat/completions" in original_path:
+        route = "completions"
+    else:
+        route = "passthrough"
+    logger.info(f"[req-trace] ROUTE to {route} req_id={req_id}")
+    if route != "passthrough":
         logger.info(
-            f"[perf] REQ body={_perf_body_size}B msgs={_perf_msg_count} chars={_perf_msg_chars} "
-            f"body_read={_perf_body_time:.1f}ms req_id={req_id}"
+            f"[perf] REQ body={len(body)}B msgs={msg_count} chars={msg_chars} "
+            f"body_read={body_read_ms:.1f}ms req_id={req_id}"
         )
-        logger.info(f"[req-trace] ROUTE to responses_handler req_id={req_id}")
+
+    if route == "responses":
         result = await handle_responses_request(
             request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
         )
-        _elapsed = time.monotonic() - start_time
-        logger.info(
-            f"[perf] EXIT responses req_id={req_id} TOTAL={_elapsed:.1f}s "
-            f"body={_perf_body_size}B msgs={_perf_msg_count}"
-        )
-        return result
-    elif "/v1/chat/completions" in original_path:
-        logger.info(
-            f"[perf] REQ body={_perf_body_size}B msgs={_perf_msg_count} chars={_perf_msg_chars} "
-            f"body_read={_perf_body_time:.1f}ms req_id={req_id}"
-        )
-        logger.info(f"[req-trace] ROUTE to completions_handler req_id={req_id}")
+    elif route == "completions":
         # ✅ Session Isolation: derive/inject session ID if marker mode is enabled
         hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
         if "messages" in req_json and isinstance(req_json["messages"], list):
@@ -2131,132 +2112,21 @@ async def proxy_with_transform(request: Request, port_prefix: str, rest: str):
                             )
                     except Exception as e:
                         logger.warning(f"[tool-context] Failed to inject history: {e}")
-        
+
         result = await handle_completions_request(
             request, upstream_url, fwd_headers, body, req_json, sess,
             upstream_port, sanitize_request_messages, transform_stream,
             hermes_sid,
         )
-        _elapsed = time.monotonic() - start_time
-        logger.info(
-            f"[perf] EXIT completions req_id={req_id} TOTAL={_elapsed:.1f}s "
-            f"body={_perf_body_size}B msgs={_perf_msg_count} chars={_perf_msg_chars}"
-        )
-        return result
     else:
         # Passthrough for other endpoints (/v1/models, etc.)
-        logger.info(f"[req-trace] ROUTE to passthrough req_id={req_id}")
         result = await _passthrough(request, upstream_url, fwd_headers, body, sess)
-        _elapsed = time.monotonic() - start_time
-        logger.info(
-            f"[perf] EXIT passthrough req_id={req_id} TOTAL={_elapsed:.1f}s "
-            f"body={_perf_body_size}B"
-        )
-        return result
 
-
-@APP.api_route("/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_default(request: Request, rest: str):
-    """
-    Fallback proxy route for paths WITHOUT port prefix.
-    Routes to default upstream (30000).
-    """
-    original_path = f"/{rest}"
-    upstream_url = resolve_upstream(original_path)
-
-    # ── Memory self-protection + body cap (same as proxy_with_transform) ──
-    if _mem_guard_reject():
-        return JSONResponse(
-            content={"error": {"message": "Proxy under memory pressure, retry later",
-                               "type": "proxy_error", "code": "memory_pressure"}},
-            status_code=503,
-            headers={"Retry-After": "5"},
-        )
-    content_length = request.headers.get("content-length")
-    if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY:
-        return JSONResponse(
-            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
-                               "type": "proxy_error", "code": "body_too_large"}},
-            status_code=413,
-        )
-
-    body = await request.body()
-    if len(body) > MAX_REQUEST_BODY:
-        return JSONResponse(
-            content={"error": {"message": f"Request body exceeds {MAX_REQUEST_BODY // (1024*1024)}MB limit",
-                               "type": "proxy_error", "code": "body_too_large"}},
-            status_code=413,
-        )
-
-    # Build forwarded headers — include Hermes session headers for stateful mode
-    fwd_headers = {}
-    for hn, hv in request.headers.items():
-        hl = hn.lower()
-        if hl in ("authorization", "content-type", "x-hermes-session-id", "x-hermes-session-key"):
-            fwd_headers[hn] = hv
-
-    try:
-        req_json = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        req_json = {}
-
-    sess = await get_session()
-    upstream_port = "30000"  # default
-
-    # ── Route to appropriate handler ──
-    if "/v1/responses" in original_path:
-        return await handle_responses_request(
-            request, upstream_url, fwd_headers, body, req_json, sess, CONFIG
-        )
-    elif "/v1/chat/completions" in original_path:
-        # ✅ Session Isolation: derive/inject session ID if marker mode is enabled
-        hermes_sid = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if "messages" in req_json and isinstance(req_json["messages"], list):
-            if _session_isolation_enabled():
-                hermes_sid = get_or_create_session_id(req_json["messages"])
-            
-            # ✅ Client-side [comp] compression: truncate tool results if [comp] triggered
-            result = compress_tool_results(req_json["messages"], CONFIG)
-            req_json["messages"] = result[0]
-            is_comp_only = result[1]
-            
-            # ✅ If user sent ONLY [comp], return auto-reply directly without LLM
-            if is_comp_only:
-                model = req_json.get("model", "hermes-agent")
-                completion_id = f"chatcmpl-{int(time.time()*1000)}"
-                created_ts = int(time.time())
-                logger.info(f"[comp] Auto-reply triggered - returning compressed context directly")
-                auto_reply = CONFIG.get("comp_auto_reply", _COMP_AUTO_REPLY)
-                return _build_comp_auto_reply_stream(auto_reply, model, completion_id, created_ts)
-            
-            # ✅ Conversation Compression: compress messages before forwarding
-            req_json["messages"] = compress_request_messages(
-                req_json["messages"], hermes_sid, CONFIG
-            )
-            
-            # ✅ Component 4: Session Marker Detection & History Injection (Native Tool Context)
-            if TOOL_MODE == "native_passthrough" and hermes_sid:
-                marker_info = native_tool_context.detect_session_marker(req_json["messages"])
-                if marker_info:
-                    detected_sid, ts = marker_info
-                    target_sid = detected_sid if detected_sid == hermes_sid else hermes_sid
-                    try:
-                        db = native_tool_context.get_tool_context_db()
-                        tool_results = await db.get_tool_results_by_session(target_sid)
-                        if tool_results:
-                            req_json["messages"] = native_tool_context.inject_tool_results_into_history(
-                                req_json["messages"], target_sid, tool_results
-                            )
-                    except Exception as e:
-                        logger.warning(f"[tool-context] Failed to inject history: {e}")
-        return await handle_completions_request(
-            request, upstream_url, fwd_headers, body, req_json, sess,
-            upstream_port, sanitize_request_messages, transform_stream,
-            hermes_sid,
-        )
-    else:
-        # Passthrough for other endpoints
-        return await _passthrough(request, upstream_url, fwd_headers, body, sess)
+    logger.info(
+        f"[perf] EXIT {route} req_id={req_id} TOTAL={time.monotonic() - start_time:.1f}s "
+        f"body={len(body)}B msgs={msg_count}"
+    )
+    return result
 
 
 async def _passthrough(request, upstream_url, fwd_headers, body, sess):
