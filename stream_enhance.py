@@ -21,6 +21,7 @@ import aiohttp
 from aiohttp.http_exceptions import LineTooLong
 
 import special_tags
+from runtime import rss_bytes
 
 logger = logging.getLogger("tool-filter")
 
@@ -110,7 +111,7 @@ def _sanitize_progress_result(result: Any) -> str:
             )
             return f"{summary}（圖片已經從你的上下文移除 你的下一輪回答將不會具有圖片知識 若用戶詢問有關內容 需要再調用一次圖片工具）"
         logger.info(f"[multimodal] stripped envelope result_len={original_len} (no summary)")
-        return f"圖片已載入模型上下文（圖片已經從你的上下文移除 你的下一輪回答將不會具有圖片知識 若用戶詢問有關內容 需要再調用一次圖片工具）"
+        return "圖片已載入模型上下文（圖片已經從你的上下文移除 你的下一輪回答將不會具有圖片知識 若用戶詢問有關內容 需要再調用一次圖片工具）"
 
     if "data:image" in result_str or original_len > 100_000:
         redacted = _DATA_URL_RE.sub("[base64_image_redacted]", result_str)
@@ -311,7 +312,7 @@ class ToolCallBuffer:
             completion_id.encode(), created, model.encode()
         ))
         _elapsed = (time.monotonic() - _t0) * 1000
-        logging.info(f"[perf] on_tool_running {tool_name} tc_id={tc_id[:8]}... active={len(self.active_tools)} {_elapsed:.1f}ms")
+        logger.debug(f"[perf] on_tool_running {tool_name} tc_id={tc_id[:8]}... active={len(self.active_tools)} {_elapsed:.1f}ms")
         return chunks
     
     def on_tool_completed(self, tc_id: str, payload: dict,
@@ -344,13 +345,13 @@ class ToolCallBuffer:
             chunks.append(_build_content_chunk(f"\n\n{details}\n"))
             
             _elapsed = (time.monotonic() - _t0) * 1000
-            logging.info(
+            logger.debug(
                 f"[perf] on_tool_completed {tool_name} tc_id={tc_id[:8]}... "
                 f"result_len={len(result)} active={len(self.active_tools)} {_elapsed:.1f}ms"
             )
             return chunks
         except Exception as e:
-            logging.error(f"[enhance-v2] on_tool_completed ERROR: {e} for tc_id={tc_id}")
+            logger.error(f"[enhance-v2] on_tool_completed ERROR: {e} for tc_id={tc_id}")
             return []
     
     @property
@@ -399,9 +400,6 @@ async def transform_stream(
     # enhance-v2 工具狀態追蹤
     v2_buffer = ToolCallBuffer()
     
-    # 過渡期追蹤：tool completed 後的第一個 content chunk 需要特別記錄
-    tool_just_completed = False
-    
     # ✅ 修復：追蹤是否已發送第一個有內容的 chunk，避免心跳干擾
     first_content_sent = False
 
@@ -411,24 +409,15 @@ async def transform_stream(
         if now - _last_rss_check < 30.0:
             return
         _last_rss_check = now
-        try:
-            with open("/proc/self/status", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        # VmRSS is in kB
-                        rss_kb = int(line.split()[1])
-                        rss_bytes = rss_kb * 1024
-                        if rss_bytes >= _rss_warn_bytes:
-                            logger.warning(
-                                f"[mem] high RSS={rss_kb} kB buffer_len={len(buffer)} "
-                                f"active_tools={len(v2_buffer.active_tools)} "
-                                f"heartbeat_count={heartbeat_count}"
-                            )
-                        else:
-                            logger.debug(f"[mem] RSS={rss_kb} kB buffer_len={len(buffer)}")
-                        break
-        except Exception:
-            pass
+        rss_kb = rss_bytes() // 1024
+        if rss_kb * 1024 >= _rss_warn_bytes:
+            logger.warning(
+                f"[mem] high RSS={rss_kb} kB buffer_len={len(buffer)} "
+                f"active_tools={len(v2_buffer.active_tools)} "
+                f"heartbeat_count={heartbeat_count}"
+            )
+        else:
+            logger.debug(f"[mem] RSS={rss_kb} kB buffer_len={len(buffer)}")
     
     # ✅ 防火牆優化：在開始讀取 upstream 前，先發送初始心跳強制連接建立
     # 學校防火牆/代理可能會緩衝小數據包，我們用多層策略確保連接不被卡住
@@ -441,7 +430,7 @@ async def transform_stream(
         completion_id.encode(), created, model.encode(), b''
     )
     
-    logger.info(f"[firewall-optimization] Sent initial packets to force connection establishment")
+    logger.debug("[firewall-optimization] Sent initial packets to force connection establishment")
     
     # ✅ 新增：在等待 upstream 第一塊內容時，使用更短的心跳間隔（0.5 秒）
     # 學校網路可能需要更頻繁的心跳來保持連接活躍
@@ -476,7 +465,6 @@ async def transform_stream(
         if elapsed >= current_heartbeat_interval:
             heartbeat_count += 1
             last_heartbeat = time.monotonic()
-            tool_just_completed = False
             
             # ✅ 關鍵修復：使用 data: 行而非 SSE comment，確保 Open WebUI 識別為活躍信號
             yield _heartbeat_chunk_tpl % (
@@ -505,7 +493,7 @@ async def transform_stream(
 
             # ── EOF detection ──
             if reader.at_eof():
-                logger.info(
+                logger.debug(
                     f"[enhance-v2] Upstream EOF detected on timeout (stream_age={time.monotonic() - _stream_start:.1f}s, "
                     f"readline_count={_readline_count}). Breaking immediately."
                 )
@@ -544,16 +532,16 @@ async def transform_stream(
                 break
             
             if not first_content_sent and len(buffer) > 0:
-                logger.warning(
-                    f"[readline-debug] TIMEOUT but buffer_len={len(buffer)}, "
-                    f"buffer_preview={buffer[:200]!r}, first_content_sent={first_content_sent}"
+                logger.debug(
+                    f"[readline-debug] TIMEOUT before first content, "
+                    f"buffer_len={len(buffer)} buffer_preview={buffer[:200]!r}"
                 )
             
             # ── Crash Debug: periodic buffer state dump ──
             now = time.monotonic()
             if now - _last_buffer_dump > 10.0:
                 _last_buffer_dump = now
-                logger.warning(
+                logger.debug(
                     f"[crash-debug] READLINE TIMEOUT after {_read_elapsed:.2f}s | "
                     f"stream_age={now - _stream_start:.1f}s readline_count={_readline_count} "
                     f"buffer_len={len(buffer)} heartbeat={heartbeat_count} "
@@ -594,18 +582,9 @@ async def transform_stream(
             # readline() 可能丟出 exception（例如 client 斷開連線）
             logger.error(
                 f"[enhance-v2] readline() exception: {type(e).__name__}: {e}, "
-                f"tool_just_completed={tool_just_completed}, "
                 f"done_received={done_received}, buffer_len={len(buffer)}"
             )
             raise
-
-        # DEBUG: 記錄所有讀取的原始行（前 100 行）
-        if heartbeat_count < 100:
-            line_preview = line[:100] if line else b""
-            logger.debug(
-                f"[readline-debug] READ line_len={len(line)}, preview={line_preview!r}, "
-                f"buffer_len={len(buffer)}, first_content={first_content_sent}"
-            )
 
         # ✅ 收到任何 upstream 數據即更新 stale 計時器
         _last_data_time = time.monotonic()
@@ -614,13 +593,12 @@ async def transform_stream(
         if not line:
             elapsed = time.monotonic() - last_heartbeat
             stream_age = time.monotonic() - _stream_start
-            logger.info(
+            logger.debug(
                 f"[enhance-v2] Upstream EOF detected! "
                 f"stream_age={stream_age:.1f}s readline_count={_readline_count} "
                 f"last_heartbeat={elapsed:.1f}s ago, "
                 f"done_received={done_received}, "
                 f"buffer_len={len(buffer)}, "
-                f"tool_just_completed={tool_just_completed}, "
                 f"active_tools={len(v2_buffer.active_tools)}"
             )
             break
@@ -654,9 +632,8 @@ async def transform_stream(
             if "[DONE]" in frame and not done_received:
                 yield (frame + "\n\n").encode("utf-8")
                 done_received = True
-                logger.info(
-                    f"[enhance-v2] ⚠️ Received [DONE] from upstream. "
-                    f"tool_just_completed={tool_just_completed}, "
+                logger.debug(
+                    f"[enhance-v2] Received [DONE] from upstream. "
                     f"heartbeat_count={heartbeat_count}, "
                     f"buffer_len={len(buffer)} — 繼續等待 upstream EOF"
                 )
@@ -716,43 +693,25 @@ async def transform_stream(
                             f"[enhance-v2] Tool '{tool}' completed (tc_id={tc_id[:20]}...), "
                             f"sent 3 nudges + thinking chunk to keep stream alive"
                         )
-                        tool_just_completed = True
                     # 跳過 hermes.tool.progress 事件，不發送給客戶端
                     continue
 
-                # 過渡期 logging：tool completed 後的第一個 content chunk
-                if tool_just_completed and frame:
-                    try:
-                        fc = json.loads(frame) if not frame.startswith(':') else None
-                        if fc:
-                            delta = fc.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                logger.info(
-                                    f"[enhance-v2] Post-tool transition: first content chunk "
-                                    f"({len(content)} chars) -> {content[:80]}..."
-                                )
-                                tool_just_completed = False
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        tool_just_completed = False
                 # content frame 原樣即時輸出——包括模型自己寫出的 <details> 字串
                 # （舊版丟掉含 type="tool_calls" 的 chunk，會截斷模型的正常輸出）。
                 # tool card 由 on_tool_completed 以獨立 chunk 注入，不經過這裡。
                 yield (frame + "\n\n").encode("utf-8")
                 
                 # ✅ 修復：追蹤第一個有內容的 chunk，之後才啟動心跳
-                if not first_content_sent and data_str:
+                if not first_content_sent and parsed_json:
                     try:
-                        pj = json.loads(data_str)
-                        delta = pj.get("choices", [{}])[0].get("delta", {})
-                        if delta.get("content"):
+                        if parsed_json.get("choices", [{}])[0].get("delta", {}).get("content"):
                             first_content_sent = True
-                            logger.info(f"[enhance-v2] First content chunk sent, heartbeat enabled")
-                    except (json.JSONDecodeError, IndexError, KeyError):
+                            logger.debug("[enhance-v2] First content chunk sent, heartbeat enabled")
+                    except (AttributeError, IndexError, KeyError, TypeError):
                         pass
                 
             except Exception as e:
-                logging.error(f"[transform_stream] Frame processing ERROR: {e} | frame_preview={frame[:200]}")
+                logger.error(f"[transform_stream] Frame processing ERROR: {e} | frame_preview={frame[:200]}")
                 continue
 
         # ✅ 關鍵修復：收到 [DONE] 後不再立即跳出
@@ -772,5 +731,5 @@ async def transform_stream(
     logger.info(
         f"[crash-debug] STREAM COMPLETE stream_age={stream_age:.1f}s "
         f"readline_count={_readline_count} heartbeat={heartbeat_count} "
-        f"active_tools={len(v2_buffer.active_tools)}"
+        f"done={done_received} active_tools={len(v2_buffer.active_tools)}"
     )
