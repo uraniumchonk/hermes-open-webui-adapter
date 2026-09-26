@@ -82,29 +82,6 @@ async def handle_completions_request(
     - 串流模式（SSE + enhance-v2 轉換）
     - 非串流模式（直接透傳）
     """
-    # 🔍 臨時 DEBUG：記錄請求結構（確認 Open WebUI 發送什麼欄位）
-    _debug_keys = list(req_json.keys())
-    _meta = req_json.get("metadata", {})
-    _has_chat_id = "chat_id" in req_json or "chatId" in req_json or "chatId" in str(_meta)
-    _msg_count = len(req_json.get("messages", []))
-    _stream_opts = req_json.get("stream_options", {})
-    _num_ctx = req_json.get("num_ctx", "")
-    # 提取 messages 的 role 分佈
-    _roles = [m.get("role","?") for m in req_json.get("messages",[])]
-    # 提取第一個 message 的 keys（system prompt）
-    _first_msg_keys = list(req_json.get("messages",[{}])[0].keys()) if _msg_count > 0 else []
-    # 計算每個 message 的 content 長度
-    _msg_lens = [len(str(m.get("content",""))) for m in req_json.get("messages",[])]
-    # 檢查是否有 X-Hermes-Session-Id 已經存在
-    _has_hermes_sid = bool(request.headers.get("X-Hermes-Session-Id", "").strip())
-    logger.info(
-        f"[DEBUG-request] keys={_debug_keys} | stream_options={_stream_opts} "
-        f"| num_ctx={_num_ctx} | metadata_keys={list(_meta.keys())} "
-        f"| messages={_msg_count} roles={_roles} "
-        f"| msg_lens={_msg_lens} | first_msg_keys={_first_msg_keys} "
-        f"| chat_id={_has_chat_id} | hermes_sid={_has_hermes_sid} | model={req_json.get('model','')}"
-    )
-
     model = req_json.get("model", "hermes-agent")
     stream_flag = req_json.get("stream", True)
     original_path = request.scope.get("path", "")
@@ -122,9 +99,6 @@ async def handle_completions_request(
 
     # --- Streaming path (chat completions with stream=true) ---
     if stream_flag and "chat/completions" in original_path:
-        completion_id = f"chatcmpl-{int(time.time()*1000)}"
-        created_ts = int(time.time())
-
         async def generate():
             upstream_resp = None
             try:
@@ -156,7 +130,8 @@ async def handle_completions_request(
                         logger.error(f"[queue-reader] Error: {type(e).__name__}: {e}")
                         await queue.put(None)
                 
-                # 啟動背景讀取任務
+                # 啟動背景讀取任務（保留 read_task 參照：event loop 只持有 task 的弱參照，
+                # 沒人引用可能在執行中被 GC——pyflakes 報 unused 也別刪）
                 read_task = asyncio.create_task(reader_task())
                 
                 # 從 queue 讀取並 yield - 這不會阻塞 upstream 讀取

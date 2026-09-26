@@ -102,7 +102,7 @@ async def proxy(request: Request, path: str):
     upstream_url = resolve_upstream(original_path)
     req_id = path[:60]
     start_time = time.monotonic()
-    logger.info(f"[req-trace] ENTER {request.method} {original_path[:80]} req_id={req_id}")
+    logger.debug(f"[req-trace] ENTER {request.method} {original_path[:80]} req_id={req_id}")
 
     # ── Memory self-protection: reject under pressure before reading body ──
     if mem_guard_reject():
@@ -127,10 +127,9 @@ async def proxy(request: Request, path: str):
     except json.JSONDecodeError:
         req_json = {}
 
-    msg_count = msg_chars = 0
+    msg_count = 0
     if "messages" in req_json and isinstance(req_json["messages"], list):
         msg_count = len(req_json["messages"])
-        msg_chars = sum(len(str(m.get("content", ""))) for m in req_json["messages"])
 
     sess = await get_session()
 
@@ -140,10 +139,9 @@ async def proxy(request: Request, path: str):
         route = "completions"
     else:
         route = "passthrough"
-    logger.info(f"[req-trace] ROUTE to {route} req_id={req_id}")
     if route != "passthrough":
         logger.info(
-            f"[perf] REQ body={len(body)}B msgs={msg_count} chars={msg_chars} "
+            f"[perf] REQ {route} body={len(body)}B msgs={msg_count} "
             f"body_read={body_read_ms:.1f}ms req_id={req_id}"
         )
 
@@ -205,5 +203,5 @@ if __name__ == "__main__":
         logger.info(f"  /{port}/v1/*  ->  {url}/v1/*")
     logger.info(f"Default upstream: {DEFAULT_UPSTREAM}")
     logger.info("=" * 60)
-    logger.info(f"Crash debug: SIGUSR2 handler registered (kill -USR2 <pid> for thread dump)")
+    logger.info("Crash debug: SIGUSR2 handler registered (kill -USR2 <pid> for thread dump)")
     uvicorn.run(APP, host=BIND_HOST, port=BIND_PORT, log_level="info")

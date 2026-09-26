@@ -39,9 +39,10 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(_LOG_LEVEL)
 console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 
-# File handler (persistent log for debugging)
+# File handler (persistent log). Same level as console: DEBUG-level tracing
+# only when TOOL_FILTER_LOG_LEVEL=DEBUG (SIGUSR2 dumps bypass logging).
 file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)  # 文件記錄所有 DEBUG 級別
+file_handler.setLevel(_LOG_LEVEL)
 file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
 
 # Root logger
@@ -92,7 +93,7 @@ def _thread_dump_handler(signum, frame):
         for task in list(tasks)[:20]:  # 最多 20 個
             dump_lines.append(f"  Task: {task.get_name() if hasattr(task, 'get_name') else repr(task)}")
             if task.done():
-                dump_lines.append(f"    Status: DONE")
+                dump_lines.append("    Status: DONE")
             else:
                 dump_lines.append(f"    Status: {'CANCELLED' if task.cancelled() else 'PENDING/RUNNING'}")
     except Exception as e:
@@ -127,6 +128,18 @@ _health_dump_task = None
 _RSS_WATCHDOG_BYTES = 3 * 1024 * 1024 * 1024  # 3GB
 
 
+def rss_bytes() -> int:
+    """Process RSS from /proc/self/status (0 if unavailable)."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
 async def _health_dump_loop():
     """Periodic health dump task — runs in background."""
     global _health_dump_task
@@ -134,12 +147,7 @@ async def _health_dump_loop():
     while True:
         await asyncio.sleep(_health_dump_interval)
         try:
-            rss_kb = 0
-            with open("/proc/self/status", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        rss_kb = int(line.split()[1])
-                        break
+            rss_kb = rss_bytes() // 1024
             
             # ── RSS watchdog：超過上限直接自殺讓 systemd 重啟 ──
             # 歷史教訓（2026-08-07）：stale stream 20 分鐘吃到 3.2G RSS +
@@ -253,24 +261,13 @@ MAX_REQUEST_BODY = 128 * 1024 * 1024   # 128MB 請求體上限（防超大歷史
 _mem_guard_last_gc = 0.0
 
 
-def _rss_bytes() -> int:
-    try:
-        with open("/proc/self/status", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
-    except Exception:
-        pass
-    return 0
-
-
 def mem_guard_reject() -> bool:
     """
     記憶體壓力檢查。回傳 True 表示應該拒接請求（503）。
     超過閾值時先 gc.collect() 一次，仍超過才拒接。
     """
     global _mem_guard_last_gc
-    if _rss_bytes() < _MEM_GUARD_BYTES:
+    if rss_bytes() < _MEM_GUARD_BYTES:
         return False
     now = time.monotonic()
     if now - _mem_guard_last_gc > 5.0:
@@ -279,7 +276,7 @@ def mem_guard_reject() -> bool:
         collected = gc.collect()
         logger.warning(f"[mem-guard] RSS exceeded {_MEM_GUARD_BYTES//(1024*1024)}MB, "
                        f"gc.collect() freed {collected} objects")
-    return _rss_bytes() > _MEM_GUARD_BYTES
+    return rss_bytes() > _MEM_GUARD_BYTES
 
 
 async def get_session() -> aiohttp.ClientSession:
