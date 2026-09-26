@@ -1,0 +1,78 @@
+diff --git a/tools/browser_camofox.py b/tools/browser_camofox.py
+index 8618a595c6..da50d32d21 100644
+--- a/tools/browser_camofox.py
++++ b/tools/browser_camofox.py
+@@ -380,17 +380,19 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
+ def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
+     """Open ``browser_url`` in the task's tab (creating it if missing) and return
+     ``(session, navigate_response)``. A 404 on the existing tab means the server
+-    garbage-collected it — recreate instead of failing."""
++    garbage-collected it; a 410 means the browser restarted — recreate instead
++    of failing in either case."""
+     session = _get_session(task_id)
+     if session["tab_id"]:
+         try:
+             data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
+             return session, data
+         except requests.HTTPError as e:
+-            if e.response is None or e.response.status_code != 404:
++            if e.response is None or e.response.status_code not in (404, 410):
+                 raise
+-            logger.warning("Camofox tab %s returned 404 — tab was garbage collected. Creating a fresh tab.",
+-                           session["tab_id"])
++            reason = "garbage collected" if e.response.status_code == 404 else "browser restarted"
++            logger.warning("Camofox tab %s returned %s — tab was %s. Creating a fresh tab.",
++                           session["tab_id"], e.response.status_code, reason)
+             session["tab_id"] = None
+     return _ensure_tab(task_id, browser_url), {"ok": True, "url": browser_url}
+ 
+@@ -455,12 +457,21 @@ def _require_tab(task_id: Optional[str], action: Optional[str] = None) -> tuple[
+ 
+ def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[Dict[str, Any]], str]) -> str:
+     """Require a tab (+ private-page guard when ``guard_action`` is set), then run ``body(session)``;
+-    any exception becomes a ``tool_error``."""
++    any exception becomes a ``tool_error``. A 404 (tab GC'd) or 410 (browser restarted)
++    drops the stale tab_id so the next navigate recreates it, and says to re-navigate."""
++    session = None
+     try:
+         session, blocked = _require_tab(task_id, guard_action)
+         if blocked:
+             return blocked
+         return body(session)
++    except requests.HTTPError as e:
++        if session is not None and e.response is not None and e.response.status_code in (404, 410):
++            session["tab_id"] = None
++            reason = "the browser was restarted" if e.response.status_code == 410 else "the tab was closed"
++            return tool_error(f"Camofox tab no longer exists ({reason}) — the previous page is gone. "
++                              "Call browser_navigate to open a fresh tab.", success=False)
++        return tool_error(str(e), success=False)
+     except Exception as e:
+         return tool_error(str(e), success=False)
+ 
+@@ -489,7 +500,8 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
+ 
+ 
+ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
+-    """Type text into an element by ref via Camofox."""
++    """Type text into an element by ref via Camoufox."""
++    session = None
+     try:
+         session, blocked = _require_tab(task_id, "type")
+         if blocked:
+@@ -503,6 +515,16 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
+         display_text = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
+         response = {"success": True, "typed": display_text, "element": clean_ref}
+         return json.dumps(redact_browser_typed_text_for_display(response, text))
++    except requests.HTTPError as e:
++        if session is not None and e.response is not None and e.response.status_code in (404, 410):
++            session["tab_id"] = None
++            reason = "the browser was restarted" if e.response.status_code == 410 else "the tab was closed"
++            from agent.display import redact_browser_typed_text_for_display
++            return tool_error(redact_browser_typed_text_for_display(
++                f"Camofox tab no longer exists ({reason}) — the previous page is gone. "
++                "Call browser_navigate to open a fresh tab.", text), success=False)
++        from agent.display import redact_browser_typed_text_for_display
++        return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
+     except Exception as e:
+         from agent.display import redact_browser_typed_text_for_display
+         return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
