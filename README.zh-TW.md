@@ -91,7 +91,6 @@ python main.py
 upstreams:
   "30001": "http://127.0.0.1:30001"
 
-tool_mode: "enhance-v2"
 enable_history_sanitization: true
 sanitization_result_max_length: 20000
 ```
@@ -128,17 +127,17 @@ patch（套用順序 + grep 驗證 + 重匯）、兩台部署、以及你的人�
 ## 專案結構
 
 ```
-main.py                      # 入口：proxy routing、串流、health
-completions_handler.py       # /v1/chat/completions — tool card enhance + sanitize
+main.py                      # 入口：app、proxy routing、health
+runtime.py                   # logging、config、crash debug、記憶體保護、共用 session
+completions_handler.py       # /v1/chat/completions — history sanitize + 轉發
+stream_enhance.py            # SSE 轉換：hermes.tool.progress → tool card
 responses_handler.py         # /v1/responses — session 續接 + tool results
 responses_session.py         # sid marker 提取/注入（responses 專用）
 tool_history_format.py       # tool card → 模型安全 history（structured）
 tool_history_structured.py   # structured sanitizer（原生 tool role）
-native_tool_context.py       # 原生 tool-context 注入
 special_tags.py              # neutralize tool result 內的特殊標籤
 special_tags.json            # 標籤清單（data）
 extract_tags.py              # 一次性標籤產生器（升級 model/OWUI 後重跑）
-comp_mode.py                 # 可選 tool-result 壓縮
 patches/                     # 可選自用 Hermes patch（見上）
 config.yaml                  # 範例 config
 requirements.txt
