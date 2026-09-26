@@ -1993,6 +1993,18 @@ async def get_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+# ── Health Check ───────────────────────────────────────────
+
+# Must be registered before the catch-all proxy route, or it is shadowed.
+@APP.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "ports": {p: u for p, u in PORT_MAP.items()},
+        "default_upstream": DEFAULT_UPSTREAM,
+    }
+
+
 # ── Route: Catch-all proxy ────────────────────────────────
 
 _FORWARD_HEADERS = ("authorization", "content-type", "x-hermes-session-id", "x-hermes-session-key")
@@ -2147,17 +2159,6 @@ async def _passthrough(request, upstream_url, fwd_headers, body, sess):
             return JSONResponse(content=parsed, status_code=resp_status)
     except Exception:
         return Response(content=resp_body, status_code=resp_status)
-
-
-# ── Health Check ───────────────────────────────────────────
-
-@APP.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "ports": {p: u for p, u in PORT_MAP.items()},
-        "default_upstream": DEFAULT_UPSTREAM,
-    }
 
 
 # ── Start background health dump task ──
