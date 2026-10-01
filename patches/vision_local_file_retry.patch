@@ -1,0 +1,33 @@
+diff --git a/tools/image_source.py b/tools/image_source.py
+index c780cf7ef7..c90f5f1485 100644
+--- a/tools/image_source.py
++++ b/tools/image_source.py
+@@ -20,6 +20,13 @@ from typing import Optional
+ # payload cap — that one is enforced post-resize at the call sites.
+ _MAX_INGEST_BYTES = 50 * 1024 * 1024
+ 
++# A freshly-uploaded file (e.g. Open WebUI hands the model the path before the upload
++# write lands on disk) can race the first vision_analyze within the same second:
++# is_file() is False for the first few ms, then the file appears. Retry window for the
++# local-backend miss path — mirrors the container cold-start retry (#76566).
++_LOCAL_FILE_RETRY_ATTEMPTS = 3
++_LOCAL_FILE_RETRY_DELAY = 0.3  # seconds; an upload lands well inside ~0.9s
++
+ 
+ class ImageResolutionError(Exception):
+     def __init__(self, message: str, *, src: str = "", origin: str = ""):
+@@ -73,6 +80,14 @@ async def resolve_image_source(
+     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
+     p = Path(os.path.expanduser(candidate))
+     host_target = _permitted_host_read_target(p, ctx)
++    if (host_target is None or not host_target.is_file()) and _is_local_terminal_backend():
++        # A freshly-uploaded file can race the first read within the same second
++        # (see _LOCAL_FILE_RETRY_* above): retry briefly before declaring it missing.
++        for _attempt in range(_LOCAL_FILE_RETRY_ATTEMPTS):
++            await asyncio.sleep(_LOCAL_FILE_RETRY_DELAY)
++            host_target = _permitted_host_read_target(p, ctx)
++            if host_target is not None and host_target.is_file():
++                break
+     if host_target is not None and host_target.is_file():
+         _guard_credential_read(host_target, s)
+         data = await asyncio.to_thread(host_target.read_bytes)
