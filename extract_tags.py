@@ -5,9 +5,9 @@ import json
 import re
 from pathlib import Path
 
-JINJA = Path("/home/user/models/Qwen3.8-27B-AWQ-INT4/chat_template.jinja")
-OWUI_MW = Path("/home/user/openwebui/lib/python3.12/site-packages/open_webui/utils/middleware.py")
-OUT = Path("/home/user/hermes_tool_filter/special_tags.json")
+JINJA = Path.home() / "models/Qwen3.8-27B-AWQ-INT4/chat_template.jinja"
+OWUI_MW = Path.home() / "openwebui/lib/python3.12/site-packages/open_webui/utils/middleware.py"
+OUT = Path.home() / "hermes_tool_filter/special_tags.json"
 
 def extract_jinja_tags(text: str) -> list[str]:
     tags = []
@@ -46,8 +46,8 @@ for t in ("<details", "</details>"):
 data = {
     "_comment": "特殊標籤清單（自動提取自 jinja + OWUI 0.11.1）。filter 用此清單 neutralize tool result body 內的標籤，避免 OWUI tag 偵測通拉跳脫。",
     "source": {
-        "jinja": str(JINJA),
-        "owui_middleware": str(OWUI_MW),
+        "jinja": "~/" + str(JINJA.relative_to(Path.home())),
+        "owui_middleware": "~/" + str(OWUI_MW.relative_to(Path.home())),
     },
     "model_jinja_tags": jinja_tags,
     "owui_reasoning_tags": reasoning_pairs,
