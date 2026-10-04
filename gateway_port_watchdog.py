@@ -158,21 +158,20 @@ def _units(level: str) -> str:
 def _parse_units(level: str) -> list[tuple[str, str]]:
     """Return (service_name, profile) pairs for gateway services at `level`.
 
-    user level:   hermes-gateway-<profile>.service
-    system level: hermes-<profile>.service   (excluding hermes-tool-filter)
+    Gateway units may be named hermes-<profile>.service (system level, or
+    user level e.g. blub) or hermes-gateway-<profile>.service (user level,
+    supervised mode). Both forms are matched at either level; the profile is
+    the name with the hermes- / hermes-gateway- prefix stripped.
+    (hermes-tool-filter is excluded.)
     """
     out = _units(level)
     pairs: list[tuple[str, str]] = []
-    if level == "user":
-        for m in re.finditer(r"(hermes-gateway-[a-z0-9-]+)\.service", out):
-            name = m.group(1)
-            pairs.append((name, name[len("hermes-gateway-"):]))
-    else:
-        for m in re.finditer(r"(hermes-[a-z0-9-]+)\.service", out):
-            name = m.group(1)
-            if name == "hermes-tool-filter":
-                continue
-            pairs.append((name, name[len("hermes-"):]))
+    for m in re.finditer(r"(hermes-[a-z0-9-]+)\.service", out):
+        name = m.group(1)
+        if name == "hermes-tool-filter":
+            continue
+        prefix = "hermes-gateway-" if name.startswith("hermes-gateway-") else "hermes-"
+        pairs.append((name, name[len(prefix):]))
     return pairs
 
 
