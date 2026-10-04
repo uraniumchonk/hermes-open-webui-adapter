@@ -1,5 +1,5 @@
 diff --git a/tools/image_source.py b/tools/image_source.py
-index c780cf7ef7..c90f5f1485 100644
+index deef22e6b8..e051576fc9 100644
 --- a/tools/image_source.py
 +++ b/tools/image_source.py
 @@ -20,6 +20,13 @@ from typing import Optional

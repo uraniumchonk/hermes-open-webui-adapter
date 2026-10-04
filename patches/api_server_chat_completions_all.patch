@@ -1,8 +1,8 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 0a261a2fd4..17ed2b438a 100644
+index dcae2f9d94..e9d40bca5d 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
-@@ -23,6 +23,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
+@@ -25,6 +25,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
  # Logger parity with the origin module (moved log records keep their name).
  logger = logging.getLogger("gateway.platforms.api_server")
  
@@ -123,7 +123,7 @@ index 0a261a2fd4..17ed2b438a 100644
  async def _iter_stream_items(stream_q, agent_task, response):
      """Yield agent stream items until EOS, writing SSE keepalives while idle.
  
-@@ -590,21 +734,60 @@ class OpenAICompatRoutesMixin:
+@@ -658,21 +802,60 @@ class OpenAICompatRoutesMixin:
          # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
          # (Anthropic rejects images there, OpenAI text models ignore them).
          system_prompt = None
@@ -188,7 +188,7 @@ index 0a261a2fd4..17ed2b438a 100644
          if not _content_has_visible_payload(user_message):
              return _invalid_request("No user message found in messages")
  
-@@ -689,14 +872,38 @@ class OpenAICompatRoutesMixin:
+@@ -757,14 +940,38 @@ class OpenAICompatRoutesMixin:
                  label = build_tool_preview(function_name, function_args) or function_name
                  _stream_q.put_threadsafe(("__tool_progress__", {
                      "tool": function_name, "emoji": get_tool_emoji(function_name), "label": label,

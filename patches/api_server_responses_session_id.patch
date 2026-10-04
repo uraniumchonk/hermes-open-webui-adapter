@@ -1,8 +1,8 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 5c9737bd19..d78ebe9f24 100644
+index dcae2f9d94..e9d40bca5d 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
-@@ -635,6 +635,36 @@ class _ResponsesStream:
+@@ -548,6 +662,36 @@ class _ResponsesStream:
          await self.write_event("response.failed", {"type": "response.failed", "response": env})
  
  
@@ -39,7 +39,7 @@ index 5c9737bd19..d78ebe9f24 100644
  class OpenAICompatRoutesMixin:
      """/v1/chat/completions and /v1/responses handlers + SSE writers."""
  
-@@ -1190,6 +1220,27 @@ class OpenAICompatRoutesMixin:
+@@ -1045,6 +1252,27 @@ class OpenAICompatRoutesMixin:
          gateway_session_key, key_err = self._parse_session_key_header(request)
          if key_err is not None:
              return key_err
@@ -67,7 +67,7 @@ index 5c9737bd19..d78ebe9f24 100644
          try:
              body = await request.json()
          except Exception:
-@@ -1211,11 +1262,11 @@ class OpenAICompatRoutesMixin:
+@@ -1066,11 +1294,11 @@ class OpenAICompatRoutesMixin:
  
          input_messages: List[Dict[str, Any]] = []
          if isinstance(raw_input, str):
@@ -81,7 +81,7 @@ index 5c9737bd19..d78ebe9f24 100644
                  elif _is_reasoning_input_item(item):
                      continue
                  elif isinstance(item, dict):
-@@ -1223,7 +1274,7 @@ class OpenAICompatRoutesMixin:
+@@ -1078,7 +1306,7 @@ class OpenAICompatRoutesMixin:
                          content = _normalize_multimodal_content(item.get("content", ""))
                      except ValueError as exc:
                          return _multimodal_validation_error(exc, param=f"input[{idx}].content")
@@ -90,7 +90,7 @@ index 5c9737bd19..d78ebe9f24 100644
          else:
              return _error_response("'input' must be a string or array", 400)
  
-@@ -1242,11 +1293,32 @@ class OpenAICompatRoutesMixin:
+@@ -1097,11 +1325,32 @@ class OpenAICompatRoutesMixin:
                      entry_content = _normalize_multimodal_content(entry["content"])
                  except ValueError as exc:
                      return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
@@ -125,7 +125,7 @@ index 5c9737bd19..d78ebe9f24 100644
              stored = self._current_response_store().get(previous_response_id)
              if stored is None:
                  return _error_response(f"Previous response not found: {previous_response_id}", 404)
-@@ -1262,9 +1334,10 @@ class OpenAICompatRoutesMixin:
+@@ -1117,9 +1366,10 @@ class OpenAICompatRoutesMixin:
          if body.get("truncation") == "auto":
              conversation_history = _auto_truncate_response_history(conversation_history)
  
@@ -139,7 +139,7 @@ index 5c9737bd19..d78ebe9f24 100644
          _declared_selected = not stored_session_id and bool(gateway_session_key)
          session_id = (
              stored_session_id
-@@ -1276,6 +1349,18 @@ class OpenAICompatRoutesMixin:
+@@ -1131,6 +1381,18 @@ class OpenAICompatRoutesMixin:
              model_alias=body.get("model"))
          if selection_error is not None:
              return selection_error
@@ -158,211 +158,3 @@ index 5c9737bd19..d78ebe9f24 100644
          run_kwargs = dict(
              user_message=user_message, conversation_history=conversation_history,
              ephemeral_system_prompt=instructions, session_id=session_id,
-diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
-index 2ba16401ac..eed9d6c5c6 100644
---- a/tests/gateway/test_api_server.py
-+++ b/tests/gateway/test_api_server.py
-@@ -1690,6 +1690,203 @@ class TestResponsesEndpoint:
-             assert data["output"][0]["content"][0]["text"] != f"provider auth failed OPENAI_API_KEY={raw_secret}"
- 
- 
-+class TestResponsesSessionIdHeader:
-+    """X-Hermes-Session-Id on /v1/responses: header-based session continuation.
-+
-+    The responses endpoint previously had no header-based continuation (only
-+    chat/completions had it), so stateless clients (Open WebUI Responses mode)
-+    lost all tool-call history between turns: each request minted a fresh
-+    session and the model only saw the user/assistant text the client
-+    re-sent. The header loads the canonical transcript (including tool calls)
-+    from SessionDB.
-+    """
-+
-+    @pytest.mark.asyncio
-+    async def test_provided_session_id_loads_history_from_db(self, auth_adapter):
-+        """History comes from SessionDB (full transcript, tool calls included),
-+        not from the request body; the turn binds to the provided session."""
-+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-+        db_history = [
-+            {"role": "user", "content": "stored message 1"},
-+            {
-+                "role": "assistant",
-+                "tool_calls": [
-+                    {
-+                        "id": "call_db",
-+                        "type": "function",
-+                        "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
-+                    }
-+                ],
-+            },
-+            {"role": "tool", "tool_call_id": "call_db", "content": "file contents"},
-+            {"role": "assistant", "content": "stored reply 1"},
-+        ]
-+        mock_db = MagicMock()
-+        mock_db.get_messages_as_conversation.return_value = db_history
-+        mock_db.resolve_resume_session_id.side_effect = lambda sid: sid
-+        auth_adapter._session_db = mock_db
-+        app = _create_app(auth_adapter)
-+        async with TestClient(TestServer(app)) as cli:
-+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-+                resp = await cli.post(
-+                    "/v1/responses",
-+                    headers={"X-Hermes-Session-Id": "existing-session", "Authorization": "Bearer sk-secret"},
-+                    # Body carries a different (text-only) history — must be ignored.
-+                    json={
-+                        "model": "hermes-agent",
-+                        "conversation_history": [
-+                            {"role": "user", "content": "old msg from client"},
-+                            {"role": "assistant", "content": "old reply from client"},
-+                        ],
-+                        "input": "new question",
-+                    },
-+                )
-+
-+        assert resp.status == 200
-+        call_kwargs = mock_run.call_args.kwargs
-+        # History must come from the DB (tool calls intact), not the body.
-+        assert call_kwargs["conversation_history"] == db_history
-+        assert call_kwargs["user_message"] == "new question"
-+        assert call_kwargs["session_id"] == "existing-session"
-+
-+    @pytest.mark.asyncio
-+    async def test_provided_session_id_resolves_rotation_tip(self, auth_adapter):
-+        """A pre-rotation id adopts the live continuation tip (#98619/#13437)."""
-+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-+        mock_db = MagicMock()
-+        mock_db.get_messages_as_conversation.return_value = []
-+        mock_db.resolve_resume_session_id.side_effect = lambda sid: "child-session-tip"
-+        auth_adapter._session_db = mock_db
-+        app = _create_app(auth_adapter)
-+        async with TestClient(TestServer(app)) as cli:
-+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-+                resp = await cli.post(
-+                    "/v1/responses",
-+                    headers={"X-Hermes-Session-Id": "parent-session", "Authorization": "Bearer sk-secret"},
-+                    json={"model": "hermes-agent", "input": "continue"},
-+                )
-+
-+        assert resp.status == 200
-+        assert mock_run.call_args.kwargs["session_id"] == "child-session-tip"
-+        mock_db.get_messages_as_conversation.assert_called_once_with("child-session-tip")
-+
-+    @pytest.mark.asyncio
-+    async def test_session_id_requires_api_key(self, adapter):
-+        """No API key configured → 403 (ids would be guessable otherwise)."""
-+        app = _create_app(adapter)
-+        async with TestClient(TestServer(app)) as cli:
-+            resp = await cli.post(
-+                "/v1/responses",
-+                headers={"X-Hermes-Session-Id": "some-session"},
-+                json={"model": "hermes-agent", "input": "hi"},
-+            )
-+        assert resp.status == 403
-+
-+    @pytest.mark.asyncio
-+    async def test_session_id_path_unsafe_rejected(self, auth_adapter):
-+        app = _create_app(auth_adapter)
-+        async with TestClient(TestServer(app)) as cli:
-+            resp = await cli.post(
-+                "/v1/responses",
-+                headers={"X-Hermes-Session-Id": "../etc/passwd", "Authorization": "Bearer sk-secret"},
-+                json={"model": "hermes-agent", "input": "hi"},
-+            )
-+        assert resp.status == 400
-+
-+    @pytest.mark.asyncio
-+    async def test_no_header_behavior_unchanged(self, adapter):
-+        """Regression guard: without the header, a fresh session is minted and
-+        history comes from the body only (today's behavior)."""
-+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-+        app = _create_app(adapter)
-+        async with TestClient(TestServer(app)) as cli:
-+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-+                resp = await cli.post(
-+                    "/v1/responses",
-+                    json={
-+                        "model": "hermes-agent",
-+                        "conversation_history": [
-+                            {"role": "user", "content": "prior"},
-+                            {"role": "assistant", "content": "prior reply"},
-+                        ],
-+                        "input": "new question",
-+                    },
-+                )
-+
-+        assert resp.status == 200
-+        call_kwargs = mock_run.call_args.kwargs
-+        assert call_kwargs["conversation_history"] == [
-+            {"role": "user", "content": "prior"},
-+            {"role": "assistant", "content": "prior reply"},
-+        ]
-+        # Fresh uuid session — not bound to anything client-declared.
-+        assert call_kwargs["session_id"]
-+        assert call_kwargs["session_id"] != "prior"
-+
-+    @pytest.mark.asyncio
-+    async def test_marker_stripped_from_input_before_llm(self, adapter):
-+        """REGRESSION: the sid marker (OWUI output_text format) must never
-+        reach the model. The LLM saw the pattern once and hallucinated fresh
-+        marker instances into its output, which persisted to SessionDB."""
-+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-+        app = _create_app(adapter)
-+        marker = "<!--hermes-sid:90b24e5c-0003-439b-a519-426727d50626-->"
-+        async with TestClient(TestServer(app)) as cli:
-+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-+                resp = await cli.post(
-+                    "/v1/responses",
-+                    json={
-+                        "model": "hermes-agent",
-+                        "input": [
-+                            {
-+                                "type": "message",
-+                                "role": "assistant",
-+                                "content": [{"type": "output_text", "text": f"old answer {marker}"}],
-+                            },
-+                            {"type": "message", "role": "user", "content": "new question"},
-+                        ],
-+                    },
-+                )
-+
-+        assert resp.status == 200
-+        call_kwargs = mock_run.call_args.kwargs
-+        history = call_kwargs["conversation_history"]
-+        user_msg = call_kwargs["user_message"]
-+        assert marker not in str(history), f"marker leaked into history: {history}"
-+        assert marker not in str(user_msg)
-+        # The text itself survives; only the marker is removed.
-+        assert history[0]["content"] == "old answer "
-+
-+    @pytest.mark.asyncio
-+    async def test_marker_stripped_from_explicit_history(self, adapter):
-+        """Markers in an explicit conversation_history are stripped too."""
-+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-+        app = _create_app(adapter)
-+        marker = "<!--hermes-sid:0a0e2c74-6e8a-40d3-a0a2-fffaa0de460f-->"
-+        async with TestClient(TestServer(app)) as cli:
-+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-+                resp = await cli.post(
-+                    "/v1/responses",
-+                    json={
-+                        "model": "hermes-agent",
-+                        "conversation_history": [
-+                            {"role": "assistant", "content": f"answer {marker}"},
-+                        ],
-+                        "input": "next",
-+                    },
-+                )
-+
-+        assert resp.status == 200
-+        call_kwargs = mock_run.call_args.kwargs
-+        assert marker not in str(call_kwargs["conversation_history"])
-+        assert call_kwargs["conversation_history"][0]["content"] == "answer "
-+
-+
- class TestResponsesStreaming:
- 
- 
