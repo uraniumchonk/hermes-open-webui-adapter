@@ -1,5 +1,21 @@
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index a1fd8a0eee0..f10de12129a 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1681,6 +1681,11 @@ DEFAULT_CONFIG = {
+         "cron_mode": "deny",
+         "single_query_mode": "deny",
+         "unattended_mode": "deny",
++        # When True, on unattended platforms (api_server / meowchat / OWUI — no /approve channel)
++        # a guardian DENY/ESCALATE verdict is final: fail closed immediately instead of parking in
++        # the human prompt and waiting out `timeout` (300s). See tools/approval_context.py
++        # (_get_smart_final_on_unattended). Default False; only profiles with a guardian (coder) set it.
++        "smart_final_on_unattended": False,
+         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
+         # commands touching /etc".
+         "smart_policy": "",
 diff --git a/tools/approval.py b/tools/approval.py
-index 21dc9e6706..a675253df2 100644
+index f3400a8a9a7..2f7ca1ff9bc 100644
 --- a/tools/approval.py
 +++ b/tools/approval.py
 @@ -23,7 +23,7 @@ from utils import env_var_enabled, is_truthy_value
@@ -10,8 +26,8 @@ index 21dc9e6706..a675253df2 100644
 +    _get_session_platform, _get_smart_final_on_unattended, _is_cron_approval_context,
      _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
      _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
-     _tirith_fail_open, get_current_session_key,
-@@ -760,7 +760,7 @@ _ACTION_GATE = _GateSpec(
+     get_current_session_key,
+@@ -740,7 +740,7 @@ _ACTION_GATE = _GateSpec(
  
  def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                  pattern_keys: list[str], session_key: str, *,
@@ -20,7 +36,7 @@ index 21dc9e6706..a675253df2 100644
      """Guardian-LLM step -> ``(result, smart_denied_for_owner)``: a result ends the gate;
      ``smart_denied_for_owner`` means an interactive owner may still override the DENY for this
      one operation (once/deny only, nothing persists).
-@@ -769,12 +769,37 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
+@@ -749,12 +749,37 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
      command suppress review of later commands in the same broad detector category. A DENY
      counts toward the denial breaker even when an owner may override it. ESCALATE follows the
      normal, potentially persistent manual behavior.
@@ -58,7 +74,7 @@ index 21dc9e6706..a675253df2 100644
      if verdict != "deny":
          return None, False
      _record_denial(session_key)
-@@ -808,7 +833,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
+@@ -785,7 +810,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
      smart_denied = False
      if smart:
          result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
@@ -68,7 +84,7 @@ index 21dc9e6706..a675253df2 100644
          if result is not None:
              return result
      pending_body = pending_body() if pending_body else None
-@@ -1039,16 +1065,72 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False)
+@@ -1033,16 +1059,72 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False)
  
  
  def _user_deny_block(command: str) -> dict | None:
@@ -145,10 +161,10 @@ index 21dc9e6706..a675253df2 100644
      """Unconditional floors, BEFORE yolo / mode=off / cron approve-mode so no
      session-level setting can bypass them: hardline catastrophic commands,
 diff --git a/tools/approval_context.py b/tools/approval_context.py
-index f71381c33c..b2412151c1 100644
+index 977ba44449b..9d5c8e6c15f 100644
 --- a/tools/approval_context.py
 +++ b/tools/approval_context.py
-@@ -306,6 +306,27 @@ def _get_unattended_approval_mode() -> str:
+@@ -322,6 +322,27 @@ def _get_unattended_approval_mode() -> str:
      return _binary_approval_mode("unattended_mode")
  
  
@@ -173,6 +189,6 @@ index f71381c33c..b2412151c1 100644
 +        return False
 +
 +
- def _tirith_fail_open() -> bool:
-     """``security.tirith_fail_open`` (default True; True when config is unreadable).
-     False means the operator opted into fail-closed: an un-importable scanner
+ def _get_approval_transport_config() -> tuple[str, str | None]:
+     """Return explicitly selected transport and fail-closed fallback mode."""
+     try:

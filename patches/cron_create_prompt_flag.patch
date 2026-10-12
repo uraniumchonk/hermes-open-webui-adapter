@@ -1,8 +1,8 @@
 diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
-index f1403a4028..7429101c58 100644
+index 6e134b35cf4..215ce537d53 100644
 --- a/hermes_cli/cron.py
 +++ b/hermes_cli/cron.py
-@@ -744,8 +744,13 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
+@@ -787,8 +787,13 @@ def _print_job_details(job_data: dict[str, Any]) -> None:
  def cron_create(args):
      # The gateway-lifecycle guard lives in cron.jobs.create_job (every creation path); a block
      # surfaces as result["error"].
@@ -18,7 +18,7 @@ index f1403a4028..7429101c58 100644
          skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
          no_agent=getattr(args, "no_agent", False) or None,
 diff --git a/hermes_cli/subcommands/cron.py b/hermes_cli/subcommands/cron.py
-index ae6115293a..36b4311bfc 100644
+index ae6115293a0..36b4311bfca 100644
 --- a/hermes_cli/subcommands/cron.py
 +++ b/hermes_cli/subcommands/cron.py
 @@ -25,6 +25,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:

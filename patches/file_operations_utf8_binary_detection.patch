@@ -1,5 +1,5 @@
 diff --git a/tools/file_operations.py b/tools/file_operations.py
-index de21a872b9..78825f085d 100644
+index 1a93283f8c9..0634e6ce88f 100644
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
 @@ -474,8 +474,22 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):

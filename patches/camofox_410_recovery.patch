@@ -1,9 +1,9 @@
 diff --git a/tools/browser_camofox.py b/tools/browser_camofox.py
-index 8618a595c6..da50d32d21 100644
+index 0aa3ac198ad..5ab0b4de091 100644
 --- a/tools/browser_camofox.py
 +++ b/tools/browser_camofox.py
-@@ -380,17 +380,19 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
- def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
+@@ -380,17 +380,19 @@ def _fetch_snapshot(session: dict[str, Any]) -> tuple[str, int]:
+ def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[dict[str, Any], dict]:
      """Open ``browser_url`` in the task's tab (creating it if missing) and return
      ``(session, navigate_response)``. A 404 on the existing tab means the server
 -    garbage-collected it — recreate instead of failing."""
@@ -28,7 +28,7 @@ index 8618a595c6..da50d32d21 100644
  
 @@ -455,12 +457,21 @@ def _require_tab(task_id: Optional[str], action: Optional[str] = None) -> tuple[
  
- def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[Dict[str, Any]], str]) -> str:
+ def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[dict[str, Any]], str]) -> str:
      """Require a tab (+ private-page guard when ``guard_action`` is set), then run ``body(session)``;
 -    any exception becomes a ``tool_error``."""
 +    any exception becomes a ``tool_error``. A 404 (tab GC'd) or 410 (browser restarted)

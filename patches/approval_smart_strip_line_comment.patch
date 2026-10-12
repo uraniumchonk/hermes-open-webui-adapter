@@ -1,5 +1,5 @@
 diff --git a/tools/approval_smart.py b/tools/approval_smart.py
-index 61a27fb4a0..77aff98b46 100644
+index 61a27fb4a01..77aff98b463 100644
 --- a/tools/approval_smart.py
 +++ b/tools/approval_smart.py
 @@ -40,8 +40,8 @@ def _strip_line_comment(line: str) -> str:

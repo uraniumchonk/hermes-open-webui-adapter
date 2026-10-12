@@ -1,5 +1,5 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index dcae2f9d94..e9d40bca5d 100644
+index 0c3a134381c..a2c85b47e04 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
 @@ -25,6 +25,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
@@ -127,7 +127,7 @@ index dcae2f9d94..e9d40bca5d 100644
          # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
          # (Anthropic rejects images there, OpenAI text models ignore them).
          system_prompt = None
--        conversation_messages: List[Dict[str, str]] = []
+-        conversation_messages: list[dict[str, str]] = []
 +        # Any — assistant may carry tool_calls; tool messages carry tool_call_id.
 +        # Dropping those fields (old code only kept role+content for user/assistant)
 +        # silently destroyed OpenAI-native tool history from hermes_tool_filter

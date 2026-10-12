@@ -1,5 +1,5 @@
 diff --git a/plugins/web/exa/provider.py b/plugins/web/exa/provider.py
-index 378e6110bb..1dadb360d8 100644
+index 90caafadae1..b0192e8a474 100644
 --- a/plugins/web/exa/provider.py
 +++ b/plugins/web/exa/provider.py
 @@ -29,6 +29,43 @@ def _get_exa_client() -> Any:
