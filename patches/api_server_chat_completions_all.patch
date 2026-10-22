@@ -1,5 +1,5 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 0c3a134381c..a2c85b47e04 100644
+index 0c3a134381c..ef5bfae4e72 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
 @@ -25,6 +25,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
@@ -123,7 +123,21 @@ index 0c3a134381c..a2c85b47e04 100644
  async def _iter_stream_items(stream_q, agent_task, response):
      """Yield agent stream items until EOS, writing SSE keepalives while idle.
  
-@@ -658,21 +802,60 @@ class OpenAICompatRoutesMixin:
+@@ -404,8 +518,11 @@ class _ResponsesStream:
+         await self.write_event("response.output_item.done", {
+             "type": "response.output_item.done", "output_index": pending["output_index"],
+             "item": done_item})
+-        result = payload.get("result", "")
+-        result_str = result if isinstance(result, str) else json.dumps(result)
++        # Wire copy only (UI tool card / filter): vision_analyze's native envelope carries
++        # multi-MB base64 that overflows proxy readline limits and drops the stream mid-tool,
++        # so OWUI sees a function_call with no output and tries to run it client-side.
++        # The model already got the full result inside the agent loop.
++        result_str = _redact_progress_result(payload.get("result", ""))
+         output_parts = [{"type": "input_text", "text": result_str}]
+         output_item = {"id": f"fco_{uuid.uuid4().hex[:24]}", "type": "function_call_output",
+                        "call_id": pending["call_id"], "output": output_parts, "status": "completed"}
+@@ -658,21 +775,60 @@ class OpenAICompatRoutesMixin:
          # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
          # (Anthropic rejects images there, OpenAI text models ignore them).
          system_prompt = None
@@ -188,7 +202,7 @@ index 0c3a134381c..a2c85b47e04 100644
          if not _content_has_visible_payload(user_message):
              return _invalid_request("No user message found in messages")
  
-@@ -757,14 +940,38 @@ class OpenAICompatRoutesMixin:
+@@ -757,14 +913,38 @@ class OpenAICompatRoutesMixin:
                  label = build_tool_preview(function_name, function_args) or function_name
                  _stream_q.put_threadsafe(("__tool_progress__", {
                      "tool": function_name, "emoji": get_tool_emoji(function_name), "label": label,
@@ -229,3 +243,12 @@ index 0c3a134381c..a2c85b47e04 100644
  
              # tool_progress_callback deliberately NOT wired: it would duplicate the structured
              # start/complete callbacks (which carry the tool_call id).
+@@ -1329,7 +1509,7 @@ class OpenAICompatRoutesMixin:
+                 items.append({
+                     "id": f"fco_{uuid.uuid4().hex[:24]}", "type": "function_call_output",
+                     "status": "completed", "call_id": msg.get("tool_call_id", ""),
+-                    "output": msg.get("content", "")})
++                    "output": _redact_progress_result(msg.get("content", ""))})
+         final = result.get("final_response", "") or _redact_api_error_text(
+             result.get("error", "(No response generated)"))
+         items.append(_message_item(final))
