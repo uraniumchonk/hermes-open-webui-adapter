@@ -1,8 +1,8 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 0c3a134381c..ef5bfae4e72 100644
+index 05e2d7b648..1a3660713a 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
-@@ -25,6 +25,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
+@@ -26,6 +26,120 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
  # Logger parity with the origin module (moved log records keep their name).
  logger = logging.getLogger("gateway.platforms.api_server")
  
@@ -123,7 +123,7 @@ index 0c3a134381c..ef5bfae4e72 100644
  async def _iter_stream_items(stream_q, agent_task, response):
      """Yield agent stream items until EOS, writing SSE keepalives while idle.
  
-@@ -404,8 +518,11 @@ class _ResponsesStream:
+@@ -495,8 +609,11 @@ class _ResponsesStream:
          await self.write_event("response.output_item.done", {
              "type": "response.output_item.done", "output_index": pending["output_index"],
              "item": done_item})
@@ -135,26 +135,31 @@ index 0c3a134381c..ef5bfae4e72 100644
 +        # The model already got the full result inside the agent loop.
 +        result_str = _redact_progress_result(payload.get("result", ""))
          output_parts = [{"type": "input_text", "text": result_str}]
-         output_item = {"id": f"fco_{uuid.uuid4().hex[:24]}", "type": "function_call_output",
+         output_item = {"id": self._item_id('function_call_output', call_id=call_id), "type": "function_call_output",
                         "call_id": pending["call_id"], "output": output_parts, "status": "completed"}
-@@ -658,21 +775,60 @@ class OpenAICompatRoutesMixin:
-         # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
-         # (Anthropic rejects images there, OpenAI text models ignore them).
-         system_prompt = None
--        conversation_messages: list[dict[str, str]] = []
+@@ -842,12 +996,67 @@ class OpenAICompatRoutesMixin:
+         if not messages or not isinstance(messages, list):
+             return _invalid_request("Missing or invalid 'messages' field")
+         stream = _coerce_request_bool(body.get("stream"), default=False)
++        from gateway.platforms.api_server import (
++            _normalize_chat_content, _normalize_multimodal_content, _multimodal_validation_error)
++
++        # System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
++        # (Anthropic rejects images there, OpenAI text models ignore them).
++        system_prompt = None
 +        # Any — assistant may carry tool_calls; tool messages carry tool_call_id.
 +        # Dropping those fields (old code only kept role+content for user/assistant)
 +        # silently destroyed OpenAI-native tool history from hermes_tool_filter
 +        # structured conversion, so the model only saw plain assistant prose.
 +        conversation_messages: List[Dict[str, Any]] = []
-         for idx, msg in enumerate(messages):
++        for idx, msg in enumerate(messages):
 +            if not isinstance(msg, dict):
 +                continue
-             role = msg.get("role", "")
-             raw_content = msg.get("content", "")
-             if role == "system":
-                 content = _normalize_chat_content(raw_content)
-                 system_prompt = content if system_prompt is None else system_prompt + "\n" + content
++            role = msg.get("role", "")
++            raw_content = msg.get("content", "")
++            if role == "system":
++                content = _normalize_chat_content(raw_content)
++                system_prompt = content if system_prompt is None else system_prompt + "\n" + content
 +            elif role == "tool":
 +                # OpenAI-native tool result. Must survive into agent history so
 +                # chat_template renders the tool special tokens.
@@ -171,14 +176,11 @@ index 0c3a134381c..ef5bfae4e72 100644
 +                if msg.get("name"):
 +                    entry["name"] = str(msg["name"])
 +                conversation_messages.append(entry)
-             elif role in {"user", "assistant"}:
-                 try:
-                     content = _normalize_multimodal_content(raw_content)
-                 except ValueError as exc:
-                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
--                conversation_messages.append({"role": role, "content": content})
--        user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
--        history = conversation_messages[:-1]
++            elif role in {"user", "assistant"}:
++                try:
++                    content = _normalize_multimodal_content(raw_content)
++                except ValueError as exc:
++                    return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
 +                entry = {"role": role, "content": content}
 +                # Preserve assistant.tool_calls (structured history from
 +                # hermes_tool_filter). Without this the tool results have no
@@ -199,10 +201,16 @@ index 0c3a134381c..ef5bfae4e72 100644
 +        if last_user_idx is not None:
 +            user_message = conversation_messages[last_user_idx].get("content", "")
 +            history = conversation_messages[:last_user_idx]
+ 
+-        system_prompt, conversation_messages, messages_err = _parse_chat_messages(messages)
+-        if messages_err is not None:
+-            return messages_err
+-        user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
+-        history = conversation_messages[:-1]
          if not _content_has_visible_payload(user_message):
              return _invalid_request("No user message found in messages")
  
-@@ -757,14 +913,38 @@ class OpenAICompatRoutesMixin:
+@@ -936,14 +1145,38 @@ class OpenAICompatRoutesMixin:
                  label = build_tool_preview(function_name, function_args) or function_name
                  _stream_q.put_threadsafe(("__tool_progress__", {
                      "tool": function_name, "emoji": get_tool_emoji(function_name), "label": label,
@@ -243,7 +251,15 @@ index 0c3a134381c..ef5bfae4e72 100644
  
              # tool_progress_callback deliberately NOT wired: it would duplicate the structured
              # start/complete callbacks (which carry the tool_call id).
-@@ -1329,7 +1509,7 @@ class OpenAICompatRoutesMixin:
+@@ -1372,6 +1627,7 @@ class OpenAICompatRoutesMixin:
+         response_model = body.get('model', self._model_name)
+         if durable_key:
+             response_model = self._current_response_store().request_model(durable_key[0], response_model)
++
+         if stream:
+             _stream_q = ThreadSafeAsyncQueue()
+ 
+@@ -1580,7 +1836,7 @@ class OpenAICompatRoutesMixin:
                  items.append({
                      "id": f"fco_{uuid.uuid4().hex[:24]}", "type": "function_call_output",
                      "status": "completed", "call_id": msg.get("tool_call_id", ""),

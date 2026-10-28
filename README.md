@@ -106,13 +106,12 @@ sanitization_result_max_length: 20000
 Gateway `.env`: `API_SERVER_ENABLED=true`, `API_SERVER_PORT` matches the
 upstream key, `API_SERVER_KEY=...`.
 
-### Optional: local Hermes patches
+### Optional: Gateway patches
 
-The proxy works without modifying Hermes.
-`patches/` holds **optional personal patches** used on some setups for a better
-experience (e.g. richer tool-progress payloads, allowing Markdown on
-api_server, keeping `role=tool` through Chat Completions, the responses
-session-id header). They are **not required** to run this project.
+The proxy works without modifying Hermes. Three features need the Gateway to
+emit more than upstream does — tool cards with arguments/result, Markdown on
+api_server, and responses session continuity. `patches/` has **reference
+snapshots** of those three Gateway changes; see `patches/README.md`.
 
 If you use them, re-apply after `hermes update`. Line numbers drift — treat the
 files as references, not guaranteed clean applies on every Hermes version.
@@ -122,7 +121,7 @@ files as references, not guaranteed clean applies on every Hermes version.
 ## For AI agents
 
 This repo ships an **`AGENTS.md`** — a complete operating guide: architecture,
-file map, the 8 Hermes patches (apply order + grep verification + re-export),
+file map, the 3 reference Gateway patches (apply order + grep verification),
 two-machine deployment, and the standing maintenance your human needs to know.
 
 Hand the repo straight to your agent (Hermes, Claude Code, Codex, …):
@@ -149,7 +148,7 @@ tool_history_structured.py   # structured sanitizer (native tool roles)
 special_tags.py              # neutralize special tags in tool results
 special_tags.json            # tag list (data)
 extract_tags.py              # one-off tag generator (re-run after model/OWUI upgrade)
-patches/                     # optional personal Hermes patches (see above)
+patches/                     # reference Gateway patches (see patches/README.md)
 config.yaml                  # sample config
 requirements.txt
 ```

@@ -1,9 +1,9 @@
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index 9271b1b0a73..1e4f90d2edc 100644
+index 68375dea3d..068780afc4 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
-@@ -820,9 +820,9 @@ PLATFORM_HINTS = {
-         "draw sticker-like PNGs and send them as images, and bare Unicode emoji is not a substitute."
+@@ -713,9 +713,9 @@ PLATFORM_HINTS = {
+         "file, not with prose."
      ),
      "api_server": (
 -        "You're responding through an API server. The rendering layer is unknown — assume plain text. No markdown "

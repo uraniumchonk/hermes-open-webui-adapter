@@ -1,9 +1,57 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 0c3a134381c..a2c85b47e04 100644
+index 05e2d7b648..1a3660713a 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
-@@ -548,6 +662,36 @@ class _ResponsesStream:
-         await self.write_event("response.failed", {"type": "response.failed", "response": env})
+@@ -694,16 +811,20 @@ def _parse_chat_messages(messages: list[Any]) -> tuple:
+ 
+ 
+ def _parse_responses_input(raw_input: Any) -> tuple:
+-    """Responses ``input`` (string or item array) -> ``(input_messages, error_response_or_None)``."""
++    """Responses ``input`` (string or item array) -> ``(input_messages, error_response_or_None)``.
++
++    Strips <!--hermes-sid:...--> session markers so they never reach the model
++    (hermes_tool_filter embeds them for stateless clients; the LLM hallucinates
++    fresh instances when it sees the pattern)."""
+     from gateway.platforms.api_server import (
+         _error_response, _multimodal_validation_error, _normalize_multimodal_content)
+     input_messages: list[dict[str, Any]] = []
+     if isinstance(raw_input, str):
+-        input_messages = [{"role": "user", "content": raw_input}]
++        input_messages = [{"role": "user", "content": _strip_hermes_sid_markers(raw_input)}]
+     elif isinstance(raw_input, list):
+         for idx, item in enumerate(raw_input):
+             if isinstance(item, str):
+-                input_messages.append({"role": "user", "content": item})
++                input_messages.append({"role": "user", "content": _strip_hermes_sid_markers(item)})
+             elif _is_reasoning_input_item(item):
+                 continue
+             elif isinstance(item, dict):
+@@ -711,14 +832,16 @@ def _parse_responses_input(raw_input: Any) -> tuple:
+                     content = _normalize_multimodal_content(item.get("content", ""))
+                 except ValueError as exc:
+                     return None, _multimodal_validation_error(exc, param=f"input[{idx}].content")
+-                input_messages.append({"role": item.get("role", "user"), "content": content})
++                input_messages.append({"role": item.get("role", "user"), "content": _strip_hermes_sid_markers(content)})
+     else:
+         return None, _error_response("'input' must be a string or array", 400)
+     return input_messages, None
+ 
+ 
+ def _parse_conversation_history(raw_history: Any) -> tuple:
+-    """Explicit Responses ``conversation_history`` -> ``(history, error_response_or_None)``."""
++    """Explicit Responses ``conversation_history`` -> ``(history, error_response_or_None)``.
++
++    Strips <!--hermes-sid:...--> session markers (see _parse_responses_input)."""
+     from gateway.platforms.api_server import (
+         _error_response, _multimodal_validation_error, _normalize_multimodal_content)
+     conversation_history: list[dict[str, Any]] = []
+@@ -733,10 +856,41 @@ def _parse_conversation_history(raw_history: Any) -> tuple:
+             entry_content = _normalize_multimodal_content(entry["content"])
+         except ValueError as exc:
+             return None, _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+-        conversation_history.append({"role": str(entry["role"]), "content": entry_content})
++        conversation_history.append({"role": str(entry["role"]), "content": _strip_hermes_sid_markers(entry_content)})
+     return conversation_history, None
  
  
 +# Session marker for the /v1/responses path: hermes_tool_filter embeds the
@@ -36,10 +84,11 @@ index 0c3a134381c..a2c85b47e04 100644
 +    return content
 +
 +
++
  class OpenAICompatRoutesMixin:
      """/v1/chat/completions and /v1/responses handlers + SSE writers."""
  
-@@ -1045,6 +1252,27 @@ class OpenAICompatRoutesMixin:
+@@ -1336,6 +1569,27 @@ class OpenAICompatRoutesMixin:
          gateway_session_key, key_err = self._parse_session_key_header(request)
          if key_err is not None:
              return key_err
@@ -67,99 +116,79 @@ index 0c3a134381c..a2c85b47e04 100644
          try:
              body = await request.json()
          except Exception:
-@@ -1066,11 +1294,11 @@ class OpenAICompatRoutesMixin:
+@@ -1358,7 +1612,8 @@ class OpenAICompatRoutesMixin:
+         from hermes_state_runtime import RuntimeStoreError
+         try:
+             context, error = await prepare_context(
+-                self, request, body, gateway_session_key, durable_key, idempotency_scope, idempotency_key)
++                self, request, body, gateway_session_key, durable_key, idempotency_scope, idempotency_key,
++                provided_session_id=provided_session_id)
+         except RuntimeStoreError as exc:
+             from gateway.platforms.api_server import _openai_error
+             from gateway.platforms.api_server_authority_runs import store_error_response
+diff --git a/gateway/platforms/api_server_response_admissions.py b/gateway/platforms/api_server_response_admissions.py
+index 6ed96e611b..eea32b379e 100644
+--- a/gateway/platforms/api_server_response_admissions.py
++++ b/gateway/platforms/api_server_response_admissions.py
+@@ -139,7 +139,8 @@ async def _bind_successor(adapter, session_id, run_kwargs):
+             raise RuntimeStoreError('storage_unavailable') from exc
  
-         input_messages: list[dict[str, Any]] = []
-         if isinstance(raw_input, str):
--            input_messages = [{"role": "user", "content": raw_input}]
-+            input_messages = [{"role": "user", "content": _strip_hermes_sid_markers(raw_input)}]
-         elif isinstance(raw_input, list):
-             for idx, item in enumerate(raw_input):
-                 if isinstance(item, str):
--                    input_messages.append({"role": "user", "content": item})
-+                    input_messages.append({"role": "user", "content": _strip_hermes_sid_markers(item)})
-                 elif _is_reasoning_input_item(item):
-                     continue
-                 elif isinstance(item, dict):
-@@ -1078,7 +1306,7 @@ class OpenAICompatRoutesMixin:
-                         content = _normalize_multimodal_content(item.get("content", ""))
-                     except ValueError as exc:
-                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
--                    input_messages.append({"role": item.get("role", "user"), "content": content})
-+                    input_messages.append({"role": item.get("role", "user"), "content": _strip_hermes_sid_markers(content)})
-         else:
-             return _error_response("'input' must be a string or array", 400)
  
-@@ -1097,11 +1325,32 @@ class OpenAICompatRoutesMixin:
-                     entry_content = _normalize_multimodal_content(entry["content"])
-                 except ValueError as exc:
-                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
--                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
-+                conversation_history.append({"role": str(entry["role"]), "content": _strip_hermes_sid_markers(entry_content)})
-             if previous_response_id:
-                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
-         stored_session_id = None
--        if not conversation_history and previous_response_id:
-+        if provided_session_id:
-+            # Header continuation: the SessionDB row is canonical — load the
-+            # full transcript (including tool calls) from it, overriding any
-+            # body conversation_history (same semantics as the chat/completions
-+            # header path: "history comes from state.db, not the body"). An
-+            # empty/missing row falls back to the body history (or empty).
-+            try:
-+                from gateway.platforms.api_server_runs import _resolve_live_session_id
-+                # #98619/#13437: a client-addressed id from before a compression
-+                # rotation must adopt the live continuation tip (same canonical
-+                # resolution the chat/completions header path uses); fails open.
-+                stored_session_id = await _resolve_live_session_id(self, provided_session_id)
-+                db = await self._ensure_session_db_async()
-+                if db is not None:
-+                    db_history = await asyncio.to_thread(
-+                        db.get_messages_as_conversation, stored_session_id)
-+                    if db_history:
-+                        conversation_history = db_history
-+            except Exception as e:
-+                logger.warning("Failed to load session history for %s: %s", provided_session_id, e)
-+                stored_session_id = provided_session_id
-+        elif not conversation_history and previous_response_id:
-             stored = self._current_response_store().get(previous_response_id)
-             if stored is None:
-                 return _error_response(f"Previous response not found: {previous_response_id}", 404)
-@@ -1117,9 +1366,10 @@ class OpenAICompatRoutesMixin:
-         if body.get("truncation") == "auto":
-             conversation_history = _auto_truncate_response_history(conversation_history)
- 
--        # Session precedence: previous_response_id chain > declared X-Hermes-Session-Key > fresh
--        # id. Binding the declared key follows the same precedence: a chain-selected session must
--        # not have its routing key rewritten to this header.
-+        # Session precedence: X-Hermes-Session-Id > previous_response_id chain >
-+        # declared X-Hermes-Session-Key > fresh id. Binding the declared key
-+        # follows the same precedence: a chain-selected session must not have
-+        # its routing key rewritten to this header.
-         _declared_selected = not stored_session_id and bool(gateway_session_key)
-         session_id = (
-             stored_session_id
-@@ -1131,6 +1381,18 @@ class OpenAICompatRoutesMixin:
-             model_alias=body.get("model"))
-         if selection_error is not None:
-             return selection_error
-+        # Final guard: strip sid markers from every history source (body,
-+        # SessionDB, previous_response_id store) so the model never sees the
-+        # pattern — it hallucinates fresh instances when it does. Only touch
-+        # messages that carry str/list content (tool-call messages have no
-+        # content key — adding one would change their shape).
-+        conversation_history = [
-+            {**m, "content": _strip_hermes_sid_markers(m["content"])}
-+            if "content" in m and isinstance(m.get("content"), (str, list))
-+            else m
-+            for m in conversation_history
-+        ]
-+        user_message = _strip_hermes_sid_markers(user_message)
-         run_kwargs = dict(
-             user_message=user_message, conversation_history=conversation_history,
-             ephemeral_system_prompt=instructions, session_id=session_id,
+-async def prepare_context(adapter, request, body, gateway_session_key, durable_key, scope, key):
++async def prepare_context(adapter, request, body, gateway_session_key, durable_key, scope, key,
++                          provided_session_id=None):
+     """Validate first-time requests; exact retries use the accepted payload and result only."""
+     import asyncio
+     from gateway.platforms.api_server import (
+@@ -163,7 +164,25 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
+             return None, error
+     stored_session_id = chain_root = None
+     instructions = body.get('instructions')
+-    if not history and previous:
++    if provided_session_id:
++        # SessionDB continuation (hermes_tool_filter / Open WebUI): the
++        # X-Hermes-Session-Id header is canonical — load the full transcript
++        # (including tool calls) from SessionDB, overriding any body
++        # conversation_history (same semantics as the chat/completions header
++        # path: "history comes from state.db, not the body"). An empty/missing
++        # row falls back to the body history (or empty).
++        from gateway.platforms.api_server_runs import _resolve_live_session_id
++        try:
++            stored_session_id = await _resolve_live_session_id(adapter, provided_session_id)
++            db = await adapter._ensure_session_db_async()
++            if db is not None:
++                db_history = await asyncio.to_thread(db.get_messages_as_conversation, stored_session_id)
++                if db_history:
++                    history = db_history
++        except Exception as e:
++            logging.getLogger(__name__).warning('Failed to load session history for %s: %s', provided_session_id, e)
++            stored_session_id = provided_session_id
++    elif not history and previous:
+         stored = adapter._current_response_store().get(previous)
+         if stored is None:
+             return None, _error_response(f'Previous response not found: {previous}', 404)
+@@ -181,6 +200,19 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
+         return None, _error_response('No user message found in input', 400)
+     if body.get('truncation') == 'auto':
+         history = _auto_truncate_response_history(history)
++    # Final guard: strip sid markers from every history source (body, SessionDB,
++    # previous_response_id store) so the model never sees the pattern — it
++    # hallucinates fresh instances when it does. Only touch messages that carry
++    # str/list content (tool-call messages have no content key — adding one
++    # would change their shape).
++    from gateway.platforms.api_server_openai_routes import _strip_hermes_sid_markers
++    history = [
++        {**m, 'content': _strip_hermes_sid_markers(m['content'])}
++        if 'content' in m and isinstance(m.get('content'), (str, list))
++        else m
++        for m in history
++    ]
++    user_message = _strip_hermes_sid_markers(user_message)
+     declared_selected = not stored_session_id and bool(gateway_session_key)
+     session_id = stored_session_id or await asyncio.to_thread(
+         adapter._declared_conversation_session, gateway_session_key) or str(uuid.uuid4())
 diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
-index 11e404bbf9a..4dd456cc45a 100644
+index 64f601650c..3e05477faf 100644
 --- a/tests/gateway/test_api_server.py
 +++ b/tests/gateway/test_api_server.py
 @@ -1715,6 +1715,203 @@ class TestResponsesEndpoint:
@@ -366,4 +395,3 @@ index 11e404bbf9a..4dd456cc45a 100644
  class TestResponsesStreaming:
  
  
-

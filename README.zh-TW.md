@@ -97,12 +97,12 @@ sanitization_result_max_length: 20000
 
 Gateway `.env`：`API_SERVER_ENABLED=true`，`API_SERVER_PORT` 對上 upstream key，`API_SERVER_KEY=...`。
 
-### 可選：本機 Hermes patch
+### 可選：Gateway patch
 
-不改 Hermes 也能跑這個 proxy。
-`patches/` 裡是**可選的自用 patch**（例如 tool-progress 帶更完整欄位、
-api_server 允許 Markdown、Chat Completions 保留 `role=tool`、responses 的
-session-id header）。**不是專案必要條件。**
+不改 Hermes 也能跑這個 proxy。有三個功能需要 Gateway 多送一些東西：
+tool card 帶 arguments/result、api_server 允許 Markdown、responses 的
+session 續接。`patches/` 放的是這三個 Gateway 修改的**參考快照**，說明見
+`patches/README.md`。
 
 若有套用，`hermes update` 後需重套；行號會飄，請當參考用，不保證每版 Hermes
 都能 clean apply。
@@ -111,8 +111,8 @@ session-id header）。**不是專案必要條件。**
 
 ## 給 AI agent
 
-這個 repo 附帶 **`AGENTS.md`**——完整的操作指南：架構、檔案地圖、8 支 Hermes
-patch（套用順序 + grep 驗證 + 重匯）、兩台部署、以及你的人類 owner 需要知道的
+這個 repo 附帶 **`AGENTS.md`**——完整的操作指南：架構、檔案地圖、3 支 Gateway
+參考 patch（套用順序 + grep 驗證）、兩台部署、以及你的人類 owner 需要知道的
 常規維護。
 
 把 repo 直接丟給你的 agent（Hermes、Claude Code、Codex…）：
@@ -138,7 +138,7 @@ tool_history_structured.py   # structured sanitizer（原生 tool role）
 special_tags.py              # neutralize tool result 內的特殊標籤
 special_tags.json            # 標籤清單（data）
 extract_tags.py              # 一次性標籤產生器（升級 model/OWUI 後重跑）
-patches/                     # 可選自用 Hermes patch（見上）
+patches/                     # Gateway 參考 patch（見 patches/README.md）
 config.yaml                  # 範例 config
 requirements.txt
 ```
