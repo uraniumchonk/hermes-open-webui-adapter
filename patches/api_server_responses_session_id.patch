@@ -1,8 +1,8 @@
 diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
-index 05e2d7b648..1a3660713a 100644
+index 36d6f10..1a36607 100644
 --- a/gateway/platforms/api_server_openai_routes.py
 +++ b/gateway/platforms/api_server_openai_routes.py
-@@ -694,16 +811,20 @@ def _parse_chat_messages(messages: list[Any]) -> tuple:
+@@ -811,16 +811,20 @@ def _parse_chat_messages(messages: list[Any]) -> tuple:
  
  
  def _parse_responses_input(raw_input: Any) -> tuple:
@@ -26,7 +26,7 @@ index 05e2d7b648..1a3660713a 100644
              elif _is_reasoning_input_item(item):
                  continue
              elif isinstance(item, dict):
-@@ -711,14 +832,16 @@ def _parse_responses_input(raw_input: Any) -> tuple:
+@@ -828,14 +832,16 @@ def _parse_responses_input(raw_input: Any) -> tuple:
                      content = _normalize_multimodal_content(item.get("content", ""))
                  except ValueError as exc:
                      return None, _multimodal_validation_error(exc, param=f"input[{idx}].content")
@@ -45,7 +45,7 @@ index 05e2d7b648..1a3660713a 100644
      from gateway.platforms.api_server import (
          _error_response, _multimodal_validation_error, _normalize_multimodal_content)
      conversation_history: list[dict[str, Any]] = []
-@@ -733,10 +856,41 @@ def _parse_conversation_history(raw_history: Any) -> tuple:
+@@ -850,10 +856,41 @@ def _parse_conversation_history(raw_history: Any) -> tuple:
              entry_content = _normalize_multimodal_content(entry["content"])
          except ValueError as exc:
              return None, _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
@@ -88,7 +88,7 @@ index 05e2d7b648..1a3660713a 100644
  class OpenAICompatRoutesMixin:
      """/v1/chat/completions and /v1/responses handlers + SSE writers."""
  
-@@ -1336,6 +1569,27 @@ class OpenAICompatRoutesMixin:
+@@ -1532,6 +1569,27 @@ class OpenAICompatRoutesMixin:
          gateway_session_key, key_err = self._parse_session_key_header(request)
          if key_err is not None:
              return key_err
@@ -116,7 +116,7 @@ index 05e2d7b648..1a3660713a 100644
          try:
              body = await request.json()
          except Exception:
-@@ -1358,7 +1612,8 @@ class OpenAICompatRoutesMixin:
+@@ -1554,7 +1612,8 @@ class OpenAICompatRoutesMixin:
          from hermes_state_runtime import RuntimeStoreError
          try:
              context, error = await prepare_context(
@@ -127,7 +127,7 @@ index 05e2d7b648..1a3660713a 100644
              from gateway.platforms.api_server import _openai_error
              from gateway.platforms.api_server_authority_runs import store_error_response
 diff --git a/gateway/platforms/api_server_response_admissions.py b/gateway/platforms/api_server_response_admissions.py
-index 6ed96e611b..eea32b379e 100644
+index 6ed96e6..df8c9e8 100644
 --- a/gateway/platforms/api_server_response_admissions.py
 +++ b/gateway/platforms/api_server_response_admissions.py
 @@ -139,7 +139,8 @@ async def _bind_successor(adapter, session_id, run_kwargs):
@@ -140,9 +140,11 @@ index 6ed96e611b..eea32b379e 100644
      """Validate first-time requests; exact retries use the accepted payload and result only."""
      import asyncio
      from gateway.platforms.api_server import (
-@@ -163,7 +164,25 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
+@@ -162,8 +163,28 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
+         if error is not None:
              return None, error
      stored_session_id = chain_root = None
++    session_transcript = None  # the SessionDB rows as loaded, when they became the history
      instructions = body.get('instructions')
 -    if not history and previous:
 +    if provided_session_id:
@@ -160,6 +162,7 @@ index 6ed96e611b..eea32b379e 100644
 +                db_history = await asyncio.to_thread(db.get_messages_as_conversation, stored_session_id)
 +                if db_history:
 +                    history = db_history
++                    session_transcript = list(db_history)
 +        except Exception as e:
 +            logging.getLogger(__name__).warning('Failed to load session history for %s: %s', provided_session_id, e)
 +            stored_session_id = provided_session_id
@@ -167,7 +170,7 @@ index 6ed96e611b..eea32b379e 100644
          stored = adapter._current_response_store().get(previous)
          if stored is None:
              return None, _error_response(f'Previous response not found: {previous}', 404)
-@@ -181,6 +200,19 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
+@@ -181,6 +202,19 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
          return None, _error_response('No user message found in input', 400)
      if body.get('truncation') == 'auto':
          history = _auto_truncate_response_history(history)
@@ -187,8 +190,24 @@ index 6ed96e611b..eea32b379e 100644
      declared_selected = not stored_session_id and bool(gateway_session_key)
      session_id = stored_session_id or await asyncio.to_thread(
          adapter._declared_conversation_session, gateway_session_key) or str(uuid.uuid4())
+@@ -195,6 +229,15 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
+         ephemeral_system_prompt=instructions, session_id=session_id,
+         gateway_session_key=gateway_session_key, bind_declared_conversation=declared_selected,
+         **overrides, route=route, relay_metadata=_request_relay_metadata(body))
++    if session_transcript is not None and history == session_transcript:
++        # Local patch (responses_session_id): the history IS this session's transcript, untouched
++        # (no extra ``input`` turns, no ``truncation: auto`` cut, no sid marker stripped). Let the
++        # turn re-read it at execution, AFTER gateway hygiene, like chat/completions
++        # (``_authority_chat_kwargs``): a snapshot frozen into the admission payload wins in
++        # ``TurnRunner._load_turn_history``, so the turn that paid for hygiene compression still
++        # sent the pre-compression transcript (full re-prefill) and stamped its size back.
++        # ``conversation_history`` stays for the stored response record and the legacy path.
++        run_kwargs['history_from_session'] = True
+     if stored_session_id and stored_session_id != chain_root:
+         run_kwargs['walked_from'] = chain_root  # the chain moved past its swept stored session
+     if durable_key:
 diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
-index 64f601650c..3e05477faf 100644
+index 64f6016..3e05477 100644
 --- a/tests/gateway/test_api_server.py
 +++ b/tests/gateway/test_api_server.py
 @@ -1715,6 +1715,203 @@ class TestResponsesEndpoint:
@@ -395,3 +414,132 @@ index 64f601650c..3e05477faf 100644
  class TestResponsesStreaming:
  
  
+diff --git a/tests/gateway/test_responses_history_from_session.py b/tests/gateway/test_responses_history_from_session.py
+new file mode 100644
+index 0000000..9b2fe92
+--- /dev/null
++++ b/tests/gateway/test_responses_history_from_session.py
+@@ -0,0 +1,123 @@
++"""Local patch responses_session_id: a /v1/responses turn whose history came from SessionDB
++(X-Hermes-Session-Id) re-reads the transcript at execution, after gateway hygiene, instead of
++running on the admission-time snapshot (the compressing turn used to send the full old history)."""
++from types import SimpleNamespace
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++_ROWS = [("user", f"question {i}") if i % 2 == 0 else ("assistant", f"answer {i}") for i in range(40)]
++_COMPACTED = [
++    {'role': 'assistant', 'content': 'compressed-summary-sentinel', '_compressed_summary': True},
++    {'role': 'user', 'content': 'question 38'},
++    {'role': 'assistant', 'content': 'answer 39'},
++]
++
++
++def _seed(db, session_id='sess-big'):
++    db.create_session(session_id=session_id, source='api_server')
++    for i, (role, text) in enumerate(_ROWS):
++        db.append_message(session_id, role=role, content=text, timestamp=1000.0 + i)
++    return session_id
++
++
++class _Resp:
++    def __init__(self, status, body):
++        self.status, self._body = status, body
++
++    async def text(self):
++        return self._body
++
++
++async def _post(api, owner, body, handle):
++    owner.runner._handle_message = handle
++    api._api_key = 'sk-secret'  # session continuation requires a configured key
++    app = web.Application()
++    app.router.add_post('/v1/responses', api._handle_responses)
++    async with TestClient(TestServer(app)) as client:
++        resp = await client.post('/v1/responses', json=body, headers={
++            'X-Hermes-Session-Id': 'sess-big', 'Authorization': 'Bearer sk-secret'})
++        return _Resp(resp.status, await resp.text())
++
++
++def _capture(seen):
++    from gateway.session_api_turn import api_execution
++    from gateway.session_results import execution_result
++
++    async def handle(event):
++        seen.append(dict(api_execution.get()))
++        result = {'final_response': 'ok', 'messages': [{'role': 'user', 'content': event.text},
++                                                      {'role': 'assistant', 'content': 'ok'}]}
++        execution_result.get()['result'] = result
++        return 'ok'
++    return handle
++
++
++@pytest.mark.asyncio
++async def test_session_header_turn_reads_transcript_at_execution(api, owner):
++    """(a) DB rows + session header: the admission freezes no history snapshot."""
++    _seed(owner.db)
++    seen = []
++    resp = await _post(api, owner, {'input': 'new question'}, _capture(seen))
++    assert resp.status == 200, await resp.text()
++    assert seen and seen[0]['history'] is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('body', [
++    {'input': [{'role': 'user', 'content': 'extra earlier turn'}, {'role': 'user', 'content': 'new question'}]},
++    {'input': 'new question', 'truncation': 'auto'},
++])
++async def test_changed_snapshot_stays_frozen(api, owner, monkeypatch, body):
++    """Extra ``input`` turns or a ``truncation: auto`` cut make the history differ from the
++    transcript: keep the frozen snapshot (previous behaviour) so nothing the client sent is lost."""
++    import gateway.platforms.api_server as api_server
++    monkeypatch.setattr(api_server, 'RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT', 10)
++    monkeypatch.setattr(api_server._auto_truncate_response_history, '__kwdefaults__', {'limit': 10})
++    _seed(owner.db)
++    seen = []
++    resp = await _post(api, owner, body, _capture(seen))
++    assert resp.status == 200, await resp.text()
++    assert isinstance(seen[0]['history'], list) and len(seen[0]['history']) in (10, len(_ROWS) + 1)
++
++
++@pytest.mark.asyncio
++async def test_sid_marker_in_transcript_keeps_stripped_snapshot(api, owner):
++    """A transcript row carrying a sid marker: the stripped snapshot (old guard) still wins."""
++    sid = _seed(owner.db)
++    owner.db.append_message(sid, role='user', content='hi <!--hermes-sid:sess-big-->', timestamp=2000.0)
++    owner.db.append_message(sid, role='assistant', content='hello', timestamp=2001.0)
++    seen = []
++    resp = await _post(api, owner, {'input': 'new question'}, _capture(seen))
++    assert resp.status == 200, await resp.text()
++    assert isinstance(seen[0]['history'], list) and 'hermes-sid' not in str(seen[0]['history'])
++
++
++@pytest.mark.asyncio
++async def test_compacting_turn_runs_on_the_compacted_transcript(api, owner):
++    """(b) Hygiene compacts the session in place to 3 rows before the turn loads its history:
++    the turn's run gets those 3 rows (through the real ``TurnRunner._load_turn_history``)."""
++    from gateway.run_turn_runner import TurnRunner
++    from gateway.session_api_turn import api_execution
++
++    _seed(owner.db)
++    loaded = []
++
++    async def handle(event):
++        from gateway.session_results import execution_result
++        # Gateway hygiene ran: the transcript the turn context now holds is the compacted one.
++        runner = SimpleNamespace(_ctx=SimpleNamespace(history=list(_COMPACTED), channel_prompt=None,
++                                                      user_config={}, session_id='sess-big', session_key='k'),
++                                 _runner=SimpleNamespace())
++        history, _, _ = TurnRunner._load_turn_history(runner, SimpleNamespace(), False)
++        loaded.append((api_execution.get()['history'], history))
++        execution_result.get()['result'] = {'final_response': 'ok', 'messages': []}
++        return 'ok'
++
++    resp = await _post(api, owner, {'input': 'new question'}, handle)
++    assert resp.status == 200, await resp.text()
++    frozen, history = loaded[0]
++    assert frozen is None
++    assert [m['content'] for m in history] == [m['content'] for m in _COMPACTED]
++    assert 'question 0' not in str(history)
