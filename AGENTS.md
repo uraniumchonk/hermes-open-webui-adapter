@@ -59,7 +59,7 @@ keeps it running (our proven approach):
 | `completions_handler.py` | `/v1/chat/completions` — history sanitize (inbound) + forward, streamed through `stream_enhance` |
 | `stream_enhance.py` | SSE transform (enhance-v2): `hermes.tool.progress` → OWUI tool cards (outbound), heartbeats, stale-stream timeout, SSE buffer cap, `on_upstream_meta` hook (run id capture) |
 | `responses_handler.py` | `/v1/responses` — session continuity + previous-response tool-result injection |
-| `run_control.py` | Mid-turn control: per-conversation live run registry, `POST /v1/runs/{id}/steer` for a follow-up typed while the answer streams, `POST /v1/runs/{id}/stop` when the client drops, ack payloads in chat + responses shapes |
+| `run_control.py` | Mid-turn control: per-conversation live run registry, `POST /v1/runs/{id}/steer` for a follow-up typed while the answer streams, and Stop as a **hold window** — the upstream socket stays open so the user's own next message steers into the running turn at its next tool boundary, with a hard `POST /v1/runs/{id}/stop` only if nobody takes over inside `stop_grace_seconds` |
 | `responses_session.py` | sid marker extract/inject (responses path only) — pure functions, unit-tested |
 | `tool_history_format.py` | tool card → model-safe history (structured) |
 | `tool_history_structured.py` | structured sanitizer (native `assistant` + `tool` roles) |
