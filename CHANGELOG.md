@@ -6,6 +6,14 @@ and tags are cut from `main`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The hold is now set synchronously in the cancel path.** Open WebUI's "send now" on a queued
+  message runs `stopResponse(false)` then `submitPrompt` with no gap — abort and the next request
+  are milliseconds apart. Setting `holding` only when the grace watcher first runs meant that
+  follow-up could arrive before the task was even scheduled, find no hold, and get the
+  acknowledgement line instead of the rest of the answer.
+
 ## [1.2.0] - 2026-11-11
 
 ### Added
