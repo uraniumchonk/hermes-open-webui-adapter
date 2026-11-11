@@ -175,11 +175,13 @@ async def handle_completions_request(
                 # the grace window (see run_control.grace_stop).
                 if run_id_box["id"] and conv_key and upstream_resp is not None:
                     try:
+                        run_control.begin_hold(conv_key)  # synchronous: the follow-up may be 1 ms away
                         asyncio.create_task(run_control.grace_stop(conv_key, upstream_resp, sess))
                         handed_off = True
                     except Exception:
                         handed_off = False
                 if not handed_off:
+                    run_control.end_hold(conv_key)
                     try:
                         await run_control.stop_active(conv_key, sess)
                     except Exception:

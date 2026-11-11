@@ -255,6 +255,28 @@ def stop_grace_steer_text() -> str:
         return _DEFAULT_STOP_STEER
 
 
+def begin_hold(key: Optional[str]) -> None:
+    """Mark the conversation as held *before* the watcher task gets scheduled.
+
+    Open WebUI's "send now" on a queued message aborts the stream and issues the next request
+    within milliseconds (``sendQueuedMessageNow``: ``stopResponse(false)`` → ``abort()`` →
+    ``submitPrompt``). If ``holding`` were only set when ``grace_stop`` first runs, that follow-up
+    can arrive before the task is even scheduled, find no hold, and get an acknowledgement line
+    instead of the rest of the answer.
+    """
+    record = active_run(key)
+    if record is None:
+        return
+    record["holding"] = True
+    record["stop_pending"] = True
+
+
+def end_hold(key: Optional[str]) -> None:
+    record = active_run(key)
+    if record is not None:
+        record["holding"] = False
+
+
 async def grace_stop(key: Optional[str], upstream_resp, sess: Optional[aiohttp.ClientSession] = None,
                      close_after=None) -> None:
     """Hold the turn open after Stop so the user's own follow-up can still reach it.

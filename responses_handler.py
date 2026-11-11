@@ -589,12 +589,14 @@ async def _stream_responses(
             logger.info("[responses] Client disconnected — handing upstream to the grace watcher")
             if run_id_box["id"] and conv_key and resp is not None:
                 try:
+                    run_control.begin_hold(conv_key)  # synchronous: the follow-up may be 1 ms away
                     asyncio.create_task(
                         run_control.grace_stop(conv_key, resp, None, close_after=local_sess))
                     handed_off = True
                 except Exception:
                     handed_off = False
             if not handed_off:
+                run_control.end_hold(conv_key)
                 try:
                     await run_control.stop_active(conv_key)
                 except Exception:
