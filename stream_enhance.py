@@ -364,6 +364,7 @@ async def transform_stream(
     model: str,
     completion_id: str,
     created: int,
+    on_upstream_meta=None,
 ) -> AsyncGenerator[bytes, None]:
     """
     從 Hermes 上游讀取 SSE stream，即時轉換 hermes.tool.progress 事件（enhance-v2）：
@@ -664,6 +665,18 @@ async def transform_stream(
                         parsed_json = json.loads(data_str)
                     except json.JSONDecodeError:
                         pass
+
+                # Hand the upstream frame identity to the caller once per stream: the run id
+                # (chatcmpl-… on the gateway) is what /v1/runs/{id}/steer and /stop address.
+                # The frames we emit carry the proxy's own completion id, so it has to be
+                # picked up here, before the rewrite.
+                if on_upstream_meta is not None and isinstance(parsed_json, dict):
+                    upstream_id = parsed_json.get("id")
+                    if isinstance(upstream_id, str) and upstream_id:
+                        try:
+                            on_upstream_meta(upstream_id)
+                        except Exception:
+                            pass
 
                 # Handle hermes.tool.progress events
                 if event_type == "hermes.tool.progress" and parsed_json:

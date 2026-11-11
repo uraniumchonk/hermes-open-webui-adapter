@@ -18,6 +18,7 @@ from typing import Any, Dict
 import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
+import run_control
 import special_tags
 import tool_history_format
 from runtime import CONFIG
@@ -89,6 +90,18 @@ async def handle_completions_request(
     completion_id = f"chatcmpl-{int(time.time()*1000)}"
     created_ts = int(time.time())
 
+    # Conversation identity for mid-turn control (steer instead of queue). Prefer the
+    # session header the filter itself forwards; otherwise derive the same key the gateway
+    # derives, so a follow-up lands on the turn it means to correct.
+    conv_key = None
+    for header_name, header_value in fwd_headers.items():
+        if header_name.lower() in ("x-hermes-session-key", "x-hermes-session-id") and header_value:
+            conv_key = header_value
+            break
+    if conv_key is None:
+        conv_key = run_control.conversation_key(req_json)
+    upstream_base = upstream_url.split("/v1/", 1)[0]
+
     # ✅ Task 1: strip 思考內容（OWUI 把思考區域組裝回傳 LLM 時砍掉，防污染反饋迴圈）
     # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
     if "messages" in req_json and isinstance(req_json["messages"], list):
@@ -101,6 +114,13 @@ async def handle_completions_request(
     if stream_flag and "chat/completions" in original_path:
         async def generate():
             upstream_resp = None
+            run_id_box = {"id": None}
+
+            def _on_upstream_meta(upstream_run_id: str) -> None:
+                if run_id_box["id"] is None:
+                    run_id_box["id"] = upstream_run_id
+                    run_control.note_active(conv_key, upstream_run_id, upstream_base, "chat")
+
             try:
                 # Prefer context-managed response so connection is always released.
                 # Keep explicit close paths for CancelledError / partial failure.
@@ -122,6 +142,7 @@ async def handle_completions_request(
                     try:
                         async for chunk in transform_stream(
                             upstream_resp.content, model, completion_id, created_ts,
+                            on_upstream_meta=_on_upstream_meta,
                         ):
                             await queue.put(chunk)
                         # 標記完成
@@ -142,6 +163,12 @@ async def handle_completions_request(
                     yield chunk
             except asyncio.CancelledError:
                 logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
+                # Stop is explicit here: a proxy hop can keep the upstream request alive after
+                # the browser gave up, and then the agent runs on with nobody listening.
+                try:
+                    await run_control.stop_active(conv_key, sess)
+                except Exception:
+                    pass
                 raise
             except aiohttp.ServerDisconnectedError:
                 logger.info(f"[port={upstream_port}] Upstream disconnected")
@@ -152,6 +179,7 @@ async def handle_completions_request(
                 logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
                 yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure","detail": "' + str(e).encode('utf-8', errors='replace') + b'"}}\n\n'
             finally:
+                run_control.clear_active(conv_key, run_id_box["id"])
                 if upstream_resp is not None and not upstream_resp.closed:
                     upstream_resp.close()
                     # Release connection back to pool promptly (aiohttp best practice)

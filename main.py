@@ -31,6 +31,7 @@ from runtime import (
 )
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
+import run_control
 
 APP = FastAPI(title="Hermes Tool Card Enhancer Router")
 
@@ -84,6 +85,48 @@ def _proxy_error(status: int, code: str, message: str, headers: Optional[dict] =
         status_code=status,
         headers=headers,
     )
+
+
+async def _maybe_steer(req_json: dict, fwd_headers: dict, route: str, sess):
+    """Redirect a mid-turn follow-up into ``POST /v1/runs/{id}/steer``.
+
+    Open WebUI does not abort the running answer when the user types again — it opens a
+    second request for the same conversation, which the gateway queues behind the live turn.
+    Steering folds the correction into the turn already in progress; this returns the short
+    acknowledgement Open WebUI needs for the message it just sent, or None to proxy normally
+    (no live run, empty text, or a gateway that refused the steer).
+    """
+    conv_key = None
+    for header_name, header_value in fwd_headers.items():
+        if header_name.lower() in ("x-hermes-session-key", "x-hermes-session-id") and header_value:
+            conv_key = header_value
+            break
+    if conv_key is None:
+        conv_key = run_control.conversation_key(req_json)
+    if run_control.active_run(conv_key) is None:
+        return None
+    text = run_control.last_user_text(req_json)
+    if not text:
+        return None
+    if not await run_control.steer_active(conv_key, text, sess):
+        return None
+    logger.info(f"[run-control] mid-turn message became a steer ({len(text)} chars)")
+    model = req_json.get("model", "hermes-agent")
+    stream_flag = bool(req_json.get("stream", route == "completions"))
+    stamp = int(time.time() * 1000)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                   "Connection": "keep-alive"}
+    if route == "responses":
+        response_id = f"resp_steer{stamp}"
+        if stream_flag:
+            return Response(content=run_control.steer_ack_responses_sse(response_id, model),
+                            media_type="text/event-stream", headers=sse_headers)
+        return JSONResponse(content=run_control.steer_ack_responses_json(response_id, model))
+    completion_id = f"chatcmpl-steer-{stamp}"
+    if stream_flag:
+        return Response(content=run_control.steer_ack_sse(completion_id, model),
+                        media_type="text/event-stream", headers=sse_headers)
+    return JSONResponse(content=run_control.steer_ack_json(completion_id, model))
 
 
 @APP.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -144,6 +187,13 @@ async def proxy(request: Request, path: str):
             f"[perf] REQ {route} body={len(body)}B msgs={msg_count} "
             f"body_read={body_read_ms:.1f}ms req_id={req_id}"
         )
+
+    # Mid-turn steering: a follow-up in a conversation whose turn is still running becomes
+    # POST /v1/runs/{id}/steer instead of a queued second turn.
+    if route in ("responses", "completions") and request.method.upper() == "POST":
+        steered = await _maybe_steer(req_json, fwd_headers, route, sess)
+        if steered is not None:
+            return steered
 
     if route == "responses":
         result = await handle_responses_request(

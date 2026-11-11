@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, Optional
 
@@ -25,6 +26,7 @@ import aiohttp
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import run_control
 from responses_session import (
     extract_session_id,
     inject_marker_into_blocking_response,
@@ -33,6 +35,10 @@ from responses_session import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The gateway's response id doubles as the run id (api_server_run_control patch), and it is
+# the handle /v1/runs/{id}/steer and /stop address. Read off the passthrough frames here.
+_RESP_RUN_ID_RE = re.compile(rb'"id"\s*:\s*"(resp_[A-Za-z0-9_-]{8,})"')
 
 
 def build_previous_tool_context(
@@ -503,6 +509,21 @@ async def _stream_responses(
     created_ts = int(time.time())
 
     async def generate() -> AsyncGenerator[bytes, None]:
+        conv_key: Optional[str] = None
+        run_id_box: Dict[str, Any] = {"id": None}
+        upstream_base = upstream_url.rsplit("/v1/responses", 1)[0]
+
+        async def _tracked(iterator):
+            """Pass frames through while learning this stream's run id."""
+            async for chunk in iterator:
+                if run_id_box["id"] is None:
+                    found = _RESP_RUN_ID_RE.search(chunk if isinstance(chunk, (bytes, bytearray)) else b"")
+                    if found:
+                        run_id = found.group(1).decode("utf-8", errors="replace")
+                        run_id_box["id"] = run_id
+                        run_control.note_active(conv_key, run_id, upstream_base, "responses")
+                yield chunk
+
         # NO lifetime cap (total=None): a healthy agent task can run far
         # longer than 10 minutes (the old total=600 killed in-flight tasks
         # at exactly 600s — 2026-09-23 incident). Dead-upstream detection
@@ -529,16 +550,17 @@ async def _stream_responses(
                     # First turn only (should_embed) — continuation turns keep
                     # the single marker on the first assistant message.
                     out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
+                    conv_key = out_sid or None
 
                     if sse_mode == "passthrough":
                         if should_embed and out_sid and resp.status == 200:
                             # Frame-level passthrough with marker injection
                             # (last delta + done text + completed envelope).
-                            async for chunk in stream_with_marker(resp, out_sid):
+                            async for chunk in _tracked(stream_with_marker(resp, out_sid)):
                                 yield chunk
                         else:
                             # 直接透傳 SSE 事件（Open WebUI 能處理原生 Responses SSE）
-                            async for chunk in resp.content:
+                            async for chunk in _tracked(resp.content):
                                 yield chunk
                     else:
                         # 轉換模式：將 Responses SSE 轉為 Chat Completions SSE
@@ -549,9 +571,20 @@ async def _stream_responses(
                             yield chunk
                         return
 
+            except asyncio.CancelledError:
+                # Client hung up (Open WebUI Stop). Stop the run explicitly: the socket
+                # teardown alone leaves the agent running behind a proxy hop.
+                logger.info("[responses] Client disconnected, stopping the run")
+                try:
+                    await run_control.stop_active(conv_key)
+                except Exception:
+                    pass
+                raise
             except Exception as e:
                 logger.error(f"[responses] Streaming error: {type(e).__name__}: {e}")
                 yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error"}}\n\n'
+            finally:
+                run_control.clear_active(conv_key, run_id_box["id"])
 
     return StreamingResponse(
         generate(),
