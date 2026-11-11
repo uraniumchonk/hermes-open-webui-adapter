@@ -120,6 +120,7 @@ async def handle_completions_request(
         async def generate():
             upstream_resp = None
             run_id_box = {"id": None}
+            handed_off = False
 
             def _on_upstream_meta(upstream_run_id: str) -> None:
                 if run_id_box["id"] is None:
@@ -168,13 +169,21 @@ async def handle_completions_request(
                         break
                     yield chunk
             except asyncio.CancelledError:
-                logger.info(f"[port={upstream_port}] Client disconnected, closing upstream gracefully")
-                # Stop is explicit here: a proxy hop can keep the upstream request alive after
-                # the browser gave up, and then the agent runs on with nobody listening.
-                try:
-                    await run_control.stop_active(conv_key, sess)
-                except Exception:
-                    pass
+                logger.info(f"[port={upstream_port}] Client disconnected — handing upstream to the grace watcher")
+                # Keep the socket open so the gateway never sees a dead client: the watcher steers
+                # "stop now" in at the next tool boundary and only hard-stops if the run outlives
+                # the grace window (see run_control.grace_stop).
+                if run_id_box["id"] and conv_key and upstream_resp is not None:
+                    try:
+                        asyncio.create_task(run_control.grace_stop(conv_key, upstream_resp, sess))
+                        handed_off = True
+                    except Exception:
+                        handed_off = False
+                if not handed_off:
+                    try:
+                        await run_control.stop_active(conv_key, sess)
+                    except Exception:
+                        pass
                 raise
             except aiohttp.ServerDisconnectedError:
                 logger.info(f"[port={upstream_port}] Upstream disconnected")
@@ -185,8 +194,9 @@ async def handle_completions_request(
                 logger.error(f"[port={upstream_port}] Proxy error: {type(e).__name__}: {e}", exc_info=True)
                 yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error","code":"upstream_failure","detail": "' + str(e).encode('utf-8', errors='replace') + b'"}}\n\n'
             finally:
-                run_control.clear_active(conv_key, run_id_box["id"])
-                if upstream_resp is not None and not upstream_resp.closed:
+                if not handed_off:
+                    run_control.clear_active(conv_key, run_id_box["id"])
+                if upstream_resp is not None and not upstream_resp.closed and not handed_off:
                     upstream_resp.close()
                     # Release connection back to pool promptly (aiohttp best practice)
                     try:

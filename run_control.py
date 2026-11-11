@@ -19,6 +19,7 @@ plain proxying.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -202,7 +203,7 @@ async def stop_active(key: Optional[str], sess: Optional[aiohttp.ClientSession] 
     return True
 
 
-async def steer_active(key: Optional[str], text: str, sess: aiohttp.ClientSession) -> bool:
+async def steer_active(key: Optional[str], text: str, sess: Optional[aiohttp.ClientSession] = None) -> bool:
     record = active_run(key)
     if record is None or not text:
         return False
@@ -210,8 +211,109 @@ async def steer_active(key: Optional[str], text: str, sess: aiohttp.ClientSessio
                                      {"input": text}, auth_header=record.get("auth"))
     if result is None:
         return False
+    # The user's own follow-up took over this turn: do not hard-stop it out from under them.
+    record["stop_pending"] = False
     logger.info(f"[run-control] steered {record['run_id']} with {len(text)} chars")
     return True
+
+
+# ── Stop with a grace window ────────────────────────────────────────────────
+#
+# A hard stop mid-tool is the wrong shape for this UI: the run flips to cancelled, but the
+# agent is between tool calls, so nothing aborts and it keeps issuing requests until the turn
+# ends on its own (measured: 56 s / 11 API calls after the user pressed Stop, and the follow-up
+# message sat queued behind it).
+#
+# What the user asked for instead: pressing Stop should hold for a few seconds, let the turn
+# reach its next tool boundary, fold "stop now" in as steering, and only kill it if it is still
+# running after the window. That is exactly what grace_stop does.
+
+_DEFAULT_STOP_STEER = (
+    "使用者按下停止。請立刻停止目前的工作，用一兩句話回報已完成到哪裡，"
+    "不要再開新的工具呼叫。"
+)
+
+
+def stop_grace_seconds() -> float:
+    try:
+        from runtime import CONFIG
+        return float(CONFIG.get("stop_grace_seconds", 20))
+    except Exception:
+        return 20.0
+
+
+def stop_grace_steer_text() -> str:
+    try:
+        from runtime import CONFIG
+        return str(CONFIG.get("stop_grace_steer") or _DEFAULT_STOP_STEER)
+    except Exception:
+        return _DEFAULT_STOP_STEER
+
+
+async def grace_stop(key: Optional[str], upstream_resp, sess: Optional[aiohttp.ClientSession] = None,
+                     close_after=None) -> None:
+    """Hold the turn open after Stop so the user's own follow-up can still reach it.
+
+    Pressing Stop in this UI used to mean "hard interrupt now", which is the worst of both
+    worlds: the run was marked cancelled, but the agent was between tool calls so nothing
+    aborted, and it kept issuing requests (measured: 56 s / 11 API calls) while the follow-up
+    message sat queued behind it.
+
+    What we do instead: keep the upstream socket open — the gateway never sees a dead client,
+    so it does not hard-interrupt on its own — and keep draining it. The conversation stays
+    addressable for ``stop_grace_seconds``: if the user types again, ``_maybe_steer`` folds that
+    text into the running turn at its next tool boundary and clears ``stop_pending``. Only if
+    nobody takes over before the window closes do we POST /stop.
+
+    ``close_after`` is an owned session the handler could not close itself (it lost the
+    ``async with`` frame on cancel); it is closed when this watcher is done.
+    """
+    record = active_run(key)
+    if record is None:
+        _close_quietly(upstream_resp)
+        await _close_session(close_after)
+        return
+    run_id = record["run_id"]
+    grace = stop_grace_seconds()
+    record["stop_pending"] = True
+    logger.info(f"[run-control] stop held for {run_id}: {grace:.0f}s window for a follow-up message")
+
+    deadline = time.monotonic() + grace
+    content = getattr(upstream_resp, "content", None)
+    while content is not None:
+        try:
+            await asyncio.wait_for(content.readany(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            break
+        if content.at_eof():
+            logger.info(f"[run-control] {run_id} finished on its own during the hold")
+            break
+        if record.get("stop_pending") and time.monotonic() >= deadline:
+            logger.info(f"[run-control] {run_id} nobody took over in {grace:.0f}s — hard stop")
+            record["stop_pending"] = False
+            await stop_active(key, sess)
+            # Fall through: keep draining until EOF so the gateway's SSE writes never block.
+    _close_quietly(upstream_resp)
+    await _close_session(close_after)
+
+
+async def _close_session(session) -> None:
+    if session is None:
+        return
+    try:
+        await session.close()
+    except Exception:
+        pass
+
+
+def _close_quietly(upstream_resp) -> None:
+    try:
+        if upstream_resp is not None and not getattr(upstream_resp, "closed", True):
+            upstream_resp.close()
+    except Exception:
+        pass
 
 
 def steer_ack_sse(completion_id: str, model: str) -> bytes:

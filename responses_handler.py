@@ -539,58 +539,82 @@ async def _stream_responses(
         # is dead — same semantics as transform_stream's
         # STALE_STREAM_TIMEOUT=120s on the completions path.
         timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
-        async with aiohttp.ClientSession(timeout=timeout, read_bufsize=524288) as local_sess:
-            try:
-                async with local_sess.post(
-                    upstream_url, data=body, headers=fwd_headers
-                ) as resp:
-                    logger.info(
-                        f"[responses] Streaming started, mode={sse_mode}, "
-                        f"upstream_status={resp.status}"
-                    )
+        # Not an ``async with`` on purpose: on client cancel the response (and this session)
+        # are handed to the grace watcher, which keeps them alive so the gateway never sees a
+        # dead socket and can be steered to a clean stop at the next tool boundary.
+        local_sess = aiohttp.ClientSession(timeout=timeout, read_bufsize=524288)
+        resp = None
+        handed_off = False
+        try:
+            resp = await local_sess.post(
+                upstream_url, data=body, headers=fwd_headers
+            )
+            logger.info(
+                f"[responses] Streaming started, mode={sse_mode}, "
+                f"upstream_status={resp.status}"
+            )
 
-                    # Session marker (responses path only): the gateway returns
-                    # its session id in the response header; embed it in the
-                    # final assistant text so the next request continues this
-                    # session (history + tool calls loaded from SessionDB).
-                    # First turn only (should_embed) — continuation turns keep
-                    # the single marker on the first assistant message.
-                    out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
-                    conv_key = out_sid or None
+            # Session marker (responses path only): the gateway returns
+            # its session id in the response header; embed it in the
+            # final assistant text so the next request continues this
+            # session (history + tool calls loaded from SessionDB).
+            # First turn only (should_embed) — continuation turns keep
+            # the single marker on the first assistant message.
+            out_sid = resp.headers.get("X-Hermes-Session-Id", "").strip()
+            conv_key = out_sid or None
 
-                    if sse_mode == "passthrough":
-                        if should_embed and out_sid and resp.status == 200:
-                            # Frame-level passthrough with marker injection
-                            # (last delta + done text + completed envelope).
-                            async for chunk in _tracked(stream_with_marker(resp, out_sid)):
-                                yield chunk
-                        else:
-                            # 直接透傳 SSE 事件（Open WebUI 能處理原生 Responses SSE）
-                            async for chunk in _tracked(resp.content):
-                                yield chunk
-                    else:
-                        # 轉換模式：將 Responses SSE 轉為 Chat Completions SSE
-                        async for chunk in _stream_and_convert(
-                            resp, model, completion_id, created_ts,
-                            marker_sid=out_sid if (should_embed and resp.status == 200) else "",
-                        ):
-                            yield chunk
-                        return
+            if sse_mode == "passthrough":
+                if should_embed and out_sid and resp.status == 200:
+                    # Frame-level passthrough with marker injection
+                    # (last delta + done text + completed envelope).
+                    async for chunk in _tracked(stream_with_marker(resp, out_sid)):
+                        yield chunk
+                else:
+                    # 直接透傳 SSE 事件（Open WebUI 能處理原生 Responses SSE）
+                    async for chunk in _tracked(resp.content):
+                        yield chunk
+            else:
+                # 轉換模式：將 Responses SSE 轉為 Chat Completions SSE
+                async for chunk in _stream_and_convert(
+                    resp, model, completion_id, created_ts,
+                    marker_sid=out_sid if (should_embed and resp.status == 200) else "",
+                ):
+                    yield chunk
+                return
 
-            except asyncio.CancelledError:
-                # Client hung up (Open WebUI Stop). Stop the run explicitly: the socket
-                # teardown alone leaves the agent running behind a proxy hop.
-                logger.info("[responses] Client disconnected, stopping the run")
+        except asyncio.CancelledError:
+            # Client hung up (Open WebUI Stop). Hand the live upstream to the grace watcher:
+            # it steers "stop now" in at the next tool boundary and only hard-stops the run if
+            # it outlives the grace window (run_control.grace_stop).
+            logger.info("[responses] Client disconnected — handing upstream to the grace watcher")
+            if run_id_box["id"] and conv_key and resp is not None:
+                try:
+                    asyncio.create_task(
+                        run_control.grace_stop(conv_key, resp, None, close_after=local_sess))
+                    handed_off = True
+                except Exception:
+                    handed_off = False
+            if not handed_off:
                 try:
                     await run_control.stop_active(conv_key)
                 except Exception:
                     pass
-                raise
-            except Exception as e:
-                logger.error(f"[responses] Streaming error: {type(e).__name__}: {e}")
-                yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error"}}\n\n'
-            finally:
+            raise
+        except Exception as e:
+            logger.error(f"[responses] Streaming error: {type(e).__name__}: {e}")
+            yield b'data: {"error":{"message":"Internal proxy error","type":"proxy_error"}}\n\n'
+        finally:
+            if not handed_off:
                 run_control.clear_active(conv_key, run_id_box["id"])
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                try:
+                    await local_sess.close()
+                except Exception:
+                    pass
 
     return StreamingResponse(
         generate(),
