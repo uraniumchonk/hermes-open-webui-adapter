@@ -291,9 +291,21 @@ async def grace_stop(key: Optional[str], upstream_resp, sess: Optional[aiohttp.C
             logger.info(f"[run-control] {run_id} finished on its own during the hold")
             break
         if record.get("stop_pending") and time.monotonic() >= deadline:
-            logger.info(f"[run-control] {run_id} nobody took over in {grace:.0f}s — hard stop")
             record["stop_pending"] = False
-            await stop_active(key, sess)
+            current = active_run(key)
+            if current is not None and current.get("run_id") == run_id:
+                logger.info(f"[run-control] {run_id} nobody took over in {grace:.0f}s — hard stop")
+                await stop_active(key, sess)
+            else:
+                # Another turn took over this conversation while we held (a follow-up that could
+                # not be steered became a fresh run). Stopping "whatever is active now" would kill
+                # that new work instead of the turn the user pressed Stop on — measured on
+                # 2026-11-11: the follow-up was killed 19 s after it started and Open WebUI just
+                # showed the answer ending with nothing.
+                logger.info(
+                    f"[run-control] {run_id} is no longer the active run for this conversation; "
+                    f"leaving the new one alone"
+                )
             # Fall through: keep draining until EOF so the gateway's SSE writes never block.
     _close_quietly(upstream_resp)
     await _close_session(close_after)

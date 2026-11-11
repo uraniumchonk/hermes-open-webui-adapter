@@ -31,6 +31,7 @@ from runtime import (
 )
 from completions_handler import handle_completions_request
 from responses_handler import handle_responses_request
+import responses_session
 import run_control
 
 APP = FastAPI(title="Hermes Tool Card Enhancer Router")
@@ -101,6 +102,16 @@ async def _maybe_steer(req_json: dict, fwd_headers: dict, route: str, sess):
         if header_name.lower() in ("x-hermes-session-key", "x-hermes-session-id") and header_value:
             conv_key = header_value
             break
+    if conv_key is None and route == "responses":
+        # Open WebUI never sends X-Hermes-Session-Id: the sid rides inside the input text as a
+        # <!--hermes-sid:...--> marker. Without reading it the key gets derived from scratch
+        # (api-<sha>) and can never match the sid the live run was registered under, so a real
+        # follow-up silently fell through to a second turn queued behind the live one — the
+        # exact failure this function exists to prevent.
+        try:
+            conv_key = responses_session.extract_session_id(req_json.get("input"))
+        except Exception:
+            conv_key = None
     if conv_key is None:
         conv_key = run_control.conversation_key(req_json)
     if run_control.active_run(conv_key) is None:
