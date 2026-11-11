@@ -126,7 +126,12 @@ def note_active(key: Optional[str], run_id: Optional[str], upstream: str, kind: 
     if not key or not run_id:
         return
     ACTIVE[key] = {"run_id": run_id, "upstream": upstream.rstrip("/"), "ts": time.time(),
-                   "kind": kind, "auth": auth_header or ""}
+                   "kind": kind, "auth": auth_header or "",
+                   # Chunks the grace watcher drains while a turn is held after Stop. A follow-up
+                   # that steers into that turn attaches to this queue and keeps streaming the
+                   # rest of the answer instead of ending on an acknowledgement line.
+                   "stream_queue": asyncio.Queue(maxsize=400),
+                   "holding": False}
     logger.info(f"[run-control] active {kind} run {run_id} for {key[:16]}…")
 
 
@@ -276,17 +281,27 @@ async def grace_stop(key: Optional[str], upstream_resp, sess: Optional[aiohttp.C
     run_id = record["run_id"]
     grace = stop_grace_seconds()
     record["stop_pending"] = True
+    record["holding"] = True
+    queue = record.get("stream_queue")
     logger.info(f"[run-control] stop held for {run_id}: {grace:.0f}s window for a follow-up message")
 
     deadline = time.monotonic() + grace
     content = getattr(upstream_resp, "content", None)
     while content is not None:
         try:
-            await asyncio.wait_for(content.readany(), timeout=1.0)
+            chunk = await asyncio.wait_for(content.readany(), timeout=1.0)
         except asyncio.TimeoutError:
-            pass
+            chunk = b""
         except Exception:
             break
+        if chunk and queue is not None:
+            # A follow-up that steered into this turn reads from here and keeps streaming, so the
+            # user sees the rest of the answer instead of just the "steered" line. Nobody reading
+            # is normal (they may have closed the tab) — never let a full queue stall the drain.
+            try:
+                queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                pass
         if content.at_eof():
             logger.info(f"[run-control] {run_id} finished on its own during the hold")
             break
@@ -307,6 +322,12 @@ async def grace_stop(key: Optional[str], upstream_resp, sess: Optional[aiohttp.C
                     f"leaving the new one alone"
                 )
             # Fall through: keep draining until EOF so the gateway's SSE writes never block.
+    if queue is not None:
+        try:
+            queue.put_nowait(None)  # end-of-stream marker for whoever attached
+        except asyncio.QueueFull:
+            pass
+    record["holding"] = False
     _close_quietly(upstream_resp)
     await _close_session(close_after)
 
@@ -388,6 +409,47 @@ def steer_ack_responses_sse(response_id: str, model: str) -> bytes:
         f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
         for name, payload in events
     ).encode("utf-8")
+
+
+def hold_queue(key: Optional[str]):
+    """The live chunk queue if this conversation is being held after Stop, else None.
+
+    Only a held turn has a reader-owned stream to hand over: while the original request is still
+    the one streaming, the answer belongs to that request and a follow-up can only be acknowledged.
+    """
+    record = active_run(key)
+    if record is None or not record.get("holding"):
+        return None
+    return record.get("stream_queue")
+
+
+def resume_prelude_responses(response_id: str, model: str) -> bytes:
+    """Opening frames for a stream we take over mid-answer.
+
+    The upstream emitted its own ``response.created`` long ago (before the user pressed Stop), so
+    the client needs one it can attach to. Everything after this comes from upstream verbatim and
+    upstream's own ``response.completed`` closes the response — we deliberately emit no
+    ``item.done``/``completed`` of our own, or the client would end the answer early.
+    """
+    now = int(time.time())
+    created = {"type": "response.created", "response": {
+        "id": response_id, "object": "response", "created_at": now,
+        "status": "in_progress", "model": model, "output": []}}
+    delta = {"type": "response.output_text.delta", "item_id": f"msg_steer_{now}",
+             "output_index": 0, "content_index": 0, "delta": _STEER_NOTE}
+    return "".join(
+        f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        for name, payload in (("response.created", created),
+                              ("response.output_text.delta", delta))
+    ).encode("utf-8")
+
+
+def resume_prelude_chat(completion_id: str, model: str) -> bytes:
+    payload = {"id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()),
+               "model": model,
+               "choices": [{"index": 0, "delta": {"role": "assistant", "content": _STEER_NOTE},
+                            "finish_reason": None}]}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 def steer_ack_responses_json(response_id: str, model: str) -> dict:

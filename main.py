@@ -18,12 +18,13 @@ Hermes SSE Tool Card Enhancer Proxy (Multi-Tenant Router)
 Systemd service: hermes-tool-filter.service
 """
 
+import asyncio
 import json
 import time
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 from runtime import (
     CONFIG, BIND_HOST, BIND_PORT, PORT_MAP, DEFAULT_UPSTREAM, MAX_REQUEST_BODY,
@@ -88,6 +89,31 @@ def _proxy_error(status: int, code: str, message: str, headers: Optional[dict] =
     )
 
 
+async def _resume_stream(queue, prelude: bytes, route: str):
+    """Carry a held turn's remaining SSE frames into the follow-up's own response.
+
+    ``prelude`` opens a response the client can attach to (the upstream's own ``response.created``
+    went out on the connection the user already closed). Everything after that is upstream's own
+    bytes, including its terminal event, so the client ends the answer at the right moment.
+    """
+    yield prelude
+    while True:
+        try:
+            chunk = await asyncio.wait_for(queue.get(), timeout=10.0)
+        except asyncio.TimeoutError:
+            # A silent stretch usually means the agent is thinking or running a tool: keep the
+            # client's idle timer alive instead of letting it drop the connection.
+            yield b": keepalive\n\n"
+            continue
+        if chunk is None:
+            break
+        if route == "responses" and len(chunk) < 900 and (
+            b"event: response.created" in chunk or b"event: response.in_progress" in chunk
+        ):
+            continue  # the prelude already opened this response
+        yield chunk
+
+
 async def _maybe_steer(req_json: dict, fwd_headers: dict, route: str, sess):
     """Redirect a mid-turn follow-up into ``POST /v1/runs/{id}/steer``.
 
@@ -127,6 +153,23 @@ async def _maybe_steer(req_json: dict, fwd_headers: dict, route: str, sess):
     stamp = int(time.time() * 1000)
     sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                    "Connection": "keep-alive"}
+
+    # If this conversation is being held after Stop, the rest of the answer is still arriving on
+    # the held socket: take it over and keep streaming, so the follow-up shows the real reply
+    # rather than ending on the acknowledgement line. What was said before this point is gone —
+    # that request already closed — and that is fine.
+    held = run_control.hold_queue(conv_key) if stream_flag else None
+    if held is not None:
+        if route == "responses":
+            response_id = f"resp_steer{stamp}"
+            return StreamingResponse(
+                _resume_stream(held, run_control.resume_prelude_responses(response_id, model), route),
+                media_type="text/event-stream", headers=sse_headers)
+        completion_id = f"chatcmpl-steer-{stamp}"
+        return StreamingResponse(
+            _resume_stream(held, run_control.resume_prelude_chat(completion_id, model), route),
+            media_type="text/event-stream", headers=sse_headers)
+
     if route == "responses":
         response_id = f"resp_steer{stamp}"
         if stream_flag:
