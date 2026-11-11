@@ -512,6 +512,11 @@ async def _stream_responses(
         conv_key: Optional[str] = None
         run_id_box: Dict[str, Any] = {"id": None}
         upstream_base = upstream_url.rsplit("/v1/responses", 1)[0]
+        auth_header = ""
+        for header_name, header_value in fwd_headers.items():
+            if header_name.lower() == "authorization" and header_value:
+                auth_header = header_value
+                break
 
         async def _tracked(iterator):
             """Pass frames through while learning this stream's run id."""
@@ -521,7 +526,8 @@ async def _stream_responses(
                     if found:
                         run_id = found.group(1).decode("utf-8", errors="replace")
                         run_id_box["id"] = run_id
-                        run_control.note_active(conv_key, run_id, upstream_base, "responses")
+                        run_control.note_active(conv_key, run_id, upstream_base, "responses",
+                                                auth_header)
                 yield chunk
 
         # NO lifetime cap (total=None): a healthy agent task can run far

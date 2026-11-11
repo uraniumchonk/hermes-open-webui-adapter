@@ -114,11 +114,18 @@ def last_user_text(req_json: Dict[str, Any]) -> str:
     return ""
 
 
-def note_active(key: Optional[str], run_id: Optional[str], upstream: str, kind: str) -> None:
-    """Remember the live run for this conversation (called as soon as the id is known)."""
+def note_active(key: Optional[str], run_id: Optional[str], upstream: str, kind: str,
+                auth_header: Optional[str] = None) -> None:
+    """Remember the live run for this conversation (called as soon as the id is known).
+
+    ``auth_header`` is the caller's own Authorization value: the run-control routes are
+    authenticated per API key, so a stop/steer sent without it comes back 401 and the
+    follow-up silently falls back to queueing.
+    """
     if not key or not run_id:
         return
-    ACTIVE[key] = {"run_id": run_id, "upstream": upstream.rstrip("/"), "ts": time.time(), "kind": kind}
+    ACTIVE[key] = {"run_id": run_id, "upstream": upstream.rstrip("/"), "ts": time.time(),
+                   "kind": kind, "auth": auth_header or ""}
     logger.info(f"[run-control] active {kind} run {run_id} for {key[:16]}…")
 
 
@@ -147,9 +154,12 @@ def active_run(key: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 async def _post_run_control(sess: Optional[aiohttp.ClientSession], upstream: str, run_id: str,
-                            action: str, payload: Optional[dict] = None) -> Optional[dict]:
+                            action: str, payload: Optional[dict] = None,
+                            auth_header: Optional[str] = None) -> Optional[dict]:
     url = f"{upstream.rstrip('/')}/v1/runs/{run_id}/{action}"
     headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
 
     async def _do(client: aiohttp.ClientSession) -> Optional[dict]:
         async with client.post(url, json=payload or {}, headers=headers, timeout=_STEER_TIMEOUT) as resp:
@@ -184,7 +194,8 @@ async def stop_active(key: Optional[str], sess: Optional[aiohttp.ClientSession] 
     record = active_run(key)
     if record is None:
         return False
-    if await _post_run_control(sess, record["upstream"], record["run_id"], "stop") is None:
+    if await _post_run_control(sess, record["upstream"], record["run_id"], "stop",
+                               auth_header=record.get("auth")) is None:
         return False
     logger.info(f"[run-control] stop sent for {record['run_id']}")
     clear_active(key, record["run_id"])
@@ -196,7 +207,7 @@ async def steer_active(key: Optional[str], text: str, sess: aiohttp.ClientSessio
     if record is None or not text:
         return False
     result = await _post_run_control(sess, record["upstream"], record["run_id"], "steer",
-                                     {"input": text})
+                                     {"input": text}, auth_header=record.get("auth"))
     if result is None:
         return False
     logger.info(f"[run-control] steered {record['run_id']} with {len(text)} chars")

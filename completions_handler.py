@@ -101,6 +101,11 @@ async def handle_completions_request(
     if conv_key is None:
         conv_key = run_control.conversation_key(req_json)
     upstream_base = upstream_url.split("/v1/", 1)[0]
+    auth_header = ""
+    for header_name, header_value in fwd_headers.items():
+        if header_name.lower() == "authorization" and header_value:
+            auth_header = header_value
+            break
 
     # ✅ Task 1: strip 思考內容（OWUI 把思考區域組裝回傳 LLM 時砍掉，防污染反饋迴圈）
     # ✅ History Sanitization: 在轉發前清理 messages 中的 <details> 標籤
@@ -119,7 +124,8 @@ async def handle_completions_request(
             def _on_upstream_meta(upstream_run_id: str) -> None:
                 if run_id_box["id"] is None:
                     run_id_box["id"] = upstream_run_id
-                    run_control.note_active(conv_key, upstream_run_id, upstream_base, "chat")
+                    run_control.note_active(conv_key, upstream_run_id, upstream_base, "chat",
+                                            auth_header)
 
             try:
                 # Prefer context-managed response so connection is always released.
