@@ -41,8 +41,9 @@ bind_port: 9099
 # 按停止後「hold」的秒數：不立刻硬殺，而是把 upstream 保持打開，這段時間內使用者
 # 追加的訊息會 steer 進正在跑的 turn（在下一個 tool 邊界生效）；超過這個秒數都
 # 沒有人接手，才真的 POST /v1/runs/{id}/stop 硬停。
-# 太短 = 又變成硬殺，太長 = 使用者按了停止卻覺得沒停。20 秒涵蓋 1–2 個 tool 邊界。
-stop_grace_seconds: 20
+# 太短 = 又變成硬殺，太長 = 使用者按了停止卻覺得沒停。
+# 60 秒：電腦端「立即傳送」是零延遲、手機端「先停止再打字送出」可能拖很久，都給足。
+stop_grace_seconds: 60
 
 # flat 時代用的 hint 檔（structured 不需要；保留鍵名僅供對照舊文件）
 # tool_usage_hint_file: "tool_hint.txt"

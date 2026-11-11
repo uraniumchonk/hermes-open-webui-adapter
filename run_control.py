@@ -350,6 +350,11 @@ async def grace_stop(key: Optional[str], upstream_resp, sess: Optional[aiohttp.C
         except asyncio.QueueFull:
             pass
     record["holding"] = False
+    # The run is either finished or was hard-stopped above; leaving the record behind makes the
+    # next request think this conversation is still live and waste a steer round-trip on a 409.
+    # clear_active only drops the key when the recorded id still matches, so a run this watcher
+    # never saw created cannot be clobbered.
+    clear_active(key, run_id)
     _close_quietly(upstream_resp)
     await _close_session(close_after)
 
