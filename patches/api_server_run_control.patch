@@ -1,0 +1,216 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index f8160def3d..32d6ad982a 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -81,6 +81,7 @@ _CAPABILITY_ENDPOINTS = (
+     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
+     ("chat_completions", ("POST", "/v1/chat/completions")),
+     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
++    ("run_list", ("GET", "/v1/runs")),
+     ("run_status", ("GET", "/v1/runs/{run_id}")),
+     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
+     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
+@@ -4389,6 +4390,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         _api_runs._release_run_owner_if_forgotten(self, run_id)
+ 
+     _handle_get_run = _run_route_delegate("_handle_get_run")
++    _handle_list_runs = _run_route_delegate("_handle_list_runs")
+     _handle_run_events = _run_route_delegate("_handle_run_events")
+     _handle_run_approval = _run_route_delegate("_handle_run_approval")
+     _handle_run_clarify = _run_route_delegate("_handle_run_clarify")
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 1a3660713a..861adb4665 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -938,11 +938,20 @@ class OpenAICompatRoutesMixin:
+             self._release_run_owner_if_forgotten(completion_id)
+         return _approval_notify, _on_done
+ 
+-    def _spawn_stream_agent(self, stream_q, *, on_done=None, run_agent=None, **run_kwargs) -> tuple:
++    def _spawn_stream_agent(self, stream_q, *, on_done=None, run_agent=None, run_id=None,
++                            **run_kwargs) -> tuple:
+         """Start ``_run_agent`` for an SSE writer -> ``(agent_task, agent_ref)``. ``agent_ref[0]``
+         lets the writer interrupt on disconnect; the EOS sentinel is enqueued from the task's done
+         callback so drain loops never race a polled ``agent_task.done()``. ``on_done(task)`` runs
+-        in that same callback, before EOS."""
++        in that same callback, before EOS.
++
++        ``run_id`` makes the stream a first-class run: the task ref is registered here and the
++        agent ref by ``_run_agent`` (``active_run_id``), so ``/v1/runs/{id}`` status, ``/stop`` and
++        ``/steer`` reach a live stream instead of answering ``run_not_found``. The caller stamps
++        ``_run_owners``/``_run_statuses`` *before* spawning — ownerless runs are fail-closed.
++        """
++        if run_id:
++            run_kwargs.setdefault("active_run_id", run_id)
+         def _on_delta(delta):
+             # None from the agent is a CLI box-close signal, not EOS — forwarding it would end
+             # the stream early. Called from the run_conversation worker thread: put_threadsafe.
+@@ -965,6 +974,8 @@ class OpenAICompatRoutesMixin:
+         agent_task = asyncio.ensure_future((run_agent or self._run_agent)(
+             stream_delta_callback=_on_delta, reasoning_callback=_on_reasoning, status_callback=_on_status,
+             agent_ref=agent_ref, **run_kwargs))
++        if run_id:
++            self._active_run_tasks[run_id] = agent_task
+         def _done(fut):
+             try:
+                 if on_done is not None:
+@@ -972,6 +983,12 @@ class OpenAICompatRoutesMixin:
+             except Exception:
+                 logger.debug("[api_server] stream on_done hook failed", exc_info=True)
+             finally:
++                if run_id:
++                    # Agent/task/approval control state dies with the turn; the pollable status
++                    # record stays until its TTL sweep so a late /v1/runs/{id} poll still answers.
++                    from gateway.platforms.api_server_runs import _retire_live_run
++                    with suppress(Exception):
++                        _retire_live_run(self, run_id)
+                 stream_q.put_nowait(None)
+         agent_task.add_done_callback(_done)
+         return agent_task, agent_ref
+@@ -1187,7 +1204,8 @@ class OpenAICompatRoutesMixin:
+             agent_task, agent_ref = self._spawn_stream_agent(
+                 _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
+                 tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
+-                approval_session_key=completion_id, **run_kwargs)
++                approval_session_key=completion_id, run_id=completion_id,
++                **run_kwargs)
+             # #13437 identity contract: an explicit-header client keeps addressing the id it
+             # sent; the response echoes that stable id while reads/writes adopt the live tip,
+             # so a rotation mid-turn (after these headers are prepared) never changes what the
+@@ -1649,10 +1667,33 @@ class OpenAICompatRoutesMixin:
+                 # copy as a commentary item would duplicate it.
+                 if not already_streamed and isinstance(text, str) and text.strip():
+                     _stream_q.put_threadsafe(("__commentary__", {"text": text}))
++            # Stamp ownership + a pollable status BEFORE the agent starts: without this the
++            # Responses stream is not a run at all, so /v1/runs/{id}, /stop and /steer answer
++            # run_not_found and the only way out of a runaway turn is dropping the socket (which
++            # the agent can survive) or restarting the gateway.
++            self._run_owners[response_id] = self._run_idempotency_scope(request)
++            self._set_run_status(response_id, "running", session_id=session_id or "",
++                                 model=response_model)
++
++            def _responses_stream_done(fut):
++                from gateway.platforms.api_server_runs import terminal_run_status
++                if fut.cancelled():
++                    self._set_run_status(response_id, "cancelled")
++                    return
++                if fut.exception() is not None:
++                    self._set_run_status(response_id, "failed",
++                                         error="The streaming task failed.")
++                    return
++                result = (fut.result() or (None,))[0]
++                status, fields = (terminal_run_status(result) if isinstance(result, dict)
++                                  else ("completed", {}))
++                self._set_run_status(response_id, status, **fields)
++
+             agent_task, agent_ref = self._spawn_stream_agent(
+                 _stream_q, run_agent=run_agent, tool_progress_callback=_on_tool_progress,
+                 tool_start_callback=_on_tool_start, tool_complete_callback=_on_tool_complete,
+-                interim_assistant_callback=_on_commentary, **run_kwargs)
++                interim_assistant_callback=_on_commentary, run_id=response_id,
++                on_done=_responses_stream_done, **run_kwargs)
+             return await self._write_sse_responses(
+                 request=request, response_id=response_id,
+                 model=response_model, created_at=created_at,
+diff --git a/gateway/platforms/api_server_runs.py b/gateway/platforms/api_server_runs.py
+index c7296d95cc..8883c15bc4 100644
+--- a/gateway/platforms/api_server_runs.py
++++ b/gateway/platforms/api_server_runs.py
+@@ -240,7 +240,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
+ 
+ def _http_routes(self) -> list[tuple[str, str, Any]]:
+     return [
+-        ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
++        ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs", self._handle_list_runs),
++        ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+         ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
+@@ -1209,6 +1210,32 @@ async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Res
+     return err or web.json_response(status)
+ 
+ 
++async def _handle_list_runs(self, request: web.Request, *, _api_server) -> web.Response:
++    """GET /v1/runs — list this caller's runs, newest first.
++
++    Without a list, a client that lost its stream (or never captured the id) cannot address the
++    turn it just started: ``POST /v1/runs/{id}/stop`` needs an id it has no way to learn. Every
++    surface that spawns a stream agent registers its run, so listing is the control-plane entry.
++    ``?active=1`` keeps only runs still executing. Terminal records are included until the
++    status TTL sweep drops them, so a late poll still resolves.
++    """
++    auth_err = self._check_run_auth(request, permission="status")
++    if auth_err:
++        return auth_err
++    active_only = str(request.query.get("active", "")).lower() in {"1", "true", "yes"}
++    data = []
++    for run_id, status in list(self._run_statuses.items()):
++        if not self._request_owns_run(request, run_id):
++            continue
++        task = self._active_run_tasks.get(run_id)
++        active = run_id in self._active_run_agents or (task is not None and not task.done())
++        if active_only and not active:
++            continue
++        data.append({**status, "active": active})
++    data.sort(key=lambda row: float(row.get("created_at") or 0), reverse=True)
++    return web.json_response({"object": "list", "data": data})
++
++
+ async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.StreamResponse:
+     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
+     # Same door as GET /v1/runs/{id}: a room grant that may poll the run may stream it.
+@@ -1407,7 +1434,10 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
+         from gateway.platforms.api_server_authority_runs import run_admission
+         owned = run_admission(self, run_id)
+         owned = owned if run_id not in self._stopping_run_ids else None
+-        agent = None
++        if owned is not None:
++            # An admission run's steer goes through the authority; a stream run has no
++            # admission, so keep the live agent ref and steer it directly below.
++            agent = None
+     # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
+     # agent ref) is what rejects stop-then-steer.
+     if status.get("status") != "running" or (owned is None and not hasattr(agent, "steer")):
+@@ -1459,14 +1489,18 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
+         return err
+     # A run whose turn a live Bot Chat owns (``_execute_run_via_live_owner``) is not an API
+     # admission: its stop is the legacy in-process task cancel below, never ``stop_run``.
++    # Same for a stream run (chat completions / responses / session stream): it has no admission
++    # receipt, and ``stop_run`` raises ``not_found`` for it — the live agent ref must be
++    # interrupted in-process instead of answering 409.
+     if (getattr(self.gateway_runner, 'session_authority', None) is not None
+             and not (task is not None and status.get("delivery_id"))):
+-        from gateway.platforms.api_server_authority_runs import stop_run, store_error_response
++        from gateway.platforms.api_server_authority_runs import run_admission, stop_run, store_error_response
+         from hermes_state_runtime import RuntimeStoreError
+-        try:
+-            return web.json_response(await stop_run(self, run_id))
+-        except RuntimeStoreError as exc:
+-            return store_error_response(_openai_error, exc)
++        if run_admission(self, run_id) is not None:
++            try:
++                return web.json_response(await stop_run(self, run_id))
++            except RuntimeStoreError as exc:
++                return store_error_response(_openai_error, exc)
+     if status.get("status") in TERMINAL_STATUSES:
+         return web.json_response(status)
+     if agent is None and task is None:
+
+diff --git a/agent/turn_api_call.py b/agent/turn_api_call.py
+index 196e9dbf72..59bfa670af 100644
+--- a/agent/turn_api_call.py
++++ b/agent/turn_api_call.py
+@@ -78,6 +78,13 @@ def perform_api_call(
+     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+     response = None
+ 
++    if getattr(agent, "_interrupt_requested", False):
++        # The flag was set while tools were running (SSE disconnect, ``POST /v1/runs/{id}/stop``,
++        # a CLI Ctrl-C): no request is in flight to abort, and without this the next iteration
++        # opens a fresh one and the turn keeps going — the stop looks ignored. Raise the same
++        # signal a mid-stream abort raises so ``handle_api_interrupt`` closes the turn properly.
++        raise InterruptedError("interrupted before the next API call")
++
+     def _verdict(action: str) -> ApiCallVerdict:
+         return ApiCallVerdict(
+             action=action, response=response, thinking_spinner=thinking_spinner,

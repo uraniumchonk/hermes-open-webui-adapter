@@ -99,9 +99,10 @@ Gateway `.env`：`API_SERVER_ENABLED=true`，`API_SERVER_PORT` 對上 upstream k
 
 ### 可選：Gateway patch
 
-不改 Hermes 也能跑這個 proxy。有三個功能需要 Gateway 多送一些東西：
+不改 Hermes 也能跑這個 proxy。有四個功能需要 Gateway 多送一些東西：
 tool card 帶 arguments/result、api_server 允許 Markdown、responses 的
-session 續接。`patches/` 放的是這三個 Gateway 修改的**參考快照**，說明見
+session 續接，以及可定址的 streaming run（mid-turn steering 與「停止後
+hold 窗口」都建立在它上面）。`patches/` 放的是這四個 Gateway 修改的**參考快照**，說明見
 `patches/README.md`。
 
 若有套用，`hermes update` 後需重套；行號會飄，請當參考用，不保證每版 Hermes
@@ -111,7 +112,7 @@ session 續接。`patches/` 放的是這三個 Gateway 修改的**參考快照**
 
 ## 給 AI agent
 
-這個 repo 附帶 **`AGENTS.md`**——完整的操作指南：架構、檔案地圖、3 支 Gateway
+這個 repo 附帶 **`AGENTS.md`**——完整的操作指南：架構、檔案地圖、4 支 Gateway
 參考 patch（套用順序 + grep 驗證）、兩台部署、以及你的人類 owner 需要知道的
 常規維護。
 

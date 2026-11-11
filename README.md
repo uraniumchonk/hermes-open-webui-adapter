@@ -108,10 +108,11 @@ upstream key, `API_SERVER_KEY=...`.
 
 ### Optional: Gateway patches
 
-The proxy works without modifying Hermes. Three features need the Gateway to
+The proxy works without modifying Hermes. Four features need the Gateway to
 emit more than upstream does — tool cards with arguments/result, Markdown on
-api_server, and responses session continuity. `patches/` has **reference
-snapshots** of those three Gateway changes; see `patches/README.md`.
+api_server, responses session continuity, and addressable streaming runs (which
+is what mid-turn steering and the Stop hold window are built on). `patches/` has
+**reference snapshots** of those four Gateway changes; see `patches/README.md`.
 
 If you use them, re-apply after `hermes update`. Line numbers drift — treat the
 files as references, not guaranteed clean applies on every Hermes version.
@@ -121,7 +122,7 @@ files as references, not guaranteed clean applies on every Hermes version.
 ## For AI agents
 
 This repo ships an **`AGENTS.md`** — a complete operating guide: architecture,
-file map, the 3 reference Gateway patches (apply order + grep verification),
+file map, the 4 reference Gateway patches (apply order + grep verification),
 two-machine deployment, and the standing maintenance your human needs to know.
 
 Hand the repo straight to your agent (Hermes, Claude Code, Codex, …):
