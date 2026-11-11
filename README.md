@@ -5,7 +5,7 @@ context models. Pick the one that fits how you chat.
 
 English · [繁體中文](README.zh-TW.md)
 
-**v1.2.0**
+**v1.2.1**
 
 ---
 

@@ -6,13 +6,25 @@ and tags are cut from `main`.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-11
+
+### Changed
+
+- **Stop hold window 20 s → 60 s.** Desktop uses Open WebUI's send-now (abort and submit with no
+  gap); on a phone you stop first and then type, which can take a while. 60 s covers both paths
+  without changing the mechanism.
+
 ### Fixed
 
-- **The hold is now set synchronously in the cancel path.** Open WebUI's "send now" on a queued
-  message runs `stopResponse(false)` then `submitPrompt` with no gap — abort and the next request
-  are milliseconds apart. Setting `holding` only when the grace watcher first runs meant that
+- **The hold is now set synchronously in the cancel path.** Open WebUI's send-now runs
+  `stopResponse(false)` then `submitPrompt` with no gap — abort and the next request are
+  milliseconds apart. Setting `holding` only when the grace watcher first runs meant that
   follow-up could arrive before the task was even scheduled, find no hold, and get the
   acknowledgement line instead of the rest of the answer.
+- **The active record is dropped when the hold ends.** It used to stay behind after a run finished
+  on its own, so a later message counted as mid-turn and burned a steer round-trip on a `409`
+  before falling back to a normal turn. `clear_active` only drops the key when the recorded id
+  still matches, so a newer run is never clobbered.
 
 ## [1.2.0] - 2026-11-11
 
