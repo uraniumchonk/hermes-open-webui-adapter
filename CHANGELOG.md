@@ -6,6 +6,18 @@ and tags are cut from `main`.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-11
+
+### Added
+
+- **A steered follow-up keeps streaming the rest of the answer.** After Stop the turn is held and
+  its upstream socket is still delivering, but the follow-up only got the
+  "（已插入當前回應中，繼續執行…）" line and closed — the rest of the reply was lost to the user even
+  though the server was still producing it. The follow-up now takes that stream over: a prelude
+  the client can attach to, then upstream's own frames verbatim (terminal event included), with a
+  keepalive comment during silent tool stretches. Whatever was said before the handover point is
+  gone — that request already closed — and the next message just attaches again.
+
 ## [1.1.1] - 2026-11-11
 
 ### Fixed
