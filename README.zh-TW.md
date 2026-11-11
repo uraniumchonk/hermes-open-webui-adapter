@@ -140,6 +140,7 @@ special_tags.py              # neutralize tool result 內的特殊標籤
 special_tags.json            # 標籤清單（data）
 extract_tags.py              # 一次性標籤產生器（升級 model/OWUI 後重跑）
 patches/                     # Gateway 參考 patch（見 patches/README.md）
+docs/                        # mid-turn-control.md — steer 與「停止後 hold 窗口」
 config.yaml                  # 範例 config
 requirements.txt
 ```

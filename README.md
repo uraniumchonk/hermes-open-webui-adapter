@@ -150,6 +150,7 @@ special_tags.py              # neutralize special tags in tool results
 special_tags.json            # tag list (data)
 extract_tags.py              # one-off tag generator (re-run after model/OWUI upgrade)
 patches/                     # reference Gateway patches (see patches/README.md)
+docs/                        # mid-turn-control.md — steering + Stop hold window
 config.yaml                  # sample config
 requirements.txt
 ```

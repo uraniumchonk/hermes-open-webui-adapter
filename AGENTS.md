@@ -54,6 +54,7 @@ keeps it running (our proven approach):
 
 | File | Role |
 |---|---|
+| `docs/mid-turn-control.md` | Deep dive: the three Open WebUI send/stop paths, the Stop hold window, handover streaming, and the invariants that cost a real failure |
 | `main.py` | Entry point: FastAPI app, single catch-all proxy (per-port routing via `resolve_upstream`), `/health`, passthrough |
 | `runtime.py` | Process plumbing: logging, `config.yaml` → `CONFIG` / `PORT_MAP`, SIGUSR2 thread dump, health dump + RSS watchdog, memory guard, shared aiohttp session |
 | `completions_handler.py` | `/v1/chat/completions` — history sanitize (inbound) + forward, streamed through `stream_enhance` |
@@ -208,6 +209,17 @@ update + restart **both** machines' filters or you'll keep seeing the old code.
 
 ## Key invariants (don't break these)
 
+- **Mid-turn control lives in [`docs/mid-turn-control.md`](docs/mid-turn-control.md)** — the three
+  Open WebUI send/stop paths, the hold window, and every invariant below that cost a real failure.
+  Read it before touching `run_control.py`, `main.py`'s `_maybe_steer`, or either handler's
+  cancelled-branch.
+- **Conversation key order is header → sid marker → derived.** Real Open WebUI never sends
+  `X-Hermes-Session-Id`; the sid rides in the input marker. A derived key never matches the live
+  run's sid, so follow-ups silently become queued second turns. Never verify this with a
+  self-supplied header.
+- **`holding` is set synchronously in the cancel path**, before the grace watcher task is
+  scheduled — send-now is abort + submit with no gap.
+- **An expired window stops its own run id only**, never "whatever is active now".
 - **One sid marker per chat, on the FIRST assistant message only.** The filter
   embeds a marker only when the request carries none (`should_embed = sid is
   None`); continuation turns keep the single marker.
