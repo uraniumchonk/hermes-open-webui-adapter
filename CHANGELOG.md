@@ -6,6 +6,23 @@ and tags are cut from `main`.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-11
+
+### Fixed
+
+- **Mid-turn steering never fired for real Open WebUI traffic.** `_maybe_steer` looked for an
+  `X-Hermes-Session-Id` header and otherwise derived the conversation key from the request body
+  (`api-<sha>`). Open WebUI never sends that header — the sid rides inside the input as a
+  `<!--hermes-sid:...-->` marker — so the key could not match the sid the live run was registered
+  under and every follow-up became a second turn queued behind the running one. The earlier
+  verification passed only because the test script supplied the header itself. Now the key is
+  resolved header → marker → derived.
+- **An expired stop window could kill the wrong turn.** The grace watcher's hard stop addressed
+  "whatever run is active for this conversation right now" instead of the run it was holding, so
+  once a follow-up landed as a fresh run, the 20 s timer ended *that* answer about 19 s in and
+  Open WebUI just showed it stopping. It now verifies the run id first and leaves a newer run
+  alone.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added
