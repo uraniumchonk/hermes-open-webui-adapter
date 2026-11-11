@@ -57,8 +57,9 @@ keeps it running (our proven approach):
 | `main.py` | Entry point: FastAPI app, single catch-all proxy (per-port routing via `resolve_upstream`), `/health`, passthrough |
 | `runtime.py` | Process plumbing: logging, `config.yaml` → `CONFIG` / `PORT_MAP`, SIGUSR2 thread dump, health dump + RSS watchdog, memory guard, shared aiohttp session |
 | `completions_handler.py` | `/v1/chat/completions` — history sanitize (inbound) + forward, streamed through `stream_enhance` |
-| `stream_enhance.py` | SSE transform (enhance-v2): `hermes.tool.progress` → OWUI tool cards (outbound), heartbeats, stale-stream timeout, SSE buffer cap |
+| `stream_enhance.py` | SSE transform (enhance-v2): `hermes.tool.progress` → OWUI tool cards (outbound), heartbeats, stale-stream timeout, SSE buffer cap, `on_upstream_meta` hook (run id capture) |
 | `responses_handler.py` | `/v1/responses` — session continuity + previous-response tool-result injection |
+| `run_control.py` | Mid-turn control: per-conversation live run registry, `POST /v1/runs/{id}/steer` for a follow-up typed while the answer streams, `POST /v1/runs/{id}/stop` when the client drops, ack payloads in chat + responses shapes |
 | `responses_session.py` | sid marker extract/inject (responses path only) — pure functions, unit-tested |
 | `tool_history_format.py` | tool card → model-safe history (structured) |
 | `tool_history_structured.py` | structured sanitizer (native `assistant` + `tool` roles) |
